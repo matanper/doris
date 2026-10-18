@@ -66,9 +66,17 @@ suite("test_analyze_long_string", "nonConcurrent") {
         return result
     }
 
-    def assertTasksFinished = { long jobId, List<String> expectedOk ->
+    def assertTaskSkipped = { long jobId, List<String> expectedSkipped, List<String> expectedOk ->
         def statuses = collectTaskStatuses(jobId)
         logger.info("job ${jobId} task statuses=${statuses}")
+        for (c in expectedSkipped) {
+            assertTrue(statuses.containsKey(c), "missing task for skipped col ${c}")
+            assertEquals("FINISHED", statuses[c].state,
+                    "expected FINISHED for skipped col ${c}, got ${statuses[c]}")
+            assertTrue(statuses[c].message.contains("statistics_max_string_column_length")
+                    || statuses[c].message.contains("exceeds"),
+                    "expected skip reason visible for col ${c}, got msg=${statuses[c].message}")
+        }
         for (c in expectedOk) {
             assertTrue(statuses.containsKey(c), "missing task for col ${c}")
             assertEquals("FINISHED", statuses[c].state,
@@ -114,23 +122,18 @@ suite("test_analyze_long_string", "nonConcurrent") {
         def jobId = findJobId("internal", "test_analyze_long_string", "test_analyze_long_string_full")
         assertNotNull(jobId, "must find analyze job for test_analyze_long_string_full")
         waitJobFinished(jobId)
-        assertTasksFinished(jobId, ["id", "name", "small_str", "fixed", "big_str"])
+        assertTaskSkipped(jobId, ["big_str"], ["id", "name", "small_str", "fixed"])
         def collected = collectedColumns("test_analyze_long_string_full")
         logger.info("test_analyze_long_string_full collected=${collected}")
-        assertTrue(collected.contains("big_str"),
-                "big_str should be collected, got ${collected}")
+        assertFalse(collected.contains("big_str"),
+                "big_str should be skipped, got ${collected}")
         assertTrue(collected.contains("id"))
         assertTrue(collected.contains("name"))
         assertTrue(collected.contains("small_str"))
         assertTrue(collected.contains("fixed"))
         def bigRows = sql """show column stats test_analyze_long_string_full (big_str)"""
-        assertEquals(1, bigRows.size(), "expected a stats row for big_str, got ${bigRows}")
-        // columns: column_name, index_name, count, ndv, num_null, data_size, avg_size_byte, min, max
-        assertEquals("3.0", bigRows[0][2].toString())
-        assertEquals("2.0", bigRows[0][3].toString())
-        assertEquals("1.0", bigRows[0][4].toString())
-        assertTrue(bigRows[0][8].toString().length() <= 1024 + 2,
-                "max of big_str should be truncated, got length ${bigRows[0][8].toString().length()}")
+        assertEquals(0, bigRows.size(),
+                "expected no stats row for skipped column big_str, got ${bigRows}")
     }
 
     // ---------- Case 2: disabled (limit <= 0) must collect everything ----------
@@ -166,13 +169,18 @@ suite("test_analyze_long_string", "nonConcurrent") {
         def jobId = findJobId("internal", "test_analyze_long_string", "test_analyze_long_string_sample")
         assertNotNull(jobId, "must find sample analyze job for test_analyze_long_string_sample")
         waitJobFinished(jobId)
-        assertTasksFinished(jobId, ["id", "small_str", "big_str"])
+        assertTaskSkipped(jobId, ["big_str"], ["id", "small_str"])
         def collected = collectedColumns("test_analyze_long_string_sample")
-        assertTrue(collected.contains("big_str"), "sample analyze: big_str should be collected")
+        assertFalse(collected.contains("big_str"), "sample analyze: big_str should be skipped")
         assertTrue(collected.contains("small_str"))
     }
 
-    // ---------- Case 4: partitioned table (PARTITION_ANALYZE_TEMPLATE) ----------
+    // ---------- Case 4: partitioned table — long-string guard does NOT apply ----------
+    // Partition-granularity analyze uses PARTITION_ANALYZE_TEMPLATE and commits per-batch
+    // inserts into __partition_stats incrementally. To avoid leaving a mix of fresh and
+    // stale partition rows on mid-loop abort, the long-string skip guard is intentionally
+    // NOT wired into this path. Analyze should FINISH normally and produce statistics
+    // for big_str even when rows exceed statistics_max_string_column_length.
     sql """drop table if exists test_analyze_long_string_part"""
     sql """
         CREATE TABLE test_analyze_long_string_part (
@@ -199,10 +207,11 @@ suite("test_analyze_long_string", "nonConcurrent") {
             def jobId = findJobId("internal", "test_analyze_long_string", "test_analyze_long_string_part")
             assertNotNull(jobId, "must find analyze job for test_analyze_long_string_part")
             waitJobFinished(jobId)
-            assertTasksFinished(jobId, ["d", "id", "big_str"])
+            // No task should be skipped: partition path bypasses the long-string guard.
+            assertTaskSkipped(jobId, [], ["d", "id", "big_str"])
             def collected = collectedColumns("test_analyze_long_string_part")
             assertTrue(collected.contains("big_str"),
-                    "partition analyze should collect big_str")
+                    "partition analyze should still collect big_str (guard does not apply)")
             assertTrue(collected.contains("d"))
             assertTrue(collected.contains("id"))
         } finally {
@@ -239,17 +248,22 @@ suite("test_analyze_long_string", "nonConcurrent") {
             def jobId = findJobId("internal", "test_analyze_long_string", "test_analyze_long_string_duj1")
             assertNotNull(jobId, "must find analyze job for test_analyze_long_string_duj1")
             waitJobFinished(jobId)
-            assertTasksFinished(jobId, ["id", "small_str", "big_str"])
+            assertTaskSkipped(jobId, ["big_str"], ["id", "small_str"])
             def collected = collectedColumns("test_analyze_long_string_duj1")
-            assertTrue(collected.contains("big_str"),
-                    "DUJ1 analyze: big_str should be collected")
+            assertFalse(collected.contains("big_str"),
+                    "DUJ1 analyze: big_str should be skipped")
             assertTrue(collected.contains("small_str"))
         } finally {
             GetDebugPoint().disableDebugPointForAllFEs('OlapAnalysisTask.useDUJ1Template')
         }
     }
 
-    // ---------- Case 6: WITH SYNC — a long-string column gets stats like any other ----------
+    // ---------- Case 6: WITH SYNC — skipped column must have no stats ----------
+    // Sync analyze never populates analysisJobIdToTaskMap, so SHOW ANALYZE cannot see
+    // the skip reason. AnalysisManager.buildAndAssignJob surfaces skip messages via
+    // ConnectContext OK-packet info for interactive visibility. We cannot easily read
+    // that info string from JDBC in regression, so we verify the functional outcome:
+    // the skipped column produces no row in column_statistics, while other columns do.
     sql """drop table if exists test_analyze_long_string_full"""
     sql """
         CREATE TABLE test_analyze_long_string_full (
@@ -266,9 +280,8 @@ suite("test_analyze_long_string", "nonConcurrent") {
     setFeConfigTemporary([statistics_max_string_column_length: 1024]) {
         sql """analyze table test_analyze_long_string_full with sync"""
         def bigRows = sql """show column stats test_analyze_long_string_full (big_str)"""
-        assertEquals(1, bigRows.size(),
-                "WITH SYNC: big_str should be collected, got ${bigRows}")
-        assertEquals("3.0", bigRows[0][2].toString())
+        assertEquals(0, bigRows.size(),
+                "WITH SYNC: big_str should be skipped, got ${bigRows}")
         def nameRows = sql """show column stats test_analyze_long_string_full (name)"""
         assertEquals(1, nameRows.size(),
                 "WITH SYNC: name should be collected, got ${nameRows}")

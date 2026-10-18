@@ -80,6 +80,13 @@ public abstract class BaseAnalysisTask {
         DUJ1
     }
 
+    /**
+     * Marker string embedded in {@code assert_true} inside statistics collection SQL.
+     * When any row's string column length exceeds the configured limit, BE throws an
+     * error whose message contains this marker; FE detects it and converts the task
+     * result to a skip signal ({@link AnalyzeSkipException}) rather than a failure.
+     */
+    public static final String ANALYZE_SKIP_LONG_STRING_COLUMN_MARKER = "ANALYZE_SKIP_LONG_STRING_COLUMN";
 
     protected static final String FULL_ANALYZE_TEMPLATE =
             "SELECT CONCAT(${tblId}, '-', ${idxId}, '-', '${colId}') AS `id`, "
@@ -97,10 +104,11 @@ public abstract class BaseAnalysisTask {
             +     "${dataSizeFunction} AS `data_size`, "
             +     "NOW() AS `update_time`, "
             +     "null as `hot_value` "
-            + "FROM `${catalogName}`.`${dbName}`.`${tblName}` ${index}";
+            + "FROM (SELECT `${colName}`${lengthAssert} "
+            +     "FROM `${catalogName}`.`${dbName}`.`${tblName}` ${index}) __lc_t";
 
     protected static final String LINEAR_ANALYZE_TEMPLATE = "WITH cte1 AS ("
-            +     "SELECT `${colName}` "
+            +     "SELECT `${colName}`${lengthAssert} "
             +     "FROM `${catalogName}`.`${dbName}`.`${tblName}` ${index} ${sampleHints} ${limit} ${preAggHint}), "
             + "cte2 AS ("
             +     "SELECT CONCAT(${tblId}, '-', ${idxId}, '-', '${colId}') AS `id`, "
@@ -124,7 +132,7 @@ public abstract class BaseAnalysisTask {
             +         "as `hot_value` "
             +     "FROM ("
             +         "SELECT ${subStringColName} as `hash_value`, "
-            +         "MAX(${colValue}) as `column_key`, "
+            +         "MAX(`${colName}`) as `column_key`, "
             +         "COUNT(1) AS `count` "
             +         "FROM cte1 WHERE `${colName}` IS NOT NULL "
             +         "GROUP BY `hash_value` ORDER BY `count` DESC LIMIT ${hotValueCollectCount}) t) "
@@ -135,8 +143,8 @@ public abstract class BaseAnalysisTask {
             + "FROM "
             +     "(SELECT "
             +     "${subStringColName} AS `hash_value`, "
-            +     "${colValue} AS `col_value`, "
-            +     "LENGTH(`${colName}`) as `len` "
+            +     "`${colName}` AS `col_value`, "
+            +     "LENGTH(`${colName}`) as `len`${lengthAssert} "
             +     "FROM `${catalogName}`.`${dbName}`.`${tblName}` ${index} ${sampleHints} ${limit}) as `t0` "
             +     "${preAggHint} GROUP BY `t0`.`hash_value`), "
             + "cte2 AS ( "
@@ -182,6 +190,14 @@ public abstract class BaseAnalysisTask {
             + "${data_size} AS `data_size`, "
             + "NOW() ";
 
+    // NOTE: PARTITION_ANALYZE_TEMPLATE intentionally does NOT apply the long-string
+    // skip guard (statistics_max_string_column_length). Partition-granularity analyze
+    // commits per-batch INSERTs into __partition_stats incrementally. Aborting mid-loop
+    // via assert_true would leave a mix of fresh and stale rows in __partition_stats
+    // that is non-trivial to roll back. Since partition-level statistics are seldom
+    // relied upon today, we accept that long-string columns are NOT protected on this
+    // path. Only the full / sample OLAP paths and the external-table path enforce the
+    // per-row byte-length ceiling.
     protected static final String PARTITION_ANALYZE_TEMPLATE = " SELECT "
             + "${catalogId} AS `catalog_id`, "
             + "${dbId} AS `db_id`, "
@@ -270,7 +286,66 @@ public abstract class BaseAnalysisTask {
 
     public void execute() throws Exception {
         prepareExecution();
-        doExecute();
+        try {
+            doExecute();
+        } catch (AnalyzeSkipException e) {
+            handleSkip(e);
+        } catch (Exception e) {
+            if (containsSkipMarker(e)) {
+                handleSkip(new AnalyzeSkipException(buildSkipMessage(), e));
+                return;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Walk the cause chain and inspect every Throwable's message for the
+     * long-string skip marker. More robust than only checking the root cause,
+     * since some execution paths wrap the BE error in an outer exception that
+     * reformats the message without preserving the original cause.
+     */
+    protected static boolean containsSkipMarker(Throwable e) {
+        Throwable cur = e;
+        while (cur != null) {
+            String m = cur.getMessage();
+            if (m != null && m.contains(ANALYZE_SKIP_LONG_STRING_COLUMN_MARKER)) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Mark this task as FINISHED with a skip message. Called when the task
+     * detects that the column should be skipped (e.g. long string column).
+     */
+    private void handleSkip(AnalyzeSkipException e) {
+        String skipMsg = e.getMessage();
+        LOG.info("Analyze task skip column [{}] in table [{}]. Reason: {}",
+                info.colName, tbl == null ? "?" : tbl.getName(), skipMsg);
+        // Stash the skip message on info.message. The job-level flushBuffer path
+        // (AnalysisJob.updateTaskState -> AnalysisManager.updateTaskStatus) will
+        // pick it up as the single FINISHED transition for this task, so we
+        // avoid a redundant updateTaskStatus call here. Doing the state update
+        // twice used to overwrite AnalysisInfo.timeCostInMs with the near-zero
+        // delta between the two FINISHED calls.
+        info.message = skipMsg;
+        // Route through taskDoneWithoutData: adds this task to queryFinished
+        // and triggers flushBuffer, which will call updateTaskState(FINISHED,
+        // "") exactly once per task. AnalysisJob.updateTaskState substitutes
+        // the task's own info.message when the outer msg is empty, so skipMsg
+        // reaches job.message for SHOW ANALYZE visibility.
+        job.taskDoneWithoutData(this);
+    }
+
+    private String buildSkipMessage() {
+        return String.format(
+                "Column [%s] has row(s) whose byte length exceeds %d (Config.statistics_max_string_column_length), "
+                        + "skip collecting statistics for this column.",
+                info == null ? "?" : info.colName,
+                org.apache.doris.common.Config.statistics_max_string_column_length);
     }
 
     protected void prepareExecution() {
@@ -512,21 +587,27 @@ public abstract class BaseAnalysisTask {
     }
 
     /**
-     * Fills {@code ${colValue}}, the column value that sampled statistics keep per distinct value (the DUJ1
-     * {@code col_value} and the hot values). A string value is cut to
-     * {@link org.apache.doris.common.Config#statistics_max_string_column_length} bytes, so that a column
-     * holding very long strings is analyzed with bounded memory. The row count, null count, data size
-     * and NDV still come from the whole value, and min/max are stored truncated to 1024 bytes anyway.
+     * Populate the {@code ${lengthAssert}} placeholder into SQL params map.
+     * For string columns with config > 0, the placeholder expands into a per-row
+     * {@code , assert_true(col IS NULL OR LENGTH(col) <= N, 'marker') AS __lc}
+     * clause that gets inserted into the inner-most SELECT list of statistics
+     * collection SQL. For non-string columns or when config <= 0, the placeholder
+     * is an empty string so the SQL stays unchanged.
+     *
+     * Note: the {@code IS NULL OR} guard is required because Doris's
+     * {@code assert_true} BE function throws on NULL inputs.
      */
-    protected void addColumnValueParam(Map<String, String> params) {
+    protected void addLengthAssertParam(Map<String, String> params) {
         long maxLen = org.apache.doris.common.Config.statistics_max_string_column_length;
-        String escapedColName = StatisticsUtil.escapeColumnName(String.valueOf(info.colName));
         if (col != null && col.getType().isStringType() && maxLen > 0) {
+            String escapedColName = StatisticsUtil.escapeColumnName(String.valueOf(info.colName));
             // The StringSubstitutor used by callers already has ${colName} populated,
             // so we inline the escaped column name directly here.
-            params.put("colValue", "SUBSTRING(CAST(`" + escapedColName + "` AS STRING), 1, " + maxLen + ")");
+            params.put("lengthAssert",
+                    ", assert_true(`" + escapedColName + "` IS NULL OR LENGTH(`" + escapedColName + "`) <= "
+                            + maxLen + ", '" + ANALYZE_SKIP_LONG_STRING_COLUMN_MARKER + "') AS `__lc`");
         } else {
-            params.put("colValue", "`" + escapedColName + "`");
+            params.put("lengthAssert", "");
         }
     }
 
@@ -570,6 +651,9 @@ public abstract class BaseAnalysisTask {
             job.appendBuf(this, Collections.singletonList(colStatsData));
         } catch (Exception e) {
             LOG.warn("Failed to execute sql {}", sql);
+            if (containsSkipMarker(e)) {
+                throw new AnalyzeSkipException(buildSkipMessage(), e);
+            }
             throw e;
         } finally {
             if (LOG.isDebugEnabled()) {

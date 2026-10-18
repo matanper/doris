@@ -2879,15 +2879,20 @@ public class Config extends ConfigBase {
     public static int auto_analyze_simultaneously_running_task_num = 1;
 
     @ConfField(mutable = true, masterOnly = true, description = {
-            "收集统计信息时，字符串列每个取值保留的最大字节数。抽样统计为每个不同取值保留的值"
-                    + "（DUJ1 的 col_value 和热点值）会截断到该长度，使包含超长字符串的列也能以有限内存完成统计；"
-                    + "行数、空值数、数据大小和 NDV 仍基于完整取值计算，min/max 仍截断为 1024 字节。"
-                    + "≤ 0 表示不截断。默认 1024 (1KB)。",
-            "Max bytes of a string value kept while collecting statistics. The value sampled statistics "
-                    + "keep per distinct value (the DUJ1 col_value and the hot values) is cut to this length, so "
-                    + "a column holding very long strings is analyzed with bounded memory. Row count, null "
-                    + "count, data size and NDV still come from the whole value, and min/max are stored "
-                    + "truncated to 1024 bytes. A value <= 0 keeps whole values. Default: 1024 (1KB)."})
+            "统计信息收集时 string 列允许的最大字节长度。若列中存在长度超过该值的行，"
+                    + "该列的统计信息将被跳过收集（task 仍标记为 FINISHED，在 SHOW ANALYZE 中显示跳过原因）。"
+                    + "≤ 0 表示关闭此保护。默认 1024 (1KB)。"
+                    + "注意：此保护只覆盖 FULL / LINEAR / DUJ1 统计收集路径（即 analyze 全表和 sample 的主 SQL）。"
+                    + "当 enable_partition_analyze=true 时的 per-partition 路径（PARTITION_ANALYZE_TEMPLATE）"
+                    + "出于正确性考虑不启用该保护，详见 BaseAnalysisTask 中的 NOTE。",
+            "Max byte length allowed for a string column when collecting statistics. "
+                    + "If any row in a string column is longer than this value, the column's stats "
+                    + "collection is skipped (the task is still marked FINISHED, with the skip reason "
+                    + "shown in SHOW ANALYZE). A value <= 0 disables this protection. Default: 1024 (1KB). "
+                    + "Note: this protection applies to the FULL / LINEAR / DUJ1 collection paths "
+                    + "(i.e. the main SQL used by full-table and sample analyze). The per-partition path "
+                    + "(PARTITION_ANALYZE_TEMPLATE, used when enable_partition_analyze=true) is intentionally "
+                    + "not guarded for correctness reasons; see the NOTE in BaseAnalysisTask."})
     public static long statistics_max_string_column_length = 1024;
 
     @ConfField(mutable = true, description = {

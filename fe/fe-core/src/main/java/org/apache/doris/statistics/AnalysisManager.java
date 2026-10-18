@@ -489,8 +489,8 @@ public class AnalysisManager implements Writable {
         }
         info.state = taskState;
         // Preserve the existing info.message when flushBuffer calls updateTaskState(FINISHED, "")
-        // for already-finished tasks, so that a message the task set earlier is not wiped by the
-        // subsequent batch FINISHED update.
+        // for already-finished tasks, so that a previously-set skip message (from
+        // BaseAnalysisTask.handleSkip) is not wiped by the subsequent batch FINISHED update.
         if (!(taskState.equals(AnalysisState.FINISHED) && StringUtils.isEmpty(message))) {
             info.message = message;
         }
@@ -518,10 +518,10 @@ public class AnalysisManager implements Writable {
                 String errMessage = String.format("%s:[%s] ", info.colName, message);
                 job.message = job.message == null ? errMessage : job.message + errMessage;
             }
-            // Accumulate a non-empty FINISHED message into job.message so it is visible in
-            // SHOW ANALYZE at job level. Guard on the incoming message being non-empty to avoid
-            // double-counting when flushBuffer later calls updateTaskState(FINISHED, "") for
-            // the same task.
+            // Accumulate a non-empty FINISHED message (e.g. long-string skip reason) into
+            // job.message so it is visible in SHOW ANALYZE at job level. Guard on the
+            // incoming message being non-empty to avoid double-counting when flushBuffer
+            // later calls updateTaskState(FINISHED, "") for the same already-skipped task.
             if (taskState.equals(AnalysisState.FINISHED) && !StringUtils.isEmpty(message)) {
                 String skipMessage = String.format("%s:[%s] ", info.colName, message);
                 job.message = job.message == null ? skipMessage : job.message + skipMessage;
