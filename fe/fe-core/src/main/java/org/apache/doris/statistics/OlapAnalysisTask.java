@@ -476,7 +476,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         params.put("tblName", String.valueOf(tbl.getName()));
         params.put("index", getIndex());
         params.put("preAggHint", "");
-        addColumnValueParam(params);
+        addLengthAssertParam(params);
         return params;
     }
 

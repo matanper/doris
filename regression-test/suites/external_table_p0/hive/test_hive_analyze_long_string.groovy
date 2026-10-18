@@ -60,8 +60,8 @@ suite("test_hive_analyze_long_string", "p0,external,hive,external_docker,externa
         """
         sql "refresh catalog ${catalogName}"
 
-        // Column `s` contains a >1024-byte row: it is analyzed like any other column, with
-        // the values kept for sampled statistics cut to statistics_max_string_column_length.
+        // Analyze column `s` which contains a >1024-byte row: task should be marked
+        // FINISHED with a skip message, and no column stats should be persisted.
         def analyzeRes = sql "analyze table ${catalogName}.${dbName}.${tblName}(s)"
         assertEquals(1, analyzeRes.size())
         long jobId = Long.parseLong(analyzeRes[0][0].toString())
@@ -81,13 +81,23 @@ suite("test_hive_analyze_long_string", "p0,external,hive,external_docker,externa
 
         def jobRows = sql "show analyze ${jobId}"
         assertEquals("FINISHED", jobRows[0][9].toString())
+        String jobMessage = jobRows[0][7].toString()
+        assertTrue(jobMessage.contains("statistics_max_string_column_length")
+                   || jobMessage.contains("exceeds"),
+                   "expected skip reason in job message but got: ${jobMessage}")
+
         def taskRows = sql "show analyze task status ${jobId}"
         def strTaskRow = taskRows.find { it[1].toString() == "s" }
         assertNotNull(strTaskRow, "missing analyze task row for column s")
         assertEquals("FINISHED", strTaskRow[6].toString())
+        String taskMessage = strTaskRow[3].toString()
+        assertTrue(taskMessage.contains("statistics_max_string_column_length")
+                   || taskMessage.contains("exceeds"),
+                   "expected skip reason in task message but got: ${taskMessage}")
 
+        // The skipped column must NOT have any stored column statistics row.
         def colStats = sql "show column stats ${catalogName}.${dbName}.${tblName}(s)"
-        assertEquals(1, colStats.size(), "expected column stats for column s")
+        assertTrue(colStats.isEmpty(), "expected no column stats for skipped column s")
 
         // A non-string column on the same table should still analyze successfully.
         def idAnalyze = sql "analyze table ${catalogName}.${dbName}.${tblName}(id)"
