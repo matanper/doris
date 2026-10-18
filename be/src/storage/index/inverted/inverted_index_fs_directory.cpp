@@ -900,9 +900,34 @@ lucene::store::IndexOutput* DorisRAMFSDirectory::spill_output(lucene::store::RAM
         filesMap->removeitr(itr);
     }
     _disk_files.insert(name);
-    LOG(INFO) << "RAM directories reached inverted_index_ram_dir_max_memory, moved " << name
-              << " of " << directory << " to local disk";
+    VLOG_DEBUG << "RAM directories reached inverted_index_ram_dir_max_memory, moved " << name
+               << " of " << directory << " to local disk";
     return out;
+}
+
+void DorisRAMFSDirectory::move_files_to_disk() {
+    std::lock_guard<std::mutex> wlock(_this_lock);
+    if (filesMap->empty()) {
+        return;
+    }
+    prepare_disk();
+    for (auto& [name, file] : *filesMap) {
+        std::unique_ptr<lucene::store::IndexOutput> out(DorisFSDirectory::createOutput(name));
+        int64_t remaining = file->getLength();
+        for (int32_t i = 0; remaining > 0; ++i) {
+            auto len = static_cast<int32_t>(
+                    std::min<int64_t>(remaining, lucene::store::RAMOutputStream::BUFFER_SIZE));
+            out->writeBytes(file->getBuffer(i), len);
+            remaining -= len;
+        }
+        out->close();
+        _disk_files.insert(name);
+    }
+    SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+    for (auto& [name, file] : *filesMap) {
+        release_file_bytes(file);
+    }
+    filesMap->clear();
 }
 
 bool DorisRAMFSDirectory::spilled() const {

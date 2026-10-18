@@ -1182,4 +1182,32 @@ TEST_F(DorisFSDirectoryTest, IndexMovedToDiskMidWriteMatchesRamDirIndex) {
     }
 }
 
+TEST_F(DorisFSDirectoryTest, DorisRAMFSDirectoryMoveFilesToDiskFreesMemory) {
+    auto tracker = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::OTHER,
+                                                    "DorisRAMFSDirectoryMoveTest");
+    std::thread([&]() {
+        SCOPED_ATTACH_TASK(tracker);
+        const int64_t tracked_before = tracker->consumption();
+        auto path = (_tmp_dir / "moved").string();
+        auto ram_dir = std::make_unique<DorisRAMFSDirectory>();
+        ram_dir->init(_fs, path.c_str());
+        write_ram_file(ram_dir.get(), "a", 10 * 1024 + 5);
+        write_ram_file(ram_dir.get(), "b", 3000);
+        const std::string a = read_file(ram_dir.get(), "a");
+
+        ram_dir->move_files_to_disk();
+        EXPECT_TRUE(ram_dir->spilled());
+        EXPECT_EQ(tracker->consumption() - tracked_before, 0);
+        EXPECT_EQ(std::filesystem::file_size(std::filesystem::path(path) / "a"), 10 * 1024 + 5);
+        EXPECT_EQ(read_file(ram_dir.get(), "a"), a);
+        EXPECT_EQ(ram_dir->fileLength("b"), 3000);
+        std::vector<std::string> names;
+        EXPECT_TRUE(ram_dir->list(&names));
+        std::sort(names.begin(), names.end());
+        EXPECT_EQ(names, (std::vector<std::string> {"a", "b"}));
+        EXPECT_TRUE(ram_dir->deleteDirectory());
+        EXPECT_FALSE(std::filesystem::exists(path));
+    }).join();
+}
+
 } // namespace doris::segment_v2

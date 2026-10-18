@@ -126,6 +126,9 @@ public:
     lucene::store::IndexOutput* spill_output(lucene::store::RAMFile* file);
     // Whether some of the directory's files are on local disk.
     bool spilled() const;
+    // Moves every file to local disk and frees its buffers. No stream may be open on the
+    // directory's files.
+    void move_files_to_disk();
 
 private:
     // Called with the size of each file the directory drops.
