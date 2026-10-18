@@ -1424,6 +1424,10 @@ DEFINE_mBool(debug_inverted_index_compaction, "false");
 DEFINE_mBool(inverted_index_ram_dir_enable, "true");
 // wheather index by RAM directory when base compaction
 DEFINE_mBool(inverted_index_ram_dir_enable_when_base_compaction, "true");
+// Upper bound of the memory all index RAM directories together may hold, as bytes or as a
+// percentage of mem_limit. Past it, index files that are being written move to local disk, and
+// directories write their new files there. -1 means no bound.
+DEFINE_mString(inverted_index_ram_dir_max_memory, "10%");
 // use num_broadcast_buffer blocks as buffer to do broadcast
 DEFINE_Int32(num_broadcast_buffer, "32");
 
