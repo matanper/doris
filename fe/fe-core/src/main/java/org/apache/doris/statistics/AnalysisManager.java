@@ -553,6 +553,15 @@ public class AnalysisManager implements Writable {
                     if (MetricRepo.isInit) {
                         MetricRepo.COUNTER_STATISTICS_FAILED_ANALYZE_JOB.increase(1L);
                     }
+                    // The columns that finished have saved their statistics; record them as analyzed so
+                    // that a later round only analyzes the failed columns again.
+                    try {
+                        if (retainFinishedColumns(job, analysisJobIdToTaskMap.get(info.jobId).values())) {
+                            updateTableStats(job);
+                        }
+                    } catch (Throwable e) {
+                        LOG.warn("Failed to update Table statistics in job: {}", info.toString(), e);
+                    }
                 } else {
                     job.markFinished();
                     tblIdToAutoAnalyzeFailureTime.remove(job.tblId);
@@ -569,6 +578,26 @@ public class AnalysisManager implements Writable {
                 analysisJobIdToTaskMap.remove(job.jobId);
             }
         }
+    }
+
+    /**
+     * Removes the columns of failed tasks from the job's columns.
+     *
+     * @return whether any column of the job finished
+     */
+    @VisibleForTesting
+    static boolean retainFinishedColumns(AnalysisInfo job, Collection<BaseAnalysisTask> tasks) {
+        if (job.jobColumns == null) {
+            return false;
+        }
+        Set<String> failedColumns = new HashSet<>();
+        for (BaseAnalysisTask task : tasks) {
+            if (task.info.state.equals(AnalysisState.FAILED)) {
+                failedColumns.add(task.info.colName);
+            }
+        }
+        job.jobColumns.removeIf(column -> failedColumns.contains(column.second));
+        return !job.jobColumns.isEmpty();
     }
 
     /**
