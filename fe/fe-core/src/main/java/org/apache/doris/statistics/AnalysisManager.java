@@ -489,8 +489,8 @@ public class AnalysisManager implements Writable {
         }
         info.state = taskState;
         // Preserve the existing info.message when flushBuffer calls updateTaskState(FINISHED, "")
-        // for already-finished tasks, so that a previously-set skip message (from
-        // BaseAnalysisTask.handleSkip) is not wiped by the subsequent batch FINISHED update.
+        // for already-finished tasks, so that a message the task set earlier is not wiped by the
+        // subsequent batch FINISHED update.
         if (!(taskState.equals(AnalysisState.FINISHED) && StringUtils.isEmpty(message))) {
             info.message = message;
         }
@@ -518,10 +518,10 @@ public class AnalysisManager implements Writable {
                 String errMessage = String.format("%s:[%s] ", info.colName, message);
                 job.message = job.message == null ? errMessage : job.message + errMessage;
             }
-            // Accumulate a non-empty FINISHED message (e.g. long-string skip reason) into
-            // job.message so it is visible in SHOW ANALYZE at job level. Guard on the
-            // incoming message being non-empty to avoid double-counting when flushBuffer
-            // later calls updateTaskState(FINISHED, "") for the same already-skipped task.
+            // Accumulate a non-empty FINISHED message into job.message so it is visible in
+            // SHOW ANALYZE at job level. Guard on the incoming message being non-empty to avoid
+            // double-counting when flushBuffer later calls updateTaskState(FINISHED, "") for
+            // the same task.
             if (taskState.equals(AnalysisState.FINISHED) && !StringUtils.isEmpty(message)) {
                 String skipMessage = String.format("%s:[%s] ", info.colName, message);
                 job.message = job.message == null ? skipMessage : job.message + skipMessage;
@@ -553,6 +553,15 @@ public class AnalysisManager implements Writable {
                     if (MetricRepo.isInit) {
                         MetricRepo.COUNTER_STATISTICS_FAILED_ANALYZE_JOB.increase(1L);
                     }
+                    // The columns that finished have saved their statistics; record them as analyzed so
+                    // that a later round only analyzes the failed columns again.
+                    try {
+                        if (retainFinishedColumns(job, analysisJobIdToTaskMap.get(info.jobId).values())) {
+                            updateTableStats(job);
+                        }
+                    } catch (Throwable e) {
+                        LOG.warn("Failed to update Table statistics in job: {}", info.toString(), e);
+                    }
                 } else {
                     job.markFinished();
                     tblIdToAutoAnalyzeFailureTime.remove(job.tblId);
@@ -569,6 +578,26 @@ public class AnalysisManager implements Writable {
                 analysisJobIdToTaskMap.remove(job.jobId);
             }
         }
+    }
+
+    /**
+     * Removes the columns of failed tasks from the job's columns.
+     *
+     * @return whether any column of the job finished
+     */
+    @VisibleForTesting
+    static boolean retainFinishedColumns(AnalysisInfo job, Collection<BaseAnalysisTask> tasks) {
+        if (job.jobColumns == null) {
+            return false;
+        }
+        Set<String> failedColumns = new HashSet<>();
+        for (BaseAnalysisTask task : tasks) {
+            if (task.info.state.equals(AnalysisState.FAILED)) {
+                failedColumns.add(task.info.colName);
+            }
+        }
+        job.jobColumns.removeIf(column -> failedColumns.contains(column.second));
+        return !job.jobColumns.isEmpty();
     }
 
     /**

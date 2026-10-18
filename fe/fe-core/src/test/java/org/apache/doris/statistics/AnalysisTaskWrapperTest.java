@@ -79,6 +79,6 @@ public class AnalysisTaskWrapperTest {
         org.junit.jupiter.api.Assertions.assertTrue(
                 errorMsg.contains("For statistics analyze, you can increase `statistics_sql_mem_limit_in_bytes`, "
                         + "decrease `huge_table_default_sample_rows`, "
-                        + "or use `statistics_max_string_column_length` to skip large string columns."));
+                        + "or decrease `statistics_max_string_column_length` to keep less of each string value."));
     }
 }

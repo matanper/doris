@@ -109,11 +109,9 @@ public class AnalysisJob {
             case FINISHED:
                 for (BaseAnalysisTask task : queryFinished) {
                     // When flushBuffer passes an empty msg, fall back to the
-                    // task's own info.message. This propagates a skip reason
-                    // previously stashed by BaseAnalysisTask.handleSkip into
-                    // the single FINISHED update for this task, so job.message
-                    // accumulation in AnalysisManager sees it and SHOW ANALYZE
-                    // surfaces the skip reason at the job level.
+                    // task's own info.message, so a message the task set reaches
+                    // the single FINISHED update for this task and SHOW ANALYZE
+                    // surfaces it at the job level.
                     String taskMsg = msg;
                     if ((taskMsg == null || taskMsg.isEmpty()) && task.info != null) {
                         taskMsg = task.info.message;
@@ -177,13 +175,14 @@ public class AnalysisJob {
         }
     }
 
-    public void taskFailed(BaseAnalysisTask task, String reason) {
-        try {
-            updateTaskState(AnalysisState.FAILED, reason);
-            cancel();
-        } finally {
-            deregisterJob();
-        }
+    /**
+     * Records the failure of one column's task. The other tasks keep running and their statistics are
+     * still saved, so only the failed column remains unanalyzed and the next round retries it.
+     */
+    public synchronized void taskFailed(BaseAnalysisTask task, String reason) {
+        queryingTask.remove(task);
+        analysisManager.updateTaskStatus(task.info, AnalysisState.FAILED, reason, System.currentTimeMillis());
+        markOneTaskDone();
     }
 
     public void cancel() {

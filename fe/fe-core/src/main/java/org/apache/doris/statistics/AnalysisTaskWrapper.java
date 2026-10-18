@@ -34,7 +34,7 @@ public class AnalysisTaskWrapper extends FutureTask<Void> {
     private static final Logger LOG = LogManager.getLogger(AnalysisTaskWrapper.class);
     private static final String STATISTICS_ANALYZE_OOM_HINT = "For statistics analyze, you can increase "
             + "`statistics_sql_mem_limit_in_bytes`, decrease `huge_table_default_sample_rows`, "
-            + "or use `statistics_max_string_column_length` to skip large string columns.";
+            + "or decrease `statistics_max_string_column_length` to keep less of each string value.";
 
     private final BaseAnalysisTask task;
 
