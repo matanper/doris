@@ -23,7 +23,9 @@
 #include <CLucene/store/IndexOutput.h>
 #include <CLucene/store/_RAMDirectory.h>
 
+#include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "CLucene/SharedHeader.h"
@@ -39,6 +41,7 @@ class LockFactory;
 } // namespace lucene::store
 
 namespace doris {
+class MemTrackerLimiter;
 class TabletIndex;
 
 namespace segment_v2 {
@@ -100,7 +103,42 @@ private:
     friend class DorisFSDirectoryTest;
 };
 
+// Index files kept in memory until the index file writer copies them into the segment's index
+// file. Their buffers are allocated by CLucene with plain new[], which Doris's allocator never
+// sees, so the directory accounts for them itself: on the memory tracker of the task that opened
+// it, and in a process-wide total bounded by inverted_index_ram_dir_max_memory.
+//
+// Once that total reaches the bound, a file that is still being written moves to the directory's
+// path on local disk and continues there, and so does every file the directory creates afterwards.
+// Files that were already closed stay in memory until they are deleted, because an input stream
+// may still be reading them.
 class CLUCENE_EXPORT DorisRAMFSDirectory : public DorisFSDirectory {
+public:
+    // Bytes held by the buffers of all RAM directories of the process.
+    static int64_t total_bytes();
+    // Whether the RAM directories together stay below inverted_index_ram_dir_max_memory.
+    static bool has_memory_budget();
+
+    // Called by the directory's output streams when a file gains buffers.
+    void add_buffer_bytes(lucene::store::RAMFile* file, int64_t bytes);
+    // Copies a file that is being written to local disk, drops it from memory and returns the
+    // stream that continues it, or nullptr when the file is no longer in the directory.
+    lucene::store::IndexOutput* spill_output(lucene::store::RAMFile* file);
+    // Whether some of the directory's files are on local disk.
+    bool spilled() const;
+
+private:
+    // Called with the size of each file the directory drops.
+    void release_file_bytes(lucene::store::RAMFile* file);
+    // Creates the directory's path on local disk; called with _this_lock held.
+    void prepare_disk();
+    bool on_disk(const char* name) const;
+
+    std::shared_ptr<MemTrackerLimiter> _mem_tracker;
+    bool _spilled = false;
+    // Names of the files that live on local disk. Guarded by _this_lock.
+    std::unordered_set<std::string> _disk_files;
+
 protected:
     using FileMap = lucene::util::CLHashMap<const char*, lucene::store::RAMFile*,
                                             lucene::util::Compare::Char, lucene::util::Equals::Char,
