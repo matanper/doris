@@ -31,6 +31,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/block/block.h"
@@ -39,6 +40,9 @@
 #include "core/field.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
+#include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/memory/untracked_heap_account.h"
+#include "runtime/thread_context.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "runtime/runtime_state.h"
 #include "storage/index/index_file_reader.h"
@@ -1964,6 +1968,63 @@ TEST_F(InvertedIndexWriterTest, TokenizedArrayElementWithNulIsIndexed) {
     for (const auto& term : seen_terms) {
         EXPECT_EQ(term.find('\0'), std::string::npos) << "term holds a NUL: " << term;
     }
+}
+
+// CLucene's indexing buffers come from plain new; the writer puts them on the task's tracker
+// while it indexes and takes them off once it finishes.
+TEST_F(InvertedIndexWriterTest, IndexingBuffersAreTracked) {
+    if (thread_net_allocated_bytes() == 0) {
+        GTEST_SKIP() << "no allocation counter in this build";
+    }
+    auto tracker = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::OTHER,
+                                                    "InvertedIndexWriterTracking");
+    std::thread([&]() {
+        SCOPED_ATTACH_TASK(tracker);
+        const int64_t before = tracker->consumption();
+        auto tablet_schema = create_schema();
+        auto index_meta_pb = std::make_unique<TabletIndexPB>();
+        index_meta_pb->set_index_type(IndexType::INVERTED);
+        index_meta_pb->set_index_id(1);
+        index_meta_pb->set_index_name("test");
+        index_meta_pb->add_col_unique_id(1);
+        TabletIndex idx_meta;
+        idx_meta.init_from_pb(*index_meta_pb.get());
+
+        std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+                local_segment_path(kTestDir, "test_rowset_tracked", 0))};
+        std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+        io::FileWriterPtr file_writer;
+        io::FileWriterOptions opts;
+        auto fs = io::global_local_filesystem();
+        ASSERT_TRUE(fs->create_file(index_path, &file_writer, &opts).ok());
+        auto index_file_writer = std::make_unique<IndexFileWriter>(
+                fs, index_path_prefix, "test_rowset_tracked", 0, InvertedIndexStorageFormatPB::V2,
+                std::move(file_writer));
+        std::unique_ptr<IndexColumnWriter> column_writer;
+        ASSERT_TRUE(IndexColumnWriter::create(&tablet_schema->column(1), &column_writer,
+                                              index_file_writer.get(), &idx_meta)
+                            .ok());
+
+        std::vector<std::string> strings;
+        for (int i = 0; i < 50000; ++i) {
+            strings.push_back("term_" + std::to_string(i));
+        }
+        std::vector<Slice> values(strings.begin(), strings.end());
+        const int64_t dir_before = DorisRAMFSDirectory::total_bytes();
+        ASSERT_TRUE(column_writer->add_values("c2", values.data(), values.size()).ok());
+        // 50000 distinct terms take megabytes of postings and term text; none of it is in the
+        // RAM directory yet, which holds index files only once the writer flushes.
+        EXPECT_GT(tracker->consumption() - before - (DorisRAMFSDirectory::total_bytes() - dir_before),
+                  1 << 20);
+
+        ASSERT_TRUE(column_writer->finish().ok());
+        column_writer.reset();
+        ASSERT_TRUE(index_file_writer->begin_close().ok());
+        ASSERT_TRUE(index_file_writer->finish_close().ok());
+        index_file_writer.reset();
+        // Allocator-tracked memory of the schema and the writers is consumed in batches.
+        EXPECT_NEAR(tracker->consumption(), before, 2 << 20);
+    }).join();
 }
 
 } // namespace doris::segment_v2

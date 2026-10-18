@@ -23,6 +23,7 @@
 #include <roaring/roaring.hh>
 
 #include "CLucene/search/Similarity.h"
+#include "runtime/memory/untracked_heap_account.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/index_writer.h"
 #include "storage/index/inverted/inverted_index_parser.h"
@@ -102,6 +103,12 @@ private:
     IndexFileWriter* _index_file_writer;
     uint32_t _ignore_above;
     bool _should_analyzer = false;
+    // CLucene's indexing buffers (the documents writer's byte, char and posting pools) and the
+    // BKD writer's points; both come from plain new, which no memory tracker sees.
+    std::unique_ptr<UntrackedHeapAccount> _heap_account;
+
+    // The RAM directory's own buffer count, which the directory already tracks, or nullptr.
+    const int64_t* tracked_dir_bytes() const;
 };
 
 } // namespace segment_v2
