@@ -23,6 +23,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -988,6 +989,13 @@ Status Compaction::do_inverted_index_compaction() {
             if (!st.ok()) {
                 error_handler(index_meta->index_id(), column_uniq_id);
                 return Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(st.msg());
+            }
+            // The index file writers keep every merged index until the compaction finishes, so a
+            // merged index kept in memory would stay there for all the indexes merged after it.
+            for (auto* dir : dest_index_dirs) {
+                if (std::strcmp(dir->getObjectName(), DorisRAMFSDirectory::getClassName()) == 0) {
+                    static_cast<DorisRAMFSDirectory*>(dir)->move_files_to_disk();
+                }
             }
         } catch (CLuceneError& e) {
             error_handler(index_meta->index_id(), column_uniq_id);
