@@ -162,15 +162,46 @@ public:
     TabletMap& tablet_map;
 };
 
-// TODO(plat1ko): Prune cache
+namespace {
+
+// Drops tablets that nobody has used for config::tablet_cache_stale_sweep_time_sec, such as the
+// tablets of another BE that this BE served while that BE was down. A tablet held by a reader,
+// a load or a compaction through get_tablet is not in the cache's LRU list and is never dropped.
+//
+// Memory GC leaves the cache alone: dropping every unused tablet at once would make the next
+// touch of each one fetch its rowsets from the meta-service again. Only a forced prune, as
+// /api/clear_cache asks for, empties it.
+class CloudTabletCache final : public LRUCachePolicy {
+public:
+    CloudTabletCache()
+            : LRUCachePolicy(CachePolicy::CacheType::CLOUD_TABLET_CACHE,
+                             config::tablet_cache_capacity, LRUCacheType::NUMBER,
+                             /*stale_sweep_time_s*/ 0, config::tablet_cache_shards,
+                             /*element_count_capacity*/ 0, /*enable_prune*/ true,
+                             /*is_lru_k*/ false) {}
+
+    void prune_stale() override {
+        _stale_sweep_time_s = static_cast<uint32_t>(
+                std::clamp<int64_t>(config::tablet_cache_stale_sweep_time_sec, 0, UINT32_MAX));
+        LRUCachePolicy::prune_stale();
+    }
+
+    // However few tablets are cached, the ones not used for the sweep time go.
+    bool exceed_prune_limit() override { return true; }
+
+    void prune_all(bool force) override {
+        if (force) {
+            LRUCachePolicy::prune_all(force);
+        }
+    }
+};
+
+} // namespace
+
 CloudTabletMgr::CloudTabletMgr(CloudStorageEngine& engine)
         : _engine(engine),
           _tablet_map(std::make_unique<TabletMap>()),
-          _cache(std::make_unique<LRUCachePolicy>(
-                  CachePolicy::CacheType::CLOUD_TABLET_CACHE, config::tablet_cache_capacity,
-                  LRUCacheType::NUMBER, /*sweep time*/ 0, config::tablet_cache_shards,
-                  /*element_count_capacity*/ 0, /*enable_prune*/ false,
-                  /*is_lru_k*/ false)) {}
+          _cache(std::make_unique<CloudTabletCache>()) {}
 
 CloudTabletMgr::~CloudTabletMgr() = default;
 
