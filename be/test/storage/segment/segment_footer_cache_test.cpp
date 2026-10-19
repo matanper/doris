@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <bvar/bvar.h>
 #include <gtest/gtest.h>
 
 #include <random>
@@ -277,6 +278,43 @@ TEST_F(SegmentFooterCacheTest, TestGetSegmentFooterCacheKey) {
         ASSERT_EQ(fsize, cache_key.fsize);
         ASSERT_EQ(offset, cache_key.offset);
     }
+}
+
+// The footer cache is charged what a parsed footer holds, not its serialized size, and the
+// bvars follow the footer until its last holder drops it.
+TEST_F(SegmentFooterCacheTest, ParsedFooterIsChargedItsHeapBytes) {
+    auto counter = [](const char* name) {
+        return std::stoll(bvar::Variable::describe_exposed(name));
+    };
+    auto segment_ptr = _segments.front();
+    auto* segment_footer_cache = ExecEnv::GetInstance()->get_storage_page_cache();
+    ASSERT_NE(segment_footer_cache, nullptr);
+    auto drop_footer = [&]() {
+        segment_footer_cache->erase(segment_ptr->get_segment_footer_cache_key(),
+                                    segment_v2::PageTypePB::INDEX_PAGE);
+        segment_ptr->_footer_pb.reset();
+    };
+    drop_footer();
+    const int64_t serialized_before = counter("segment_footer_serialized_bytes");
+    const int64_t charged_before = counter("segment_footer_charged_bytes");
+    {
+        std::shared_ptr<segment_v2::SegmentFooterPB> footer;
+        ASSERT_TRUE(segment_ptr->_get_segment_footer(footer, nullptr).ok());
+        const auto serialized = static_cast<int64_t>(footer->ByteSizeLong());
+        EXPECT_EQ(counter("segment_footer_serialized_bytes") - serialized_before, serialized);
+        EXPECT_GT(counter("segment_footer_charged_bytes") - charged_before, serialized);
+
+        // A second lookup hits the cache and parses nothing.
+        std::shared_ptr<segment_v2::SegmentFooterPB> again;
+        ASSERT_TRUE(segment_ptr->_get_segment_footer(again, nullptr).ok());
+        EXPECT_EQ(again, footer);
+        EXPECT_EQ(counter("segment_footer_serialized_bytes") - serialized_before, serialized);
+        drop_footer();
+        // Still held here.
+        EXPECT_EQ(counter("segment_footer_serialized_bytes") - serialized_before, serialized);
+    }
+    EXPECT_EQ(counter("segment_footer_serialized_bytes"), serialized_before);
+    EXPECT_EQ(counter("segment_footer_charged_bytes"), charged_before);
 }
 
 TEST_F(SegmentFooterCacheTest, TestSemgnetFooterPBPage) {

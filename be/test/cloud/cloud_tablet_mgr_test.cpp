@@ -506,6 +506,40 @@ TEST_F(CloudForeignTabletEvictionTest, StaleOwnedSetDisablesEviction) {
     EXPECT_FALSE(cached(mgr, 1001));
 }
 
+TEST_F(CloudForeignTabletEvictionTest, ForeignOnlyWithFreshOwnedSet) {
+    CloudTabletMgr mgr(_engine);
+    EXPECT_FALSE(mgr.is_foreign_tablet(1001)) << "no owned set yet";
+    mgr.set_owned_tablets({1001}, 1);
+    EXPECT_FALSE(mgr.is_foreign_tablet(1001));
+    EXPECT_TRUE(mgr.is_foreign_tablet(1002));
+    config::tablet_ownership_max_age_sec = 1;
+    idle();
+    EXPECT_FALSE(mgr.is_foreign_tablet(1002)) << "stale owned set";
+}
+
+TEST_F(CloudForeignTabletEvictionTest, KeptForeignTabletsAreCountedByReason) {
+    CloudTabletMgr mgr(_engine);
+    auto in_use = mgr.get_tablet(1001);
+    ASSERT_TRUE(in_use.has_value());
+    use(mgr, 1002);
+    std::shared_ptr<CloudTablet> held;
+    for (const auto& weak : mgr.get_weak_tablets()) {
+        if (auto tablet = weak.lock(); tablet && tablet->tablet_id() == 1002) {
+            held = tablet;
+        }
+    }
+    ASSERT_NE(held, nullptr);
+    idle();
+    use(mgr, 1003);
+    mgr.set_owned_tablets({}, 1);
+    sweep(mgr);
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign"), 3);
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign_in_use"), 1);
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign_held"), 1);
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign_recent"), 1);
+    EXPECT_EQ(mgr.get_weak_tablets().size(), 3);
+}
+
 TEST_F(CloudForeignTabletEvictionTest, OwnershipChangesTakeEffectOnNextSet) {
     CloudTabletMgr mgr(_engine);
     use(mgr, 1001);

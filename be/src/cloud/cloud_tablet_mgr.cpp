@@ -53,6 +53,13 @@ bvar::Adder<uint64_t> g_sync_tablets_rowsets_num("sync_tablets_rowsets_num");
 bvar::Status<int64_t> g_tablet_cache_owned("cloud_tablet_cache_owned", 0);
 bvar::Status<int64_t> g_tablet_cache_foreign("cloud_tablet_cache_foreign", 0);
 bvar::Adder<int64_t> g_tablet_cache_foreign_evicted("cloud_tablet_cache_foreign_evicted");
+// Why the last sweep kept the foreign tablets it kept: held through get_tablet, used within
+// foreign_tablet_idle_evict_sec, or held through the tablet map.
+bvar::Status<int64_t> g_tablet_cache_foreign_in_use("cloud_tablet_cache_foreign_in_use", 0);
+bvar::Status<int64_t> g_tablet_cache_foreign_recent("cloud_tablet_cache_foreign_recent", 0);
+bvar::Status<int64_t> g_tablet_cache_foreign_held("cloud_tablet_cache_foreign_held", 0);
+bvar::Adder<int64_t> g_foreign_tablets_skipped_for_compaction(
+        "cloud_tablet_foreign_skipped_for_compaction");
 std::atomic<int64_t> g_tablet_ownership_received_ms {0};
 bvar::PassiveStatus<int64_t> g_tablet_ownership_age_s(
         "cloud_tablet_ownership_age_s",
@@ -376,6 +383,17 @@ void CloudTabletMgr::set_owned_tablets(const std::vector<int64_t>& tablet_ids,
               << " tablets, as of FE time " << generated_at_ms;
 }
 
+bool CloudTabletMgr::is_foreign_tablet(int64_t tablet_id) {
+    std::shared_ptr<const Ownership> ownership;
+    {
+        std::lock_guard lock(_ownership_mtx);
+        ownership = _ownership;
+    }
+    return ownership != nullptr &&
+           UnixMillis() - ownership->received_ms <= config::tablet_ownership_max_age_sec * 1000 &&
+           !ownership->owned.contains(tablet_id);
+}
+
 int64_t CloudTabletMgr::evict_idle_foreign_tablets() {
     std::shared_ptr<const Ownership> ownership;
     {
@@ -405,6 +423,9 @@ int64_t CloudTabletMgr::evict_idle_foreign_tablets() {
     }
     const int64_t idle_ms = config::foreign_tablet_idle_evict_sec * 1000;
     std::vector<std::shared_ptr<CloudTablet>> evicted;
+    int64_t offered = 0;
+    int64_t recent = 0;
+    int64_t held = 0;
     // Only entries nobody holds through get_tablet are offered, so a tablet a reader, a load or
     // a compaction got from the cache is never dropped here.
     auto pred = [&](const LRUHandle* handle) -> bool {
@@ -412,25 +433,32 @@ int64_t CloudTabletMgr::evict_idle_foreign_tablets() {
         if (ownership->owned.contains(tablet->tablet_id())) {
             return false;
         }
+        ++offered;
         const int64_t last_used_ms =
                 std::max<int64_t>(handle->last_visit_time, tablet->last_access_time_ms);
         if (now_ms - last_used_ms < idle_ms) {
+            ++recent;
             return false;
         }
         // The cache entry and the tablet map hold it; anything else, such as a compaction that
         // took it from the tablet map, is still using it.
         if (tablet.use_count() > 2) {
+            ++held;
             return false;
         }
         evicted.push_back(tablet);
         return true;
     };
     static_cast<CloudTabletCache*>(_cache.get())->prune_matching(pred);
+    // Foreign tablets the sweep did not see are out of the LRU list: held through get_tablet.
+    g_tablet_cache_foreign_in_use.set_value(std::max<int64_t>(0, foreign - offered));
+    g_tablet_cache_foreign_recent.set_value(recent);
+    g_tablet_cache_foreign_held.set_value(held);
     for (const auto& tablet : evicted) {
         tablet->traverse_rowsets(
                 [](const RowsetSharedPtr& rowset) {
                     SegmentLoader::instance()->erase_segments(rowset->rowset_id(),
-                                                              rowset->num_segments());
+                                                              rowset->num_segments(), true);
                 },
                 true);
     }
@@ -700,6 +728,11 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
         // stays as high as the backlog it was dropped with.
         if (t->is_dropped()) {
             dropped_tablets.push_back(t->tablet_id());
+            continue;
+        }
+        // The BE that owns it compacts it; compacting it here would also keep it cached.
+        if (config::enable_foreign_tablet_eviction && is_foreign_tablet(t->tablet_id())) {
+            g_foreign_tablets_skipped_for_compaction << 1;
             continue;
         }
 

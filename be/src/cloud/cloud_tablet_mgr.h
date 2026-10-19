@@ -72,6 +72,9 @@ public:
     // config::foreign_tablet_idle_evict_sec, with their segments. Returns how many it dropped.
     int64_t evict_idle_foreign_tablets();
 
+    // True when the latest owned set is fresh and does not contain the tablet.
+    bool is_foreign_tablet(int64_t tablet_id);
+
     void vacuum_stale_rowsets(const CountDownLatch& stop_latch);
 
     // Return weak ptr of all cached tablets.
