@@ -169,14 +169,14 @@ public:
                               std::unique_lock<BthreadSharedMutex>& wlock);
 
     // Create an empty rowset to fill a version hole
-    Status create_empty_rowset_for_hole(CloudTablet* tablet, int64_t version,
+    Status create_empty_rowset_for_hole(const CloudTablet* tablet, int64_t version,
                                         RowsetMetaSharedPtr prev_rowset_meta,
                                         RowsetSharedPtr* rowset);
 
     // Create an empty rowset that fills every version in `versions`. Without `rowset_id`, which
     // a hole covering several versions requires, the rowset id is derived from
     // (tablet_id, first version).
-    Status create_empty_rowset_for_hole(CloudTablet* tablet, const Version& versions,
+    Status create_empty_rowset_for_hole(const CloudTablet* tablet, const Version& versions,
                                         RowsetMetaSharedPtr prev_rowset_meta,
                                         RowsetSharedPtr* rowset,
                                         const RowsetId* rowset_id = nullptr);

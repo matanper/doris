@@ -124,6 +124,9 @@ DEFINE_mBool(enable_hole_rowset_version_range, "true");
 DEFINE_mInt64(hole_rowset_max_versions, "128");
 DEFINE_Validator(hole_rowset_max_versions,
                  [](const int64_t config) -> bool { return config >= 1; });
+DEFINE_mInt64(hole_rowset_eager_prefix_versions, "16");
+DEFINE_Validator(hole_rowset_eager_prefix_versions,
+                 [](const int64_t config) -> bool { return config >= 0; });
 
 DEFINE_mBool(skip_rowset_writer_for_empty_tablet, "true");
 

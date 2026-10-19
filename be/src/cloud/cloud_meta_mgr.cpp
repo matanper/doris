@@ -2531,14 +2531,14 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
     return Status::OK();
 }
 
-Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, int64_t version,
+Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet, int64_t version,
                                                   RowsetMetaSharedPtr prev_rowset_meta,
                                                   RowsetSharedPtr* rowset) {
     return create_empty_rowset_for_hole(tablet, Version(version, version),
                                         std::move(prev_rowset_meta), rowset);
 }
 
-Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, const Version& versions,
+Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet, const Version& versions,
                                                   RowsetMetaSharedPtr prev_rowset_meta,
                                                   RowsetSharedPtr* rowset,
                                                   const RowsetId* rowset_id) {

@@ -300,13 +300,19 @@ Status BaseTablet::capture_rs_readers_unlocked(const Versions& version_path,
                                                std::vector<RowSetSplits>* rs_splits) const {
     DCHECK(rs_splits != nullptr && rs_splits->empty());
     for (auto version : version_path) {
-        auto it = _rs_version_map.find(version);
-        if (it == _rs_version_map.end()) {
+        RowsetSharedPtr rowset;
+        if (auto it = _rs_version_map.find(version); it != _rs_version_map.end()) {
+            rowset = it->second;
+        } else {
             VLOG_NOTICE << "fail to find Rowset in rs_version for version. tablet=" << tablet_id()
                         << ", version='" << version.first << "-" << version.second;
-
-            it = _stale_rs_version_map.find(version);
-            if (it == _stale_rs_version_map.end()) {
+            if (auto stale_it = _stale_rs_version_map.find(version);
+                stale_it != _stale_rs_version_map.end()) {
+                rowset = stale_it->second;
+            } else {
+                rowset = on_demand_rowset_unlocked(version);
+            }
+            if (rowset == nullptr) {
                 return Status::Error<CAPTURE_ROWSET_READER_ERROR>(
                         "fail to find Rowset in stale_rs_version for version. tablet={}, "
                         "version={}-{}",
@@ -314,10 +320,10 @@ Status BaseTablet::capture_rs_readers_unlocked(const Versions& version_path,
             }
         }
         RowsetReaderSharedPtr rs_reader;
-        auto res = it->second->create_reader(&rs_reader);
+        auto res = rowset->create_reader(&rs_reader);
         if (!res.ok()) {
             return Status::Error<CAPTURE_ROWSET_READER_ERROR>(
-                    "failed to create reader for rowset:{}", it->second->rowset_id().to_string());
+                    "failed to create reader for rowset:{}", rowset->rowset_id().to_string());
         }
         rs_splits->emplace_back(std::move(rs_reader));
     }
