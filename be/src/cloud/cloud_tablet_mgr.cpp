@@ -176,7 +176,8 @@ public:
     CloudTabletCache()
             : LRUCachePolicy(CachePolicy::CacheType::CLOUD_TABLET_CACHE,
                              config::tablet_cache_capacity, LRUCacheType::NUMBER,
-                             /*stale_sweep_time_s*/ 0, config::tablet_cache_shards,
+                             /*stale_sweep_time_s*/ 0,
+                             static_cast<uint32_t>(config::tablet_cache_shards),
                              /*element_count_capacity*/ 0, /*enable_prune*/ true,
                              /*is_lru_k*/ false) {}
 
