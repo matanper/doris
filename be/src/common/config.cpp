@@ -1418,6 +1418,12 @@ DEFINE_Int32(max_depth_in_bkd_tree, "32");
 // index compaction
 DEFINE_mBool(inverted_index_compaction_enable, "true");
 DEFINE_mBool(enable_variant_subcolumn_index_compaction, "true");
+// Before index compaction merges the input indexes, read each input segment's index file once
+// through the file cache, in chunks of index_compaction_preload_chunk_bytes, on at most
+// index_compaction_preload_threads threads shared by all compactions.
+DEFINE_mBool(enable_index_compaction_preload, "true");
+DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
+DEFINE_Int32(index_compaction_preload_threads, "16");
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory

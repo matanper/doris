@@ -111,6 +111,15 @@ TEST(VariantSubcolumnIndexCompactionTest, PathMaterializedAsStringInAll) {
             {segment({{"a", str}}), segment({{"b", str}}, {"a"})}, "a"));
     // no segment proves nothing
     EXPECT_FALSE(path_materialized_as_string_in_all({}, "a"));
+
+    EXPECT_EQ(variant_path_storage({segment({{"a", str}}), segment({{"b", str}})}, "a"),
+              VariantPathStorage::ABSENT);
+    EXPECT_EQ(variant_path_storage({segment({{"b", str}}), segment({{"a", i64}})}, "a"),
+              VariantPathStorage::NON_STRING);
+    EXPECT_EQ(variant_path_storage({segment({{"a", i64}}), segment({}, {"a"})}, "a"),
+              VariantPathStorage::SPARSE);
+    EXPECT_EQ(variant_path_storage({segment({{"a", str}})}, "a"), VariantPathStorage::STRING);
+    EXPECT_EQ(variant_path_storage({}, "a"), VariantPathStorage::ABSENT);
 }
 
 TEST(VariantSubcolumnIndexCompactionTest, SelectsOnlyIndexesEveryInputCanMerge) {
@@ -149,18 +158,29 @@ TEST(VariantSubcolumnIndexCompactionTest, SelectsOnlyIndexesEveryInputCanMerge) 
     selection = select_variant_subcolumn_indexes({candidate}, inputs, missing, {}, all_files);
     EXPECT_TRUE(selection.merge.empty());
     EXPECT_EQ(selection.rebuild, 2);
+    EXPECT_EQ(selection.reasons.absent, 2);
 
     // The path is another type in one input segment.
     auto mistyped = segments;
     mistyped[uid][0] = segment({{"a", make_nullable(std::make_shared<DataTypeInt64>())}});
     selection = select_variant_subcolumn_indexes({candidate}, inputs, mistyped, {}, all_files);
     EXPECT_TRUE(selection.merge.empty());
+    EXPECT_EQ(selection.reasons.non_string, 2);
 
     // The path is sparse in one input segment.
     auto sparse = segments;
     sparse[uid][1] = segment({}, {"a"});
     selection = select_variant_subcolumn_indexes({candidate}, inputs, sparse, {}, all_files);
     EXPECT_TRUE(selection.merge.empty());
+    EXPECT_EQ(selection.reasons.sparse, 2);
+
+    // A segment without the path does not hide a sparse or mistyped one.
+    auto sparse_and_missing = sparse;
+    sparse_and_missing[uid][0] = segment({{"b", str}});
+    selection = select_variant_subcolumn_indexes({candidate}, inputs, sparse_and_missing, {},
+                                                 all_files);
+    EXPECT_EQ(selection.reasons.sparse, 2);
+    EXPECT_EQ(selection.reasons.absent, 0);
 
     // One input rowset built the ngram index with other properties: only the keyword index merges.
     auto changed = inputs;
@@ -171,6 +191,7 @@ TEST(VariantSubcolumnIndexCompactionTest, SelectsOnlyIndexesEveryInputCanMerge) 
     ASSERT_EQ(selection.merge.size(), 1);
     EXPECT_EQ(selection.merge[0].index->index_id(), 11);
     EXPECT_EQ(selection.rebuild, 1);
+    EXPECT_EQ(selection.reasons.properties, 1);
 
     // One input rowset has no such index at all.
     changed[1] = schema_with({make_index(11, uid, keyword)});
@@ -184,11 +205,13 @@ TEST(VariantSubcolumnIndexCompactionTest, SelectsOnlyIndexesEveryInputCanMerge) 
             [](int32_t, const TabletIndex& index) { return index.index_id() != 10; });
     ASSERT_EQ(selection.merge.size(), 1);
     EXPECT_EQ(selection.merge[0].index->index_id(), 11);
+    EXPECT_EQ(selection.reasons.file, 1);
 
     // An earlier index compaction of this column failed.
     selection = select_variant_subcolumn_indexes({candidate}, inputs, segments, {uid}, all_files);
     EXPECT_TRUE(selection.merge.empty());
     EXPECT_EQ(selection.rebuild, 2);
+    EXPECT_EQ(selection.reasons.skipped, 2);
 
     // Non-string sub-columns are not candidates.
     auto numeric = candidate;

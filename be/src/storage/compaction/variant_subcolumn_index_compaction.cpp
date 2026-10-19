@@ -45,19 +45,33 @@ const TabletIndex* find_index(const TabletSchema& schema, int64_t index_id) {
 
 } // namespace
 
-bool path_materialized_as_string_in_all(const std::vector<VariantSegmentPaths>& segments,
+VariantPathStorage variant_path_storage(const std::vector<VariantSegmentPaths>& segments,
                                         const std::string& path) {
     if (segments.empty()) {
-        return false;
+        return VariantPathStorage::ABSENT;
     }
-    return std::all_of(segments.begin(), segments.end(), [&](const VariantSegmentPaths& segment) {
+    bool absent = false;
+    bool non_string = false;
+    for (const auto& segment : segments) {
         if (segment.sparse.contains(path)) {
-            return false;
+            return VariantPathStorage::SPARSE;
         }
         auto it = segment.materialized.find(path);
-        return it != segment.materialized.end() && !it->second.empty() &&
-               std::all_of(it->second.begin(), it->second.end(), is_string_storage_type);
-    });
+        if (it == segment.materialized.end() || it->second.empty()) {
+            absent = true;
+        } else if (!std::all_of(it->second.begin(), it->second.end(), is_string_storage_type)) {
+            non_string = true;
+        }
+    }
+    if (non_string) {
+        return VariantPathStorage::NON_STRING;
+    }
+    return absent ? VariantPathStorage::ABSENT : VariantPathStorage::STRING;
+}
+
+bool path_materialized_as_string_in_all(const std::vector<VariantSegmentPaths>& segments,
+                                        const std::string& path) {
+    return variant_path_storage(segments, path) == VariantPathStorage::STRING;
 }
 
 VariantSubcolumnIndexSelection select_variant_subcolumn_indexes(
@@ -72,27 +86,42 @@ VariantSubcolumnIndexSelection select_variant_subcolumn_indexes(
         if (!field_is_slice_type(candidate.type)) {
             continue;
         }
-        bool path_ok = !skipped_variant_uids.contains(candidate.variant_uid);
-        if (path_ok) {
+        const bool skipped = skipped_variant_uids.contains(candidate.variant_uid);
+        VariantPathStorage storage = VariantPathStorage::ABSENT;
+        if (!skipped) {
             auto it = input_segments.find(candidate.variant_uid);
-            path_ok = it != input_segments.end() &&
-                      path_materialized_as_string_in_all(it->second, candidate.path);
+            if (it != input_segments.end()) {
+                storage = variant_path_storage(it->second, candidate.path);
+            }
         }
         for (const auto* index : candidate.indexes) {
-            bool ok = path_ok && !input_schemas.empty() &&
-                      std::all_of(input_schemas.begin(), input_schemas.end(),
-                                  [&](const TabletSchemaSPtr& schema) {
-                                      const auto* input_index =
-                                              find_index(*schema, index->index_id());
-                                      return input_index != nullptr &&
-                                             input_index->properties() == index->properties();
-                                  }) &&
-                      inputs_have_index_files(candidate.variant_uid, *index);
-            if (ok) {
+            size_t* reason = nullptr;
+            if (skipped) {
+                reason = &selection.reasons.skipped;
+            } else if (storage == VariantPathStorage::SPARSE) {
+                reason = &selection.reasons.sparse;
+            } else if (storage == VariantPathStorage::NON_STRING) {
+                reason = &selection.reasons.non_string;
+            } else if (storage == VariantPathStorage::ABSENT) {
+                reason = &selection.reasons.absent;
+            } else if (input_schemas.empty() ||
+                       !std::all_of(input_schemas.begin(), input_schemas.end(),
+                                    [&](const TabletSchemaSPtr& schema) {
+                                        const auto* input_index =
+                                                find_index(*schema, index->index_id());
+                                        return input_index != nullptr &&
+                                               input_index->properties() == index->properties();
+                                    })) {
+                reason = &selection.reasons.properties;
+            } else if (!inputs_have_index_files(candidate.variant_uid, *index)) {
+                reason = &selection.reasons.file;
+            }
+            if (reason == nullptr) {
                 selection.merge.push_back({.variant_uid = candidate.variant_uid,
                                            .path = candidate.path,
                                            .index = std::make_shared<TabletIndex>(*index)});
             } else {
+                ++*reason;
                 ++selection.rebuild;
             }
         }

@@ -1461,6 +1461,9 @@ DECLARE_mBool(inverted_index_compaction_enable);
 // Merge the inverted indexes of VARIANT string sub-columns during compaction instead of
 // rebuilding them, when every input segment materializes the sub-column.
 DECLARE_mBool(enable_variant_subcolumn_index_compaction);
+DECLARE_mBool(enable_index_compaction_preload);
+DECLARE_mInt64(index_compaction_preload_chunk_bytes);
+DECLARE_Int32(index_compaction_preload_threads);
 // Only for debug, do not use in production
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory
