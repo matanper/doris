@@ -21,6 +21,9 @@
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +48,7 @@
 #include "storage/index/inverted/inverted_index_writer.h"
 #include "storage/tablet/tablet_schema.h"
 #include "util/slice.h"
+#include "util/stopwatch.hpp"
 
 namespace doris {
 
@@ -319,9 +323,12 @@ public:
             auto dest_dir = index_file_writer.open(index);
             ASSERT_TRUE(dest_dir.has_value()) << dest_dir.error();
             std::vector<lucene::store::Directory*> dest_dirs = {dest_dir.value().get()};
+            MonotonicStopWatch watch;
+            watch.start();
             auto st = compact_column(index->index_id(), src_dirs, dest_dirs,
                                      kTestDir + "/tmp_" + std::to_string(index->index_id()),
                                      trans_vec, {dest_rows});
+            _compact_column_ns += watch.elapsed_time();
             ASSERT_TRUE(st.ok()) << st;
         }
         ASSERT_TRUE(index_file_writer.begin_close().ok());
@@ -375,6 +382,33 @@ public:
         return bitmap ? *bitmap : roaring::Roaring();
     }
 
+    // Norms of every field with norms, by field name.
+    std::map<std::wstring, std::vector<uint8_t>> norms(const std::string& segment,
+                                                       TabletIndex* index) {
+        IndexFileReader file_reader(io::global_local_filesystem(), prefix(segment),
+                                    InvertedIndexStorageFormatPB::V2);
+        EXPECT_TRUE(file_reader.init().ok());
+        auto dir = file_reader.open(index);
+        EXPECT_TRUE(dir.has_value()) << dir.error();
+        std::map<std::wstring, std::vector<uint8_t>> result;
+        auto* reader = lucene::index::IndexReader::open(dir.value().get(), 4096, false);
+        auto* infos = reader->getFieldInfos();
+        for (size_t i = 0; i < infos->size(); ++i) {
+            auto* fi = infos->fieldInfo(static_cast<int32_t>(i));
+            if (!fi->isIndexed || fi->omitNorms) {
+                continue;
+            }
+            std::vector<uint8_t> values(reader->maxDoc());
+            reader->norms(fi->name, values.data());
+            result[fi->name] = std::move(values);
+        }
+        reader->close();
+        _CLDELETE(reader);
+        return result;
+    }
+
+    // Time spent in compact_column by merge().
+    int64_t _compact_column_ns = 0;
     TabletColumn _column;
     IndexPolicyMgr _policy_mgr;
     IndexPolicyMgr* _previous_policy_mgr = nullptr;
@@ -442,6 +476,67 @@ TEST_F(VariantSubcolumnIndexMergeTest, MergedIndexMatchesRebuiltIndex) {
         EXPECT_EQ(nulls("merged", index), roaring::Roaring::bitmapOf(2, 1, 5))
                 << "index " << index->index_id();
         EXPECT_EQ(nulls("merged", index), nulls("rebuilt", index));
+        auto merged_norms = norms("merged", index);
+        EXPECT_FALSE(merged_norms.empty()) << "index " << index->index_id();
+        EXPECT_EQ(merged_norms, norms("rebuilt", index)) << "index " << index->index_id();
+    }
+}
+
+// Cost of merging one sparse sub-column index, the shape of a VARIANT path that few rows have,
+// against rebuilding it from the merged rows. Sizes come from the environment.
+TEST_F(VariantSubcolumnIndexMergeTest, DISABLED_SparsePathMergeCost) {
+    auto env_int = [](const char* name, int fallback) {
+        const char* v = std::getenv(name);
+        return v == nullptr ? fallback : std::atoi(v);
+    };
+    const int sources = env_int("BENCH_SOURCES", 25);
+    const int rows_per_source = env_int("BENCH_ROWS", 24000);
+    const int present_every = env_int("BENCH_PRESENT_EVERY", 50);
+    const int rounds = env_int("BENCH_ROUNDS", 20);
+    TabletIndex keyword = index_with(30, {});
+    TabletIndex ngram =
+            index_with(31, {{"analyzer", "merge_test_ngram4_lower"}, {"support_phrase", "true"}});
+    std::vector<TabletIndex*> indexes = {&keyword, &ngram};
+
+    using Row = std::optional<std::string>;
+    std::vector<std::string> names;
+    std::vector<Row> all_rows;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> trans_vec(sources);
+    for (int s = 0; s < sources; ++s) {
+        std::vector<Row> rows;
+        for (int r = 0; r < rows_per_source; ++r) {
+            if (r % present_every == 0) {
+                rows.emplace_back(fmt::format("C:\\Program Files\\app_{}\\bin\\svc.exe", r % 977));
+            } else {
+                rows.emplace_back(std::nullopt);
+            }
+            trans_vec[s].emplace_back(0, static_cast<uint32_t>(all_rows.size()));
+            all_rows.push_back(rows.back());
+        }
+        names.push_back("bench_src_" + std::to_string(s));
+        write_segment(names.back(), indexes, rows);
+    }
+    for (auto* index : indexes) {
+        std::vector<TabletIndex*> one = {index};
+        _compact_column_ns = 0;
+        MonotonicStopWatch merge_watch;
+        merge_watch.start();
+        for (int i = 0; i < rounds; ++i) {
+            merge(names, "bench_merged", one, trans_vec, static_cast<uint32_t>(all_rows.size()));
+        }
+        MonotonicStopWatch rebuild_watch;
+        rebuild_watch.start();
+        for (int i = 0; i < rounds; ++i) {
+            write_segment("bench_rebuilt", one, all_rows);
+        }
+        LOG(INFO) << "sparse path index " << index->index_id() << ": sources=" << sources
+                  << " rows=" << all_rows.size() << " present 1/" << present_every
+                  << " merge_ms=" << merge_watch.elapsed_time() / 1000000 / rounds
+                  << " rebuild_ms=" << rebuild_watch.elapsed_time() / 1000000 / rounds;
+        std::cerr << "BENCH index=" << index->index_id()
+                  << " merge_ms=" << merge_watch.elapsed_time() / 1000000 / rounds
+                  << " compact_column_ms=" << _compact_column_ns / 1000000 / rounds
+                  << " rebuild_ms=" << rebuild_watch.elapsed_time() / 1000000 / rounds << std::endl;
     }
 }
 
