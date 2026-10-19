@@ -1420,6 +1420,7 @@ DEFINE_Int32(inverted_index_read_buffer_size, "4096");
 DEFINE_Int32(max_depth_in_bkd_tree, "32");
 // index compaction
 DEFINE_mBool(inverted_index_compaction_enable, "true");
+DEFINE_mBool(enable_variant_subcolumn_index_compaction, "true");
 // When a compaction ends, whatever its outcome, drop its input segments from the segment cache.
 // Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
 // the segment cache does not count, so its memory bound does not hold for them.
