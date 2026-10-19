@@ -154,6 +154,11 @@ DECLARE_mBool(enable_hole_rowset_version_range);
 // enable_hole_rowset_version_range is true.
 DECLARE_mInt64(hole_rowset_max_versions);
 
+// How many of the last intermediate versions v of a hole rowset range [s, e] get their prefix
+// rowset [s, v] when the range is created. A reader of any earlier version gets its prefix
+// when it asks for it.
+DECLARE_mInt64(hole_rowset_eager_prefix_versions);
+
 // When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
 // no rows in a load without building a rowset writer for it, as long as the tablet is cached on
 // this BE. Only the per-tablet BE bookkeeping of the load (empty rowset markers, approximate

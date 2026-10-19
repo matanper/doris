@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
+#include <optional>
 
 #include "cloud/cloud_rowset_version_index.h"
 #include "storage/partial_update_info.h"
@@ -89,8 +91,15 @@ public:
     Status capture_rs_readers(const Version& spec_version, std::vector<RowSetSplits>* rs_splits,
                               const CaptureRowsetOps& opts) override;
 
+    // A version strictly inside a hole rowset range [s, e] is read through the path to s - 1
+    // and the prefix [s, v], which `on_demand_rowset_unlocked` provides when no rowset ends at v.
     [[nodiscard]] Result<std::vector<Version>> capture_consistent_versions_unlocked(
             const Version& version_range, const CaptureRowsetOps& options) const override;
+
+    // The prefix [s, v] of the hole rowset range [s, e] that holds version v, made when a reader
+    // asks for it. Concurrent readers of one version share one prefix, which is freed with the
+    // last of them; the tablet's version maps and version graph are left untouched.
+    [[nodiscard]] RowsetSharedPtr on_demand_rowset_unlocked(const Version& version) const override;
 
     // Capture versions with cache preference optimization.
     // This method prioritizes using cached/warmed-up rowsets when building version paths,
@@ -171,8 +180,10 @@ public:
     // With `can_use_hole_rowset_version_range()`, a run of versions becomes one hole rowset of at
     // most `config::hole_rowset_max_versions` versions, and a run starting right after a trailing
     // hole rowset extends that rowset instead of adding a new one. Each intermediate version v
-    // of a range [s, e] stays readable through a stale rowset [s, v] on the stale path, the same
-    // way compaction keeps the versions of its input rowsets readable.
+    // of a range [s, e] stays readable through a prefix rowset [s, v]: the last
+    // `config::hole_rowset_eager_prefix_versions` of them go on the stale path now, the same way
+    // compaction keeps the versions of its input rowsets readable, and the others are made when
+    // a reader asks for them (see `on_demand_rowset_unlocked`).
     // Otherwise one hole rowset per version is added, as before.
     // MUST hold EXCLUSIVE `_meta_lock`.
     Status add_hole_rowsets(const Version& versions, const RowsetMetaSharedPtr& template_meta,
@@ -629,6 +640,14 @@ private:
                   rowset_meta(std::move(rowset_meta_)) {}
     };
     mutable std::mutex _visible_pending_rs_lock;
+
+    // The hole rowset range [s, e] strictly holding `version` (s <= version < e) when no rowset
+    // on the stale path ends at `version`, so a read of it needs an on-demand prefix.
+    std::optional<Version> _hole_range_needing_prefix_unlocked(int64_t version) const;
+
+    // On-demand prefix rowsets, by version, while some reader holds them.
+    mutable std::mutex _on_demand_prefix_lock;
+    mutable std::map<std::pair<int64_t, int64_t>, std::weak_ptr<Rowset>> _on_demand_prefixes;
     std::map<int64_t, VisiblePendingRowset> _visible_pending_rs_map;
 };
 

@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "cloud/cloud_meta_mgr.h"
@@ -44,14 +45,17 @@ public:
     void SetUp() override {
         _saved_enable = config::enable_hole_rowset_version_range;
         _saved_max_versions = config::hole_rowset_max_versions;
+        _saved_eager_prefixes = config::hole_rowset_eager_prefix_versions;
         config::enable_hole_rowset_version_range = true;
         config::hole_rowset_max_versions = 128;
+        config::hole_rowset_eager_prefix_versions = 16;
         _tablet = make_tablet(false);
     }
 
     void TearDown() override {
         config::enable_hole_rowset_version_range = _saved_enable;
         config::hole_rowset_max_versions = _saved_max_versions;
+        config::hole_rowset_eager_prefix_versions = _saved_eager_prefixes;
     }
 
     std::shared_ptr<CloudTablet> make_tablet(bool merge_on_write) {
@@ -145,11 +149,14 @@ public:
             }
             auto path = tablet.capture_consistent_versions_unlocked(Version(0, v), {});
             ASSERT_TRUE(path.has_value()) << "version " << v << ": " << path.error();
+            auto captured = tablet.capture_consistent_rowsets_unlocked(Version(0, v), {});
+            ASSERT_TRUE(captured.has_value()) << "version " << v << ": " << captured.error();
+            ASSERT_EQ(captured.value().rowsets.size(), path.value().size()) << "version " << v;
             int64_t next = 0;
-            for (const auto& version : path.value()) {
+            for (size_t i = 0; i < path.value().size(); ++i) {
+                const auto& version = path.value()[i];
                 ASSERT_EQ(version.first, next) << "version " << v;
-                ASSERT_TRUE(tablet.get_rowset_by_version(version, true) != nullptr)
-                        << "version " << v << " path rowset " << version.to_string();
+                ASSERT_EQ(captured.value().rowsets[i]->version(), version) << "version " << v;
                 next = version.second + 1;
             }
             ASSERT_EQ(next, v + 1);
@@ -161,6 +168,7 @@ protected:
     std::shared_ptr<CloudTablet> _tablet;
     bool _saved_enable = true;
     int64_t _saved_max_versions = 128;
+    int64_t _saved_eager_prefixes = 16;
 };
 
 TEST_F(CloudHoleRowsetRangeTest, ApplyPendingCoalescesEmptyRun) {
@@ -368,6 +376,151 @@ TEST_F(CloudHoleRowsetRangeTest, SplitRemovesCrossingStaleHoleRowsets) {
     EXPECT_EQ(path_versions, _tablet->_stale_rs_version_map.size());
     EXPECT_EQ(_tablet->tablet_meta()->all_stale_rs_metas().size(),
               _tablet->_stale_rs_version_map.size());
+}
+
+} // namespace doris
+
+namespace doris {
+
+class CloudHolePrefixTest : public CloudHoleRowsetRangeTest {
+public:
+    // [0, 1] and a hole rowset range [2, 101].
+    void make_range() {
+        add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+        ASSERT_TRUE(fill_version_holes(_tablet.get(), 101).ok());
+        ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 101}}));
+    }
+
+    static size_t stale_count(const CloudTablet& tablet) {
+        return tablet._stale_rs_version_map.size();
+    }
+
+    std::vector<RowsetSharedPtr> read(int64_t version) {
+        std::shared_lock rlock(_tablet->get_header_lock());
+        auto captured = _tablet->capture_consistent_rowsets_unlocked(Version(0, version), {});
+        EXPECT_TRUE(captured.has_value()) << "version " << version;
+        return captured.has_value() ? captured.value().rowsets : std::vector<RowsetSharedPtr> {};
+    }
+};
+
+TEST_F(CloudHolePrefixTest, OnlyTheLastVersionsGetEagerPrefixes) {
+    make_range();
+    // Prefixes [2, v] for v in [85, 100] only.
+    EXPECT_EQ(stale_count(*_tablet), 16);
+    for (int64_t v = 85; v <= 100; ++v) {
+        EXPECT_TRUE(_tablet->_stale_rs_version_map.contains(Version(2, v))) << v;
+    }
+    expect_all_versions_capturable(*_tablet);
+}
+
+TEST_F(CloudHolePrefixTest, NoEagerPrefixesStillReadsEveryVersion) {
+    config::hole_rowset_eager_prefix_versions = 0;
+    make_range();
+    EXPECT_EQ(stale_count(*_tablet), 0);
+    expect_all_versions_capturable(*_tablet);
+    // Reading made no rowsets the tablet keeps.
+    EXPECT_EQ(stale_count(*_tablet), 0);
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 101}}));
+}
+
+TEST_F(CloudHolePrefixTest, ReadInsideRangeGetsAnEmptyPrefix) {
+    make_range();
+    auto rowsets = read(50);
+    ASSERT_EQ(rowsets.size(), 2);
+    EXPECT_EQ(rowsets[0]->version(), Version(0, 1));
+    EXPECT_EQ(rowsets[1]->version(), Version(2, 50));
+    EXPECT_TRUE(rowsets[1]->is_hole_rowset());
+    EXPECT_EQ(rowsets[1]->num_rows(), 0);
+    EXPECT_EQ(rowsets[1]->num_segments(), 0);
+    // The same read as an eager prefix gives.
+    auto eager = read(90);
+    ASSERT_EQ(eager.size(), 2);
+    EXPECT_EQ(eager[1], _tablet->_stale_rs_version_map.at(Version(2, 90)));
+    EXPECT_EQ(eager[1]->num_rows(), rowsets[1]->num_rows());
+
+    std::vector<RowSetSplits> splits;
+    ASSERT_TRUE(_tablet->capture_rs_readers(Version(0, 50), &splits, {}).ok());
+    ASSERT_EQ(splits.size(), 2);
+    EXPECT_EQ(splits[1].rs_reader->version(), Version(2, 50));
+}
+
+TEST_F(CloudHolePrefixTest, ConcurrentReadersShareOnePrefix) {
+    make_range();
+    constexpr int kReaders = 16;
+    std::vector<RowsetSharedPtr> prefixes(kReaders);
+    std::vector<std::thread> readers;
+    for (int i = 0; i < kReaders; ++i) {
+        readers.emplace_back([&, i] {
+            auto rowsets = read(40);
+            if (rowsets.size() == 2) {
+                prefixes[i] = rowsets[1];
+            }
+        });
+    }
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    for (int i = 0; i < kReaders; ++i) {
+        ASSERT_NE(prefixes[i], nullptr);
+        EXPECT_EQ(prefixes[i], prefixes[0]);
+    }
+    std::weak_ptr<Rowset> held = prefixes[0];
+    prefixes.clear();
+    // Freed with its last reader; the next read makes a new one.
+    EXPECT_TRUE(held.expired());
+    auto again = read(40);
+    ASSERT_EQ(again.size(), 2);
+    EXPECT_EQ(again[1]->version(), Version(2, 40));
+}
+
+TEST_F(CloudHolePrefixTest, IncrementalReadStartingAtRange) {
+    make_range();
+    std::shared_lock rlock(_tablet->get_header_lock());
+    auto captured = _tablet->capture_consistent_rowsets_unlocked(Version(2, 30), {});
+    ASSERT_TRUE(captured.has_value());
+    ASSERT_EQ(captured.value().rowsets.size(), 1);
+    EXPECT_EQ(captured.value().rowsets[0]->version(), Version(2, 30));
+}
+
+TEST_F(CloudHolePrefixTest, CompactionOverHoleRangesKeepsVersionsReadable) {
+    config::hole_rowset_eager_prefix_versions = 0;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(5, 5))},
+                false);
+    ASSERT_TRUE(fill_version_holes(_tablet.get(), 12).ok());
+    ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 4}, {5, 5}, {6, 12}}));
+    {
+        // What a cumulative compaction of [2, 12] commits: inputs to the stale path, the output
+        // in their place.
+        std::unique_lock wlock(_tablet->get_header_lock());
+        std::vector<RowsetSharedPtr> inputs;
+        for (const auto& version : {Version(2, 4), Version(5, 5), Version(6, 12)}) {
+            inputs.push_back(_tablet->get_rowset_by_version(version));
+        }
+        _tablet->delete_rowsets(inputs, wlock);
+        _tablet->add_rowsets({create_rowset(Version(2, 12))}, false, wlock, false);
+    }
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 12}}));
+    // Versions inside the output stay readable through the stale inputs while those last.
+    for (int64_t v : {3, 4, 5, 8, 12}) {
+        auto rowsets = read(v);
+        ASSERT_FALSE(rowsets.empty()) << v;
+        EXPECT_EQ(rowsets.back()->version().second, v) << v;
+    }
+    EXPECT_EQ(read(3).back()->version(), Version(2, 3));
+    EXPECT_EQ(read(8).back()->version(), Version(6, 8));
+}
+
+TEST_F(CloudHolePrefixTest, DisabledRangesNeedNoPrefixes) {
+    config::enable_hole_rowset_version_range = false;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+    ASSERT_TRUE(fill_version_holes(_tablet.get(), 6).ok());
+    EXPECT_EQ(live_versions(*_tablet),
+              (VersionSet {{0, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6}}));
+    std::shared_lock rlock(_tablet->get_header_lock());
+    for (int64_t v = 3; v <= 6; ++v) {
+        EXPECT_EQ(_tablet->on_demand_rowset_unlocked(Version(2, v)), nullptr) << v;
+    }
+    expect_all_versions_capturable(*_tablet);
 }
 
 } // namespace doris

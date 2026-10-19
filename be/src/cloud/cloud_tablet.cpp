@@ -86,6 +86,8 @@ bvar::Adder<int64_t> g_rowset_warmup_state_missing_count("rowset_warmup_state_mi
 bvar::Adder<int64_t> g_hole_rowset_range_created_count("hole_rowset_range_created_count");
 bvar::Adder<int64_t> g_hole_rowset_range_extended_count("hole_rowset_range_extended_count");
 bvar::Adder<int64_t> g_hole_rowset_range_split_count("hole_rowset_range_split_count");
+bvar::Adder<int64_t> g_hole_rowset_prefix_on_demand_count("hole_rowset_prefix_on_demand_count");
+bvar::Adder<int64_t> g_hole_rowset_prefix_shared_count("hole_rowset_prefix_shared_count");
 bvar::Window<bvar::Adder<int64_t>> g_capture_prefer_cache_count_window(
         "capture_prefer_cache_count_window", &g_capture_prefer_cache_count, 30);
 bvar::Window<bvar::Adder<int64_t>> g_capture_with_freshness_tolerance_count_window(
@@ -181,6 +183,22 @@ Status CloudTablet::capture_rs_readers(const Version& spec_version,
 
 [[nodiscard]] Result<std::vector<Version>> CloudTablet::capture_consistent_versions_unlocked(
         const Version& version_range, const CaptureRowsetOps& options) const {
+    if (auto hole = _hole_range_needing_prefix_unlocked(version_range.second);
+        hole.has_value() && hole->first >= version_range.first) {
+        // Versions [hole->first, version_range.second] hold no data, so the path up to the
+        // version before the range followed by that prefix reads the same as any other path.
+        std::vector<Version> path;
+        if (hole->first > version_range.first) {
+            auto head = capture_consistent_versions_unlocked(
+                    Version(version_range.first, hole->first - 1), options);
+            if (!head.has_value()) {
+                return ResultError(std::move(head.error()));
+            }
+            path = std::move(head.value());
+        }
+        path.emplace_back(hole->first, version_range.second);
+        return path;
+    }
     if (options.query_freshness_tolerance_ms > 0) {
         return capture_versions_with_freshness_tolerance(version_range, options);
     } else if (options.enable_prefer_cached_rowset && !enable_unique_key_merge_on_write()) {
@@ -581,6 +599,84 @@ bool CloudTablet::can_use_hole_rowset_version_range() const {
            tablet_state() == TABLET_RUNNING;
 }
 
+std::optional<Version> CloudTablet::_hole_range_needing_prefix_unlocked(int64_t version) const {
+    if (enable_unique_key_merge_on_write()) {
+        return std::nullopt;
+    }
+    std::optional<Version> range;
+    for (const auto& live : _visible_version_index.versions_overlapping(Version(version, version))) {
+        if (live.first > version || version >= live.second) {
+            continue;
+        }
+        auto it = _rs_version_map.find(live);
+        if (it == _rs_version_map.end()) {
+            break;
+        }
+        if (it->second->is_hole_rowset()) {
+            range = live;
+            break;
+        }
+        // Inside a compaction output only the stale path still ends reads in the middle, through
+        // the input rowsets, among them hole rowset ranges.
+        for (const auto& [stale, rowset] : _stale_rs_version_map) {
+            if (stale.second == version) {
+                return std::nullopt;
+            }
+            if (rowset->is_hole_rowset() && stale.first <= version && version < stale.second) {
+                range = stale;
+            }
+        }
+        break;
+    }
+    if (!range.has_value() || _stale_rs_version_map.contains(Version(range->first, version))) {
+        return std::nullopt;
+    }
+    return range;
+}
+
+RowsetSharedPtr CloudTablet::on_demand_rowset_unlocked(const Version& version) const {
+    if (version.first > version.second) {
+        return nullptr;
+    }
+    auto range = _hole_range_needing_prefix_unlocked(version.second);
+    if (!range.has_value() || range->first != version.first) {
+        return nullptr;
+    }
+    RowsetMetaSharedPtr template_meta;
+    if (auto it = _rs_version_map.find(*range); it != _rs_version_map.end()) {
+        template_meta = it->second->rowset_meta();
+    } else if (auto stale_it = _stale_rs_version_map.find(*range);
+               stale_it != _stale_rs_version_map.end()) {
+        template_meta = stale_it->second->rowset_meta();
+    } else {
+        return nullptr;
+    }
+
+    std::lock_guard lock(_on_demand_prefix_lock);
+    auto key = std::make_pair(version.first, version.second);
+    if (auto it = _on_demand_prefixes.find(key); it != _on_demand_prefixes.end()) {
+        if (auto prefix = it->second.lock()) {
+            g_hole_rowset_prefix_shared_count << 1;
+            return prefix;
+        }
+    }
+    std::erase_if(_on_demand_prefixes, [](const auto& entry) { return entry.second.expired(); });
+    RowsetSharedPtr prefix;
+    RowsetId prefix_id = _engine.next_rowset_id();
+    if (auto st = _engine.meta_mgr().create_empty_rowset_for_hole(this, version, template_meta,
+                                                                  &prefix, &prefix_id);
+        !st.ok()) {
+        LOG_WARNING("failed to create on-demand hole prefix rowset")
+                .tag("tablet_id", tablet_id())
+                .tag("version", version.to_string())
+                .error(st);
+        return nullptr;
+    }
+    _on_demand_prefixes[key] = prefix;
+    g_hole_rowset_prefix_on_demand_count << 1;
+    return prefix;
+}
+
 RowsetSharedPtr CloudTablet::_extendable_tail_hole_rowset() const {
     auto it = _rs_version_map.find(_tail_hole_version);
     if (it == _rs_version_map.end() || it->second->end_version() != _max_version ||
@@ -639,7 +735,9 @@ Status CloudTablet::add_hole_rowsets(const Version& versions,
         // are nested in the live range [start, end], so the greedy version path capture still
         // prefers the live rowset for any version >= end.
         std::vector<RowsetSharedPtr> prefixes;
-        for (int64_t v = next; v < end; ++v) {
+        const int64_t eager_from =
+                std::max(next, end - config::hole_rowset_eager_prefix_versions);
+        for (int64_t v = eager_from; v < end; ++v) {
             Version prefix_version(start, v);
             if (_stale_rs_version_map.contains(prefix_version)) {
                 continue; // the edge is still on the stale path
