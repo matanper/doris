@@ -15,8 +15,8 @@
 	url = https://github.com/hendrikmuhs/ccache-action
 [submodule "contrib/clucene"]
 	path = contrib/clucene
-	url = https://github.com/apache/doris-thirdparty.git
-	branch = clucene
+	url = https://github.com/Melian-Security/doris-thirdparty.git
+	branch = melian/clucene
 [submodule "contrib/apache-orc"]
 	path = contrib/apache-orc
 	url = https://github.com/apache/doris-thirdparty.git
