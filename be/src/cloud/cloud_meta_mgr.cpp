@@ -2525,7 +2525,7 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
     // Holes are in ascending version order, so only the last one can extend the tablet's
     // trailing hole rowset.
     for (const auto& [versions, template_meta] : hole_ranges) {
-        RETURN_IF_ERROR(tablet->add_hole_rowsets(versions, template_meta, wlock));
+        RETURN_IF_ERROR(tablet->add_hole_rowsets(versions, template_meta, wlock, max_version));
     }
     g_cloud_version_hole_filled_count << hole_version_count;
     return Status::OK();

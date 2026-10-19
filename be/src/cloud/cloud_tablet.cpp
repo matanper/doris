@@ -694,7 +694,8 @@ RowsetSharedPtr CloudTablet::_extendable_tail_hole_rowset() const {
 
 Status CloudTablet::add_hole_rowsets(const Version& versions,
                                      const RowsetMetaSharedPtr& template_meta,
-                                     std::unique_lock<BthreadSharedMutex>& meta_lock) {
+                                     std::unique_lock<BthreadSharedMutex>& meta_lock,
+                                     int64_t tablet_max_version) {
     if (versions.first > versions.second) {
         return Status::OK();
     }
@@ -735,8 +736,11 @@ Status CloudTablet::add_hole_rowsets(const Version& versions,
         // are nested in the live range [start, end], so the greedy version path capture still
         // prefers the live rowset for any version >= end.
         std::vector<RowsetSharedPtr> prefixes;
+        // Readers ask for versions near the tablet's newest one, so only the last versions of
+        // the tablet get a prefix now; ranges further back get theirs on demand.
         const int64_t eager_from =
-                std::max(next, end - config::hole_rowset_eager_prefix_versions);
+                std::max(next, std::max({_max_version, versions.second, tablet_max_version}) -
+                                       config::hole_rowset_eager_prefix_versions);
         for (int64_t v = eager_from; v < end; ++v) {
             Version prefix_version(start, v);
             if (_stale_rs_version_map.contains(prefix_version)) {

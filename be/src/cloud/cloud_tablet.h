@@ -180,14 +180,17 @@ public:
     // With `can_use_hole_rowset_version_range()`, a run of versions becomes one hole rowset of at
     // most `config::hole_rowset_max_versions` versions, and a run starting right after a trailing
     // hole rowset extends that rowset instead of adding a new one. Each intermediate version v
-    // of a range [s, e] stays readable through a prefix rowset [s, v]: the last
-    // `config::hole_rowset_eager_prefix_versions` of them go on the stale path now, the same way
-    // compaction keeps the versions of its input rowsets readable, and the others are made when
-    // a reader asks for them (see `on_demand_rowset_unlocked`).
+    // of a range [s, e] stays readable through a prefix rowset [s, v]: those among the last
+    // `config::hole_rowset_eager_prefix_versions` versions of the tablet go on the stale path
+    // now, the same way compaction keeps the versions of its input rowsets readable, and the
+    // others are made when a reader asks for them (see `on_demand_rowset_unlocked`).
     // Otherwise one hole rowset per version is added, as before.
     // MUST hold EXCLUSIVE `_meta_lock`.
+    // `tablet_max_version` is the tablet's newest version once the caller is done, when it
+    // fills holes up to a known version; the newest of `versions` and the tablet's otherwise.
     Status add_hole_rowsets(const Version& versions, const RowsetMetaSharedPtr& template_meta,
-                            std::unique_lock<BthreadSharedMutex>& meta_lock);
+                            std::unique_lock<BthreadSharedMutex>& meta_lock,
+                            int64_t tablet_max_version = -1);
 
     // Like delete_rowsets, but also removes edges from the version graph.
     // Used by schema change to prevent the greedy capture algorithm from

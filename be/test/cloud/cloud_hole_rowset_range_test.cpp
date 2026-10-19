@@ -413,6 +413,31 @@ TEST_F(CloudHolePrefixTest, OnlyTheLastVersionsGetEagerPrefixes) {
     expect_all_versions_capturable(*_tablet);
 }
 
+TEST_F(CloudHolePrefixTest, RangesBeforeTheTabletTailGetNoEagerPrefixes) {
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(50, 50))},
+                false);
+    ASSERT_TRUE(fill_version_holes(_tablet.get(), 100).ok());
+    ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 49}, {50, 50}, {51, 100}}));
+    // Only versions [84, 99] of the trailing range; none for [2, 49].
+    EXPECT_EQ(stale_count(*_tablet), 16);
+    for (int64_t v = 84; v <= 99; ++v) {
+        EXPECT_TRUE(_tablet->_stale_rs_version_map.contains(Version(51, v))) << v;
+    }
+    expect_all_versions_capturable(*_tablet);
+
+    // Many short ranges, as a backfilled tablet has: none of them before the tail.
+    auto tablet = make_tablet(false);
+    std::vector<RowsetSharedPtr> data {create_rowset(Version(0, 1))};
+    for (int64_t v = 10; v <= 200; v += 10) {
+        data.push_back(create_rowset(Version(v, v)));
+    }
+    add_rowsets(tablet.get(), data, false);
+    ASSERT_TRUE(fill_version_holes(tablet.get(), 200).ok());
+    // Prefixes [181, 184..188] and [191, 191..198].
+    EXPECT_EQ(stale_count(*tablet), 13);
+    expect_all_versions_capturable(*tablet);
+}
+
 TEST_F(CloudHolePrefixTest, NoEagerPrefixesStillReadsEveryVersion) {
     config::hole_rowset_eager_prefix_versions = 0;
     make_range();
