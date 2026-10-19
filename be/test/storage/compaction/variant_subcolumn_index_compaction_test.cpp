@@ -482,7 +482,6 @@ TEST_F(VariantSubcolumnIndexMergeTest, MergedIndexMatchesRebuiltIndex) {
     }
 }
 
-
 // Cost of merging one sparse sub-column index, the shape of a VARIANT path that few rows have,
 // against rebuilding it from the merged rows. Sizes come from the environment.
 TEST_F(VariantSubcolumnIndexMergeTest, DISABLED_SparsePathMergeCost) {
@@ -537,8 +536,7 @@ TEST_F(VariantSubcolumnIndexMergeTest, DISABLED_SparsePathMergeCost) {
         std::cerr << "BENCH index=" << index->index_id()
                   << " merge_ms=" << merge_watch.elapsed_time() / 1000000 / rounds
                   << " compact_column_ms=" << _compact_column_ns / 1000000 / rounds
-                  << " rebuild_ms=" << rebuild_watch.elapsed_time() / 1000000 / rounds
-                  << std::endl;
+                  << " rebuild_ms=" << rebuild_watch.elapsed_time() / 1000000 / rounds << std::endl;
     }
 }
 
