@@ -3044,6 +3044,22 @@ public class Config extends ConfigBase {
             + "of the previous partition's bucket number, which is considered an abnormal case alert."})
     public static double autobucket_out_of_bounds_percent_threshold = 0.5;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "自动分区按 range 创建的新分区不在最新一端时（例如导入历史数据），按时间上与它最近的有数据的分区估算分桶数，"
+                    + "而不是按最新的分区估算",
+            "When an auto range partition is created anywhere but at the newest end of the table, as when "
+                    + "historical data is loaded, estimate its buckets from the partitions with data nearest to it "
+                    + "in range instead of from the newest partitions."})
+    public static boolean autobucket_use_nearest_partitions = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "autobucket_use_nearest_partitions 生效时，只有起点与新分区相距不超过这么多个分区间隔的有数据分区参与估算；"
+                    + "没有这样的分区时使用 autobucket_min_buckets",
+            "With autobucket_use_nearest_partitions, only partitions with data starting within this many partition "
+                    + "intervals of the new partition take part in the estimate. Without any, the new partition "
+                    + "gets autobucket_min_buckets."})
+    public static int autobucket_nearest_partitions_window = 7;
+
     @ConfField(description = {"(已弃用，被 arrow_flight_max_connection 替代) Arrow Flight Server 中所有用户 token 的缓存上限，"
             + "超过后 LRU 淘汰，arrow flight sql 是无状态的协议，连接通常不会主动断开，"
             + "bearer token 从 cache 淘汰的同时会 unregister Connection.",
