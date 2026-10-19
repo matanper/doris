@@ -38,6 +38,9 @@ DEFINE_mInt32(meta_service_rpc_timeout_retry_times, "2");
 
 DEFINE_Int64(tablet_cache_capacity, "100000");
 DEFINE_Int64(tablet_cache_shards, "16");
+DEFINE_mInt64(tablet_cache_stale_sweep_time_sec, "3600");
+DEFINE_Validator(tablet_cache_stale_sweep_time_sec,
+                 [](const int64_t config) -> bool { return config >= 0; });
 DEFINE_mInt32(tablet_sync_interval_s, "1800");
 DEFINE_mInt32(init_scanner_sync_rowsets_parallelism, "10");
 DEFINE_mInt32(sync_rowsets_slow_threshold_ms, "1000");

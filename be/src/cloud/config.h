@@ -68,6 +68,10 @@ DECLARE_mInt32(meta_service_rpc_timeout_retry_times);
 // CloudTabletMgr config
 DECLARE_Int64(tablet_cache_capacity);
 DECLARE_Int64(tablet_cache_shards);
+// Seconds a cached tablet may go unused before the periodic cache prune drops it, e.g. a
+// tablet this BE served only while the BE it belongs to was down. 0 keeps every cached tablet
+// until the cache is full.
+DECLARE_mInt64(tablet_cache_stale_sweep_time_sec);
 DECLARE_mInt32(tablet_sync_interval_s);
 // parallelism for scanner init where may issue RPCs to sync rowset meta from MS
 DECLARE_mInt32(init_scanner_sync_rowsets_parallelism);

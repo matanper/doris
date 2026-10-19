@@ -285,4 +285,119 @@ TEST_F(CloudTabletMgrTest, SyncTabletsRefreshesMetaOfContinuouslyIngestedTablet)
     sp->clear_all_call_backs();
 }
 
+
+class CloudTabletCacheSweepTest : public CloudTabletMgrTest {
+public:
+    void SetUp() override {
+        CloudTabletMgrTest::SetUp();
+        _saved_sweep = config::tablet_cache_stale_sweep_time_sec;
+        config::tablet_cache_stale_sweep_time_sec = 1;
+        auto* sp = SyncPoint::get_instance();
+        sp->clear_all_call_backs();
+        sp->enable_processing();
+        sp->set_call_back("CloudMetaMgr::get_tablet_meta", [this](auto&& args) {
+            auto tablet_id = try_any_cast<int64_t>(args[0]);
+            auto* tablet_meta_ptr = try_any_cast<TabletMetaSharedPtr*>(args[1]);
+            *tablet_meta_ptr = std::make_shared<TabletMeta>(
+                    1, 2, tablet_id, 15674, 4, 5, TTabletSchema(), 6,
+                    std::unordered_map<uint32_t, uint32_t> {{7, 8}}, UniqueId(9, 10),
+                    TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F);
+            ++_meta_fetches;
+            try_any_cast_ret<Status>(args)->second = true;
+        });
+        sp->set_call_back("CloudMetaMgr::sync_tablet_rowsets",
+                          [](auto&& args) { try_any_cast_ret<Status>(args)->second = true; });
+    }
+
+    void TearDown() override {
+        auto* sp = SyncPoint::get_instance();
+        sp->disable_processing();
+        sp->clear_all_call_backs();
+        config::tablet_cache_stale_sweep_time_sec = _saved_sweep;
+    }
+
+    static bool cached(CloudTabletMgr& mgr, int64_t tablet_id) {
+        for (const auto& weak : mgr.get_weak_tablets()) {
+            if (auto tablet = weak.lock(); tablet && tablet->tablet_id() == tablet_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void use(CloudTabletMgr& mgr, int64_t tablet_id) {
+        auto res = mgr.get_tablet(tablet_id);
+        ASSERT_TRUE(res.has_value()) << res.error();
+    }
+
+    static void sweep(CloudTabletMgr& mgr) { mgr._cache->prune_stale(); }
+
+protected:
+    int64_t _saved_sweep = 3600;
+    std::atomic<int> _meta_fetches {0};
+};
+
+TEST_F(CloudTabletCacheSweepTest, IdleTabletIsDroppedAndReloadedOnNextUse) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    ASSERT_TRUE(cached(mgr, 1001));
+    EXPECT_EQ(_meta_fetches, 1);
+
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001)) << "used less than the sweep time ago";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+    EXPECT_TRUE(mgr.get_weak_tablets().empty()) << "sync_tablets would still see it";
+
+    // The next use loads it again from the meta-service.
+    use(mgr, 1001);
+    EXPECT_TRUE(cached(mgr, 1001));
+    EXPECT_EQ(_meta_fetches, 2);
+}
+
+TEST_F(CloudTabletCacheSweepTest, RecentlyUsedTabletStays) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    use(mgr, 1002);
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    use(mgr, 1002);
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+    EXPECT_TRUE(cached(mgr, 1002));
+    EXPECT_EQ(mgr.get_weak_tablets().size(), 1);
+}
+
+TEST_F(CloudTabletCacheSweepTest, HeldTabletSurvivesUntilReleased) {
+    CloudTabletMgr mgr(_engine);
+    auto held = mgr.get_tablet(1001);
+    ASSERT_TRUE(held.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+    EXPECT_EQ(held.value()->tablet_id(), 1001);
+
+    // Idle time counts from the last get_tablet, so once released it goes on the next sweep.
+    held.value().reset();
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+}
+
+TEST_F(CloudTabletCacheSweepTest, ZeroSweepTimeAndMemoryGcKeepTablets) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    config::tablet_cache_stale_sweep_time_sec = 0;
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+
+    mgr._cache->prune_all(false);
+    EXPECT_TRUE(cached(mgr, 1001));
+    // A forced prune, as /api/clear_cache does, still empties the cache.
+    mgr._cache->prune_all(true);
+    EXPECT_FALSE(cached(mgr, 1001));
+}
+
 } // namespace doris
