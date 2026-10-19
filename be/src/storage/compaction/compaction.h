@@ -76,6 +76,8 @@ public:
     // Reads every input segment data file once through the file cache.
     void preload_input_segment_files();
 
+    const BaseTabletSPtr& tablet() const { return _tablet; }
+
     // Pick input rowsets satisfied to compact
     virtual Status prepare_compact() = 0;
 

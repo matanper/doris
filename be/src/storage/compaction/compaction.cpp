@@ -2192,6 +2192,11 @@ bool CloudCompactionMixin::should_cache_compaction_output() {
         return true;
     }
 
+    if (compaction_type() == ReaderType::READER_FULL_COMPACTION &&
+        config::enable_file_cache_keep_full_compaction_output) {
+        return true;
+    }
+
     if (compaction_type() == ReaderType::READER_BASE_COMPACTION) {
         double input_rowsets_hit_cache_ratio = 0.0;
 

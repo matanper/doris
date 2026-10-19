@@ -1335,6 +1335,9 @@ DEFINE_mInt64(cache_lock_held_long_tail_threshold_us, "30000000");
 // write to file cache, enable_file_cache_adaptive_write true means when file cache is enough, it
 // will write to file cache; satisfying any of the two conditions will write to file cache.
 DEFINE_mBool(enable_file_cache_keep_base_compaction_output, "false");
+// Write the output of full compactions to the file cache, so the first query after a full
+// compaction does not read the whole tablet from remote storage.
+DEFINE_mBool(enable_file_cache_keep_full_compaction_output, "false");
 DEFINE_mBool(enable_file_cache_adaptive_write, "true");
 DEFINE_mDouble(file_cache_keep_base_compaction_output_min_hit_ratio, "0.7");
 DEFINE_mDouble(file_cache_keep_schema_change_output_min_hit_ratio, "0.7");

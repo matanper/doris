@@ -2627,6 +2627,26 @@ void CloudTablet::apply_visible_pending_rowsets() {
     }
 }
 
+int64_t CloudTablet::cumu_compaction_busy_backoff_ms(int64_t busy_count, int64_t min_ms,
+                                                     int64_t max_ms) {
+    min_ms = std::max<int64_t>(min_ms, 0);
+    const int64_t cap = std::max(min_ms, max_ms);
+    int64_t backoff = min_ms;
+    for (int64_t i = 1; i < busy_count && backoff > 0 && backoff < cap; ++i) {
+        backoff = backoff > cap / 2 ? cap : backoff * 2;
+    }
+    return std::min(backoff, cap);
+}
+
+void CloudTablet::on_cumu_compaction_busy(int64_t now_ms) {
+    int64_t busy_count = _cumu_compaction_busy_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    _cumu_compaction_busy_until_ms.store(
+            now_ms + cumu_compaction_busy_backoff_ms(busy_count,
+                                                     config::min_compaction_failure_interval_ms,
+                                                     config::cumu_compaction_busy_max_backoff_ms),
+            std::memory_order_relaxed);
+}
+
 #include "common/compile_check_end.h"
 
 } // namespace doris
