@@ -816,16 +816,12 @@ Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
                                          const io::IOContext* source_io_ctx) {
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
     return _create_column_meta_once_call.call([this, stats, source_io_ctx] {
+        std::shared_ptr<SegmentFooterPB> footer_pb_shared;
+        RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
+        // The parsed footer is charged to the footer cache; only what the segment builds from it
+        // counts here.
         const int64_t allocated_before = thread_net_allocated_bytes();
-        Status st;
-        {
-            std::shared_ptr<SegmentFooterPB> footer_pb_shared;
-            st = _get_segment_footer(footer_pb_shared, stats, source_io_ctx);
-            if (st.ok()) {
-                st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-            }
-        }
-        // Measured once the parsed footer is released, so only what the segment keeps counts.
+        Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
         _column_meta_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
         return st;
     });
@@ -1280,6 +1276,13 @@ Status Segment::seek_and_read_by_rowid(const TabletSchema& schema, SlotDescripto
     return Status::OK();
 }
 
+namespace {
+// Parsed segment footers in the footer cache or still held after it dropped them: their
+// serialized size, and the heap parsing them kept, which the cache is charged.
+bvar::Adder<int64_t> g_segment_footer_serialized_bytes("segment_footer_serialized_bytes");
+bvar::Adder<int64_t> g_segment_footer_charged_bytes("segment_footer_charged_bytes");
+} // namespace
+
 Status Segment::_get_segment_footer(std::shared_ptr<SegmentFooterPB>& footer_pb,
                                     OlapReaderStatistics* stats,
                                     const io::IOContext* source_io_ctx) {
@@ -1307,9 +1310,22 @@ Status Segment::_get_segment_footer(std::shared_ptr<SegmentFooterPB>& footer_pb,
     //   as other index/metadata pages and avoids competing with DATA_PAGE budget.
     if (!segment_footer_cache->lookup(cache_key, &cache_handle,
                                       segment_v2::PageTypePB::INDEX_PAGE)) {
+        // A parsed footer takes several times its serialized size; charge what parsing kept.
+        const int64_t allocated_before = thread_net_allocated_bytes();
         RETURN_IF_ERROR(_parse_footer(footer_pb_shared, stats, source_io_ctx));
-        segment_footer_cache->insert(cache_key, footer_pb_shared, footer_pb_shared->ByteSizeLong(),
-                                     &cache_handle, segment_v2::PageTypePB::INDEX_PAGE);
+        const auto serialized = static_cast<int64_t>(footer_pb_shared->ByteSizeLong());
+        const int64_t charge =
+                std::max(serialized, thread_net_allocated_bytes() - allocated_before);
+        g_segment_footer_serialized_bytes << serialized;
+        g_segment_footer_charged_bytes << charge;
+        // The counts leave the bvars when the last holder of the footer drops it.
+        std::shared_ptr<SegmentFooterPB> counted(
+                footer_pb_shared.get(), [footer = footer_pb_shared, serialized, charge](auto*) {
+                    g_segment_footer_serialized_bytes << -serialized;
+                    g_segment_footer_charged_bytes << -charge;
+                });
+        segment_footer_cache->insert(cache_key, std::move(counted), charge, &cache_handle,
+                                     segment_v2::PageTypePB::INDEX_PAGE);
     } else {
         VLOG_DEBUG << fmt::format("Segment footer of {}:{}:{} is found in cache",
                                   _file_reader->path().native(), _file_reader->size(),

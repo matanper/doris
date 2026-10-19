@@ -40,8 +40,6 @@
 namespace doris {
 namespace {
 
-bvar::Adder<uint64_t> g_preload_files("index_compaction_preload_files");
-bvar::Adder<uint64_t> g_preload_bytes("index_compaction_preload_bytes");
 bvar::Adder<uint64_t> g_preload_failed_chunks("index_compaction_preload_failed_chunks");
 bvar::LatencyRecorder g_preload_latency_us("index_compaction_preload_latency_us");
 bvar::Adder<uint64_t> g_data_preload_files("compaction_data_preload_files");
@@ -121,10 +119,7 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, Preloa
         if (dynamic_cast<io::CachedRemoteFileReader*>(reader.get()) == nullptr) {
             continue;
         }
-        if (queue == PreloadCacheQueue::INDEX) {
-            g_preload_files << 1;
-            g_preload_bytes << reader->size();
-        } else {
+        if (queue == PreloadCacheQueue::DISPOSABLE) {
             g_data_preload_files << 1;
             g_data_preload_bytes << reader->size();
         }
