@@ -552,7 +552,8 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
                && now - t->last_cumu_compaction_success_time_ms < config::cumu_compaction_interval_s * 1000
                && t->fetch_add_approximate_num_rowsets(0) < max_version_config / 2);
         g_cumu_compaction_not_frozen_tablet_num << !is_frozen;
-        return is_recent_failure || is_recent_no_suitable_version || is_frozen;
+        return is_recent_failure || is_recent_no_suitable_version || is_frozen ||
+               t->in_cumu_compaction_busy_backoff(now);
     };
     // We don't schedule tablets that are disabled for compaction
     auto disable = [](CloudTablet* t) { return t->tablet_meta()->tablet_schema()->disable_auto_compaction(); };

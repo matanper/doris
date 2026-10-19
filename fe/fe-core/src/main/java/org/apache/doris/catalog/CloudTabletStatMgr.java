@@ -499,6 +499,7 @@ public class CloudTabletStatMgr extends MasterDaemon {
             replica.setLocalSegmentSize(stat.getSegmentSize());
 
             CloudReplica cloudReplica = (CloudReplica) replica;
+            cloudReplica.setSegmentCount(stat.getNumSegments());
             cloudReplica.setLastGetTabletStatsTime(System.currentTimeMillis());
             int statsIntervalIndex = cloudReplica.getStatsIntervalIndex();
             if (activeUpdate || statsChanged) {

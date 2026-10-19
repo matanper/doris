@@ -29,6 +29,7 @@ import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.catalog.TabletMeta;
+import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.cloud.catalog.CloudTablet;
 import org.apache.doris.cloud.master.CloudReportHandler;
 import org.apache.doris.common.Config;
@@ -130,6 +131,16 @@ public class MasterImpl {
         }
 
         long backendId = backend.getId();
+
+        if (taskType == TTaskType.COMPACTION) {
+            // Only compactions dispatched by the final compaction scheduler are reported; their
+            // signature is the tablet id.
+            if (Config.isCloudMode()) {
+                ((CloudEnv) Env.getCurrentEnv()).getFinalCompactionScheduler()
+                        .onTaskFinished(backendId, signature, taskStatus);
+            }
+            return result;
+        }
 
         AgentTask task = AgentTaskQueue.getTask(backendId, taskType, signature);
         if (task == null) {

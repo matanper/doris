@@ -239,6 +239,20 @@ Status CloudCompactionAction::_handle_run_status_compaction(HttpRequest* req,
     return Status::OK();
 }
 
+Status CloudCompactionAction::_handle_cancel_compaction(HttpRequest* req,
+                                                        std::string* json_result) {
+    uint64_t tablet_id = 0;
+    RETURN_NOT_OK_STATUS_WITH_WARN(_check_param(req, &tablet_id, TABLET_ID_KEY),
+                                   "check param failed");
+    if (tablet_id == 0) {
+        return Status::InvalidArgument("tablet_id is required");
+    }
+    RETURN_IF_ERROR(_engine.cancel_full_compaction(static_cast<int64_t>(tablet_id)));
+    *json_result = absl::Substitute(
+            R"({"status" : "Success", "msg" : "cancel requested", "tablet_id" : $0})", tablet_id);
+    return Status::OK();
+}
+
 void CloudCompactionAction::handle(HttpRequest* req) {
     req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
 
@@ -253,6 +267,14 @@ void CloudCompactionAction::handle(HttpRequest* req) {
     } else if (_compaction_type == CompactionActionType::RUN_COMPACTION) {
         std::string json_result;
         Status st = _handle_run_compaction(req, &json_result);
+        if (!st.ok()) {
+            HttpChannel::send_reply(req, HttpStatus::OK, st.to_json());
+        } else {
+            HttpChannel::send_reply(req, HttpStatus::OK, json_result);
+        }
+    } else if (_compaction_type == CompactionActionType::CANCEL_COMPACTION) {
+        std::string json_result;
+        Status st = _handle_cancel_compaction(req, &json_result);
         if (!st.ok()) {
             HttpChannel::send_reply(req, HttpStatus::OK, st.to_json());
         } else {

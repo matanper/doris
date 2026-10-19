@@ -3060,6 +3060,69 @@ public class Config extends ConfigBase {
                     + "gets autobucket_min_buckets."})
     public static int autobucket_nearest_partitions_window = 7;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "存算分离模式下，对不再有新版本写入、且 segment 数相对其大小过多的 tablet 自动发起 full compaction",
+            "In cloud mode, run a full compaction on each tablet that no longer receives new versions and has "
+                    + "many more segments than its size needs."})
+    public static boolean enable_final_compaction = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "查找需要 final compaction 的 tablet 的间隔，单位秒",
+            "Interval in seconds between scans for tablets that need a final compaction."})
+    public static long final_compaction_check_interval_second = 300;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区在这么多秒内没有新的可见版本后，其 tablet 才会被 final compaction",
+            "A partition's tablets get a final compaction only after no new version became visible in it "
+                    + "for this many seconds."})
+    public static long final_compaction_quiet_second = 7200;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 segment 数至少是其大小所需 segment 数的这么多倍时才会被 final compaction",
+            "A tablet gets a final compaction only when it has at least this many times the segments its "
+                    + "size needs at the table's output segment size."})
+    public static double final_compaction_segment_ratio = 4.0;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "segment 数少于这个值的 tablet 不做 final compaction",
+            "Tablets with fewer segments than this never get a final compaction."})
+    public static long final_compaction_min_segments = 16;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "非 time_series 表 compaction 输出 segment 的大小（MB），与 BE 的 vertical_compaction_max_segment_size 一致",
+            "Output segment size in MB of compactions on tables without the time_series policy; matches the "
+                    + "BE's vertical_compaction_max_segment_size."})
+    public static long final_compaction_default_target_mbytes = 1024;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "执行 final compaction 的计算组；为空时使用 tablet 当前所在的计算组",
+            "Compute group whose backends run final compactions. When empty, a compute group the tablet is "
+                    + "already mapped to is used."})
+    public static String final_compaction_compute_group = "";
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每个 BE 同时执行的 final compaction 数上限；BE 的 max_base_compaction_threads 不应小于它",
+            "Maximum number of final compactions running at once on one backend. The backend's "
+                    + "max_base_compaction_threads should not be lower."})
+    public static int final_compaction_max_tasks_per_be = 4;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每轮最多发起的 final compaction 数",
+            "Maximum number of final compactions dispatched in one scan."})
+    public static int final_compaction_max_dispatch_per_round = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "BE 在这么多秒内没有报告结束的 final compaction 被视为失败",
+            "A final compaction whose end the backend has not reported after this many seconds counts as "
+                    + "failed."})
+    public static long final_compaction_task_timeout_second = 14400;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 final compaction 结束（或失败）后，这么多秒内不会再次发起",
+            "After a tablet's final compaction ends or fails, it is not dispatched again for this many "
+                    + "seconds."})
+    public static long final_compaction_cooldown_second = 21600;
+
     @ConfField(description = {"(已弃用，被 arrow_flight_max_connection 替代) Arrow Flight Server 中所有用户 token 的缓存上限，"
             + "超过后 LRU 淘汰，arrow flight sql 是无状态的协议，连接通常不会主动断开，"
             + "bearer token 从 cache 淘汰的同时会 unregister Connection.",

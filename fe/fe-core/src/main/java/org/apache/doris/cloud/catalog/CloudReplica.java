@@ -83,6 +83,9 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
 
     private static final Random rand = new Random();
 
+    // Segment count from the latest tablet stats, -1 until stats arrive. Not persisted.
+    private transient volatile long segmentCount = -1;
+
     // clusterId, secondaryBe, changeTimestamp
     private Map<String, Pair<Long, Long>> secondaryClusterToBackends
             = new ConcurrentHashMap<String, Pair<Long, Long>>();
@@ -243,6 +246,14 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             }
             return -1;
         }
+    }
+
+    public long getSegmentCount() {
+        return segmentCount;
+    }
+
+    public void setSegmentCount(long segmentCount) {
+        this.segmentCount = segmentCount;
     }
 
     public long getPrimaryBackendId() {
