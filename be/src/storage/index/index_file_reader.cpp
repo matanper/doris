@@ -17,9 +17,11 @@
 
 #include "storage/index/index_file_reader.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
+#include "runtime/memory/untracked_heap_account.h"
 #include "storage/index/inverted/inverted_index_compound_reader.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/tablet/tablet_schema.h"
@@ -32,7 +34,9 @@ Status IndexFileReader::init(int32_t read_buffer_size, const io::IOContext* io_c
     if (!_inited) {
         _read_buffer_size = read_buffer_size;
         if (_storage_format >= InvertedIndexStorageFormatPB::V2) {
+            const int64_t allocated_before = thread_net_allocated_bytes();
             RETURN_IF_ERROR(_init_from(read_buffer_size, io_ctx));
+            _retained_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
         }
         _inited = true;
     }

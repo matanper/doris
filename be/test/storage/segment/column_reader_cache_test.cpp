@@ -720,4 +720,72 @@ TEST_F(ColumnReaderCacheTest, FillMissingDecimalV3PrecisionForComplexTypeFromTab
     EXPECT_EQ(nested_type->get_scale(), 4);
 }
 
+// The cache counts what creating each reader kept, and stops counting a reader it evicts.
+TEST_F(ColumnReaderCacheTest, RetainedBytesFollowReadersAndEviction) {
+    config::max_segment_partial_column_cache_size = 2;
+    EXPECT_EQ(_cache->retained_bytes(), 0);
+
+    std::vector<ColumnMetaPB> metas;
+    for (int i = 1; i <= 3; ++i) {
+        setup_column_uid_mapping(i, i - 1);
+        ColumnMetaPB col_meta;
+        col_meta.set_type(static_cast<int32_t>(FieldType::OLAP_FIELD_TYPE_INT));
+        col_meta.set_unique_id(i);
+        col_meta.set_encoding(get_v2_default_encoding(static_cast<FieldType>(col_meta.type())));
+        col_meta.mutable_indexes()->Add()->set_type(ORDINAL_INDEX);
+        metas.push_back(col_meta);
+    }
+    setup_segment_footer(metas);
+
+    auto node_bytes = [this]() {
+        int64_t sum = 0;
+        for (const auto& node : _cache->_lru_list) {
+            sum += node.bytes;
+        }
+        return sum;
+    };
+    std::shared_ptr<ColumnReader> reader;
+    ASSERT_TRUE(_cache->get_column_reader(1, &reader, &_stats).ok());
+    const int64_t one = _cache->retained_bytes();
+    EXPECT_GT(one, 0);
+    EXPECT_EQ(one, node_bytes());
+    // A hit creates nothing.
+    ASSERT_TRUE(_cache->get_column_reader(1, &reader, &_stats).ok());
+    EXPECT_EQ(_cache->retained_bytes(), one);
+
+    ASSERT_TRUE(_cache->get_column_reader(2, &reader, &_stats).ok());
+    const int64_t two = _cache->retained_bytes();
+    EXPECT_GT(two, one);
+    const int64_t first_reader_bytes = _cache->_cache_map.at({1, {}})->bytes;
+
+    // Column 1 is evicted; its bytes leave the sum.
+    ASSERT_TRUE(_cache->get_column_reader(3, &reader, &_stats).ok());
+    EXPECT_EQ(_cache->_cache_map.count({1, {}}), 0);
+    EXPECT_EQ(_cache->retained_bytes(), node_bytes());
+    EXPECT_EQ(_cache->retained_bytes(),
+              two - first_reader_bytes + _cache->_cache_map.at({3, {}})->bytes);
+}
+
+// External meta a cached VARIANT reader loads after it was created is counted on top.
+TEST_F(ColumnReaderCacheTest, RetainedBytesCountVariantExternalMeta) {
+    setup_column_uid_mapping(1, 0);
+    ColumnMetaPB variant_meta;
+    variant_meta.set_type(static_cast<int32_t>(FieldType::OLAP_FIELD_TYPE_VARIANT));
+    variant_meta.set_unique_id(1);
+    variant_meta.set_encoding(get_v2_default_encoding(static_cast<FieldType>(variant_meta.type())));
+    variant_meta.mutable_indexes()->Add()->set_type(ORDINAL_INDEX);
+    setup_segment_footer({variant_meta});
+
+    std::shared_ptr<ColumnReader> reader;
+    ASSERT_TRUE(_cache->get_column_reader(1, &reader, &_stats).ok());
+    auto* variant_reader = dynamic_cast<VariantColumnReader*>(reader.get());
+    ASSERT_NE(variant_reader, nullptr);
+    const int64_t created = _cache->retained_bytes();
+    EXPECT_GT(created, 0);
+
+    variant_reader->_external_meta_bytes = 12345;
+    EXPECT_EQ(_cache->retained_bytes(), created + 12345);
+    variant_reader->_external_meta_bytes = 0;
+}
+
 } // namespace doris::segment_v2

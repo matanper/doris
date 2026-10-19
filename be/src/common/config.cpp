@@ -1429,6 +1429,7 @@ DEFINE_mBool(enable_index_compaction_preload, "true");
 // Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
 // the segment cache does not count, so its memory bound does not hold for them.
 DEFINE_mBool(enable_compaction_release_input_segments, "true");
+DEFINE_mBool(enable_compaction_pin_input_segments, "true");
 // Before merging, read each input segment data file once through the file cache, on the index
 // compaction preload pool.
 DEFINE_mBool(enable_compaction_data_preload, "true");
@@ -1476,6 +1477,10 @@ DEFINE_Int32(segment_cache_capacity, "-1");
 DEFINE_Int32(segment_cache_fd_percentage, "20");
 DEFINE_mInt32(estimated_mem_per_column_reader, "512");
 DEFINE_Int32(segment_cache_memory_percentage, "5");
+// A cached segment that has grown past segment_cache_recharge_ratio times its charge plus
+// segment_cache_recharge_min_bytes is re-inserted with its real size on its next lookup.
+DEFINE_mDouble(segment_cache_recharge_ratio, "1.25");
+DEFINE_mInt64(segment_cache_recharge_min_bytes, "65536");
 DEFINE_Bool(enable_segment_cache_prune, "false");
 
 // enable feature binlog, default false

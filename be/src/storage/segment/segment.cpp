@@ -54,6 +54,7 @@
 #include "io/fs/file_system.h"
 #include "io/io_common.h"
 #include "runtime/exec_env.h"
+#include "runtime/memory/untracked_heap_account.h"
 #include "runtime/query_context.h"
 #include "runtime/runtime_predicate.h"
 #include "runtime/runtime_state.h"
@@ -333,7 +334,24 @@ void Segment::set_cache_loader(ReaderType reader_type) {
     *_cache_loader_counter << 1;
 }
 
+namespace {
+bvar::Adder<int64_t> g_segment_real_retained_bytes("segment_real_retained_bytes");
+} // namespace
+
+int64_t Segment::real_mem_usage() {
+    int64_t bytes = meta_mem_usage() + _column_meta_bytes.load(std::memory_order_relaxed);
+    if (_create_column_meta_once_call.has_called() && _column_reader_cache != nullptr) {
+        bytes += _column_reader_cache->retained_bytes();
+    }
+    if (_index_file_reader_open.has_called() && _index_file_reader != nullptr) {
+        bytes += _index_file_reader->retained_bytes();
+    }
+    g_segment_real_retained_bytes << bytes - _reported_real_bytes.exchange(bytes);
+    return bytes;
+}
+
 Segment::~Segment() {
+    g_segment_real_retained_bytes << -_reported_real_bytes.load();
     if (_cache_loader_counter != nullptr) {
         *_cache_loader_counter << -1;
     }
@@ -798,9 +816,18 @@ Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
                                          const io::IOContext* source_io_ctx) {
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
     return _create_column_meta_once_call.call([this, stats, source_io_ctx] {
-        std::shared_ptr<SegmentFooterPB> footer_pb_shared;
-        RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
-        return _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
+        const int64_t allocated_before = thread_net_allocated_bytes();
+        Status st;
+        {
+            std::shared_ptr<SegmentFooterPB> footer_pb_shared;
+            st = _get_segment_footer(footer_pb_shared, stats, source_io_ctx);
+            if (st.ok()) {
+                st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
+            }
+        }
+        // Measured once the parsed footer is released, so only what the segment keeps counts.
+        _column_meta_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
+        return st;
     });
 }
 
