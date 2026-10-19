@@ -44,6 +44,8 @@ bvar::Adder<uint64_t> g_preload_files("index_compaction_preload_files");
 bvar::Adder<uint64_t> g_preload_bytes("index_compaction_preload_bytes");
 bvar::Adder<uint64_t> g_preload_failed_chunks("index_compaction_preload_failed_chunks");
 bvar::LatencyRecorder g_preload_latency_us("index_compaction_preload_latency_us");
+bvar::Adder<uint64_t> g_data_preload_files("compaction_data_preload_files");
+bvar::Adder<uint64_t> g_data_preload_bytes("compaction_data_preload_bytes");
 // Bytes of the preloaded files that were already in the file cache, by the queue holding them.
 // Load and compaction outputs are written to the normal or TTL queue, while blocks filled by
 // index reads go to the index queue.
@@ -105,7 +107,7 @@ struct PreloadChunk {
 
 } // namespace
 
-void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers) {
+void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, PreloadCacheQueue queue) {
     ThreadPool* pool = config::enable_file_cache ? preload_pool() : nullptr;
     if (pool == nullptr || readers.empty()) {
         return;
@@ -119,8 +121,13 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers) {
         if (dynamic_cast<io::CachedRemoteFileReader*>(reader.get()) == nullptr) {
             continue;
         }
-        g_preload_files << 1;
-        g_preload_bytes << reader->size();
+        if (queue == PreloadCacheQueue::INDEX) {
+            g_preload_files << 1;
+            g_preload_bytes << reader->size();
+        } else {
+            g_data_preload_files << 1;
+            g_data_preload_bytes << reader->size();
+        }
         count_cached_bytes(*reader);
         for (size_t offset = 0; offset < reader->size(); offset += chunk_size) {
             chunks.push_back({reader, offset, std::min(chunk_size, reader->size() - offset)});
@@ -128,12 +135,13 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers) {
     }
     CountDownLatch latch(static_cast<int>(chunks.size()));
     for (const auto& chunk : chunks) {
-        auto st = pool->submit_func([chunk, &latch]() {
+        auto st = pool->submit_func([chunk, &latch, queue]() {
             io::IOContext io_ctx;
             io_ctx.is_dryrun = true;
-            // The index file reader reads with the same flag, so missed blocks land in the same
-            // cache queue either way.
-            io_ctx.is_index_data = true;
+            // The later reads use the same flags, so missed blocks land in the same cache queue
+            // either way.
+            io_ctx.is_index_data = queue == PreloadCacheQueue::INDEX;
+            io_ctx.is_disposable = queue == PreloadCacheQueue::DISPOSABLE;
             // A cache block is ready once the dry run returns.
             io_ctx.cache_write_mode_override = io::CacheWriteMode::SYNC_WRITE;
             size_t bytes_read = 0;
@@ -154,7 +162,8 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers) {
     g_preload_latency_us << watch.elapsed_time() / 1000;
 }
 
-void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets) {
+void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
+                         PreloadCacheQueue queue) {
     if (!config::enable_file_cache || targets.empty()) {
         return;
     }
@@ -170,7 +179,7 @@ void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets) {
             readers.push_back(std::move(reader));
         }
     }
-    preload_cached_files(readers);
+    preload_cached_files(readers, queue);
 }
 
 } // namespace doris

@@ -26,6 +26,12 @@
 
 namespace doris {
 
+// The file cache queue a preload fills, which must be the one the later reads use.
+enum class PreloadCacheQueue {
+    INDEX,      // inverted index files, read with is_index_data
+    DISPOSABLE, // segment data files read by compaction, read with is_disposable
+};
+
 // One file for preload_index_files().
 struct IndexFilePreloadTarget {
     io::FileSystemSPtr fs;
@@ -42,10 +48,12 @@ struct IndexFilePreloadTarget {
 // all callers, which bounds the concurrent remote reads and their buffers. Returns when every
 // chunk is done; a failed chunk leaves its blocks to the reads that need them. Files that are not
 // read through the file cache are skipped.
-void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets);
+void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
+                         PreloadCacheQueue queue = PreloadCacheQueue::INDEX);
 
 // preload_index_files() for files already open. Readers that do not read through the file cache
 // are skipped.
-void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers);
+void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers,
+                          PreloadCacheQueue queue = PreloadCacheQueue::INDEX);
 
 } // namespace doris

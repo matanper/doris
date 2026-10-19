@@ -200,6 +200,30 @@ TEST_F(IndexCompactionPreloadTest, preload_fetches_only_missing_blocks) {
     EXPECT_EQ(remote->bytes(), reader->size());
 }
 
+// Data files fill the disposable queue, which compaction reads use.
+TEST_F(IndexCompactionPreloadTest, data_preload_fills_disposable_queue) {
+    auto remote = open_remote();
+    auto reader = cached(remote);
+    preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+    EXPECT_EQ(remote->reads(), 3);
+
+    IOContext io_ctx;
+    io_ctx.is_disposable = true;
+    std::string buffer(64 * 1024, '\0');
+    for (size_t offset = 0; offset < reader->size(); offset += 1_mb) {
+        size_t bytes_read = 0;
+        ASSERT_TRUE(
+                reader->read_at(offset, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx)
+                        .ok());
+    }
+    EXPECT_EQ(remote->reads(), 3);
+
+    const int64_t cached_before = exposed("index_compaction_preload_cached_disposable_bytes");
+    preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+    EXPECT_EQ(exposed("index_compaction_preload_cached_disposable_bytes") - cached_before,
+              static_cast<int64_t>(reader->size()));
+}
+
 // Readers that do not go through the file cache, and a disabled file cache, are skipped.
 TEST_F(IndexCompactionPreloadTest, preload_skips_uncached_readers) {
     auto remote = open_remote();
