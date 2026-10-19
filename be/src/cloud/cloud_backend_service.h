@@ -51,6 +51,10 @@ public:
     void check_warm_up_cache_async(TCheckWarmUpCacheAsyncResponse& response,
                                    const TCheckWarmUpCacheAsyncRequest& request) override;
 
+    // The tablets this BE owns in its compute group, which it keeps cached
+    void publish_tablet_ownership(TPublishTabletOwnershipResponse& response,
+                                  const TPublishTabletOwnershipRequest& request) override;
+
     void get_stream_load_record(TStreamLoadRecordResult& result,
                                 int64_t last_stream_record_time) override;
 

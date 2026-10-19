@@ -20,8 +20,10 @@
 #include <bthread/countdown_event.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <set>
+#include <unordered_set>
 #include <utility>
 
 #include "cloud/cloud_cluster_info.h"
@@ -32,10 +34,12 @@
 #include "common/status.h"
 #include "cpp/sync_point.h"
 #include "runtime/memory/cache_policy.h"
+#include "storage/segment/segment_loader.h"
 #include "util/debug_points.h"
 #include "util/defer_op.h"
 #include "util/lru_cache.h"
 #include "util/stack_util.h"
+#include "util/time.h"
 
 namespace doris {
 uint64_t g_tablet_report_inactive_duration_ms = 0;
@@ -45,6 +49,18 @@ bvar::Adder<uint64_t> g_cumu_compaction_not_frozen_tablet_num(
         "cumu_compaction_not_frozen_tablet_num");
 bvar::Adder<uint64_t> g_sync_tablets_meta_num("sync_tablets_meta_num");
 bvar::Adder<uint64_t> g_sync_tablets_rowsets_num("sync_tablets_rowsets_num");
+// Cached tablets this BE owns and does not own, as of the last foreign tablet sweep.
+bvar::Status<int64_t> g_tablet_cache_owned("cloud_tablet_cache_owned", 0);
+bvar::Status<int64_t> g_tablet_cache_foreign("cloud_tablet_cache_foreign", 0);
+bvar::Adder<int64_t> g_tablet_cache_foreign_evicted("cloud_tablet_cache_foreign_evicted");
+std::atomic<int64_t> g_tablet_ownership_received_ms {0};
+bvar::PassiveStatus<int64_t> g_tablet_ownership_age_s(
+        "cloud_tablet_ownership_age_s",
+        [](void*) -> int64_t {
+            const int64_t received_ms = g_tablet_ownership_received_ms.load();
+            return received_ms == 0 ? -1 : (UnixMillis() - received_ms) / 1000;
+        },
+        nullptr);
 namespace {
 
 // port from
@@ -174,15 +190,17 @@ namespace {
 // /api/clear_cache asks for, empties it.
 class CloudTabletCache final : public LRUCachePolicy {
 public:
-    CloudTabletCache()
+    explicit CloudTabletCache(CloudTabletMgr* mgr)
             : LRUCachePolicy(CachePolicy::CacheType::CLOUD_TABLET_CACHE,
                              config::tablet_cache_capacity, LRUCacheType::NUMBER,
                              /*stale_sweep_time_s*/ 0,
                              static_cast<uint32_t>(config::tablet_cache_shards),
                              /*element_count_capacity*/ 0, /*enable_prune*/ true,
-                             /*is_lru_k*/ false) {}
+                             /*is_lru_k*/ false),
+              _mgr(mgr) {}
 
     void prune_stale() override {
+        _mgr->evict_idle_foreign_tablets();
         _stale_sweep_time_s = static_cast<uint32_t>(
                 std::clamp<int64_t>(config::tablet_cache_stale_sweep_time_sec, 0, UINT32_MAX));
         LRUCachePolicy::prune_stale();
@@ -196,6 +214,12 @@ public:
             LRUCachePolicy::prune_all(force);
         }
     }
+
+    // Drops every unreferenced entry `pred` matches, wherever it is in the LRU order.
+    PrunedInfo prune_matching(const CachePrunePredicate& pred) { return _cache->prune_if(pred); }
+
+private:
+    CloudTabletMgr* _mgr;
 };
 
 } // namespace
@@ -203,7 +227,7 @@ public:
 CloudTabletMgr::CloudTabletMgr(CloudStorageEngine& engine)
         : _engine(engine),
           _tablet_map(std::make_unique<TabletMap>()),
-          _cache(std::make_unique<CloudTabletCache>()) {}
+          _cache(std::make_unique<CloudTabletCache>(this)) {}
 
 CloudTabletMgr::~CloudTabletMgr() = default;
 
@@ -324,6 +348,99 @@ bool CloudTabletMgr::peek_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* ta
     }
     *tablet_meta = tablet->tablet_meta();
     return true;
+}
+
+struct CloudTabletMgr::Ownership {
+    std::unordered_set<int64_t> owned;
+    int64_t generated_at_ms = 0;
+    int64_t received_ms = 0;
+};
+
+void CloudTabletMgr::set_owned_tablets(const std::vector<int64_t>& tablet_ids,
+                                       int64_t generated_at_ms) {
+    auto ownership = std::make_shared<Ownership>();
+    ownership->owned.reserve(tablet_ids.size());
+    ownership->owned.insert(tablet_ids.begin(), tablet_ids.end());
+    ownership->generated_at_ms = generated_at_ms;
+    ownership->received_ms = UnixMillis();
+    {
+        std::lock_guard lock(_ownership_mtx);
+        if (_ownership != nullptr && _ownership->generated_at_ms > generated_at_ms) {
+            // An older publish arrived late, e.g. from an FE that lost mastership.
+            return;
+        }
+        _ownership = std::move(ownership);
+    }
+    g_tablet_ownership_received_ms = UnixMillis();
+    LOG(INFO) << "tablet ownership: this BE owns " << tablet_ids.size()
+              << " tablets, as of FE time " << generated_at_ms;
+}
+
+int64_t CloudTabletMgr::evict_idle_foreign_tablets() {
+    std::shared_ptr<const Ownership> ownership;
+    {
+        std::lock_guard lock(_ownership_mtx);
+        ownership = _ownership;
+    }
+    if (ownership == nullptr) {
+        return 0;
+    }
+    int64_t owned = 0;
+    int64_t foreign = 0;
+    _tablet_map->traverse([&](const std::shared_ptr<CloudTablet>& tablet) {
+        ownership->owned.contains(tablet->tablet_id()) ? ++owned : ++foreign;
+    });
+    g_tablet_cache_owned.set_value(owned);
+    g_tablet_cache_foreign.set_value(foreign);
+
+    const int64_t now_ms = UnixMillis();
+    if (!config::enable_foreign_tablet_eviction || foreign == 0) {
+        return 0;
+    }
+    if (now_ms - ownership->received_ms > config::tablet_ownership_max_age_sec * 1000) {
+        LOG(INFO) << "tablet ownership: last owned set arrived "
+                  << (now_ms - ownership->received_ms) / 1000 << "s ago, keeping the " << foreign
+                  << " cached tablets this BE does not own";
+        return 0;
+    }
+    const int64_t idle_ms = config::foreign_tablet_idle_evict_sec * 1000;
+    std::vector<std::shared_ptr<CloudTablet>> evicted;
+    // Only entries nobody holds through get_tablet are offered, so a tablet a reader, a load or
+    // a compaction got from the cache is never dropped here.
+    auto pred = [&](const LRUHandle* handle) -> bool {
+        const auto& tablet = static_cast<const CacheValue*>(handle->value)->tablet;
+        if (ownership->owned.contains(tablet->tablet_id())) {
+            return false;
+        }
+        const int64_t last_used_ms =
+                std::max<int64_t>(handle->last_visit_time, tablet->last_access_time_ms);
+        if (now_ms - last_used_ms < idle_ms) {
+            return false;
+        }
+        // The cache entry and the tablet map hold it; anything else, such as a compaction that
+        // took it from the tablet map, is still using it.
+        if (tablet.use_count() > 2) {
+            return false;
+        }
+        evicted.push_back(tablet);
+        return true;
+    };
+    static_cast<CloudTabletCache*>(_cache.get())->prune_matching(pred);
+    for (const auto& tablet : evicted) {
+        tablet->traverse_rowsets(
+                [](const RowsetSharedPtr& rowset) {
+                    SegmentLoader::instance()->erase_segments(rowset->rowset_id(),
+                                                              rowset->num_segments());
+                },
+                true);
+    }
+    g_tablet_cache_foreign_evicted << static_cast<int64_t>(evicted.size());
+    if (!evicted.empty()) {
+        LOG(INFO) << "tablet ownership: dropped " << evicted.size() << " of " << foreign
+                  << " cached tablets this BE does not own, idle for at least "
+                  << config::foreign_tablet_idle_evict_sec << "s";
+    }
+    return static_cast<int64_t>(evicted.size());
 }
 
 void CloudTabletMgr::erase_tablet(int64_t tablet_id) {

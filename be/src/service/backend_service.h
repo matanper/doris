@@ -151,6 +151,9 @@ public:
     void warm_up_tablets(TWarmUpTabletsResponse& response,
                          const TWarmUpTabletsRequest& request) override;
 
+    void publish_tablet_ownership(TPublishTabletOwnershipResponse& response,
+                                  const TPublishTabletOwnershipRequest& request) override;
+
     void stop_works() { _agent_server->stop_report_workers(); }
 
 protected:
