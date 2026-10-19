@@ -3133,6 +3133,18 @@ public class Config extends ConfigBase {
     public static boolean enable_compaction_debt_dispatch = true;
 
     @ConfField(mutable = true, masterOnly = true, description = {
+            "在云模式下，定期向每个 BE 发送它所拥有的 tablet 集合，BE 据此释放长时间未使用的非本 BE 拥有的 tablet。",
+            "In cloud mode, periodically send each backend the full set of tablets it owns, the ones whose "
+                    + "primary backend in its compute group it is. A backend drops a cached tablet it does not own "
+                    + "once nothing has used it for be config foreign_tablet_idle_evict_sec."})
+    public static boolean enable_cloud_tablet_ownership_publish = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "向 BE 发送其所拥有的 tablet 集合的间隔，单位秒。",
+            "Interval in seconds between publishes of the tablets each backend owns."})
+    public static long cloud_tablet_ownership_publish_interval_second = 300;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
             "rowset 数不少于这个值的 tablet 才算有积压",
             "A tablet has a rowset backlog when it has at least this many rowsets."})
     public static long compaction_debt_min_rowsets = 64;

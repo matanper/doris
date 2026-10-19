@@ -17,6 +17,7 @@
 
 #include "cloud/cloud_tablet_mgr.h"
 
+#include <bvar/bvar.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
 #include <gtest/gtest.h>
@@ -285,7 +286,6 @@ TEST_F(CloudTabletMgrTest, SyncTabletsRefreshesMetaOfContinuouslyIngestedTablet)
     sp->clear_all_call_backs();
 }
 
-
 class CloudTabletCacheSweepTest : public CloudTabletMgrTest {
 public:
     void SetUp() override {
@@ -398,6 +398,127 @@ TEST_F(CloudTabletCacheSweepTest, ZeroSweepTimeAndMemoryGcKeepTablets) {
     // A forced prune, as /api/clear_cache does, still empties the cache.
     mgr._cache->prune_all(true);
     EXPECT_FALSE(cached(mgr, 1001));
+}
+
+// Tablets this BE does not own go once idle; the ones it owns stay however long they idle.
+class CloudForeignTabletEvictionTest : public CloudTabletCacheSweepTest {
+public:
+    void SetUp() override {
+        CloudTabletCacheSweepTest::SetUp();
+        config::tablet_cache_stale_sweep_time_sec = 0;
+        _saved_idle = config::foreign_tablet_idle_evict_sec;
+        _saved_max_age = config::tablet_ownership_max_age_sec;
+        config::foreign_tablet_idle_evict_sec = 1;
+    }
+
+    void TearDown() override {
+        config::foreign_tablet_idle_evict_sec = _saved_idle;
+        config::tablet_ownership_max_age_sec = _saved_max_age;
+        CloudTabletCacheSweepTest::TearDown();
+    }
+
+    static int64_t bvar_value(const char* name) {
+        return std::stoll(bvar::Variable::describe_exposed(name));
+    }
+
+    static void idle() { std::this_thread::sleep_for(std::chrono::milliseconds(1200)); }
+
+protected:
+    int64_t _saved_idle = 600;
+    int64_t _saved_max_age = 1200;
+};
+
+TEST_F(CloudForeignTabletEvictionTest, WithoutOwnedSetNothingIsDropped) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    idle();
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+}
+
+TEST_F(CloudForeignTabletEvictionTest, IdleForeignTabletsAreDroppedOwnedStay) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    use(mgr, 1002);
+    use(mgr, 1003);
+    mgr.set_owned_tablets({1001}, 1);
+    const int64_t evicted = bvar_value("cloud_tablet_cache_foreign_evicted");
+    sweep(mgr);
+    EXPECT_EQ(mgr.get_weak_tablets().size(), 3) << "used less than the idle time ago";
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_owned"), 1);
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign"), 2);
+
+    idle();
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+    EXPECT_FALSE(cached(mgr, 1002));
+    EXPECT_FALSE(cached(mgr, 1003));
+    EXPECT_EQ(bvar_value("cloud_tablet_cache_foreign_evicted"), evicted + 2);
+    EXPECT_GE(bvar_value("cloud_tablet_ownership_age_s"), 1);
+
+    // A dropped tablet loads again on its next use.
+    use(mgr, 1002);
+    EXPECT_TRUE(cached(mgr, 1002));
+}
+
+TEST_F(CloudForeignTabletEvictionTest, ForeignTabletInUseStays) {
+    CloudTabletMgr mgr(_engine);
+    auto held = mgr.get_tablet(1001);
+    ASSERT_TRUE(held.has_value());
+    use(mgr, 1002);
+    // Held through the tablet map, as the compaction scheduler takes tablets.
+    std::shared_ptr<CloudTablet> from_map;
+    for (const auto& weak : mgr.get_weak_tablets()) {
+        if (auto tablet = weak.lock(); tablet && tablet->tablet_id() == 1002) {
+            from_map = tablet;
+        }
+    }
+    ASSERT_NE(from_map, nullptr);
+    mgr.set_owned_tablets({}, 1);
+    idle();
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+    EXPECT_TRUE(cached(mgr, 1002));
+
+    held.value().reset();
+    from_map.reset();
+    idle();
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+    EXPECT_FALSE(cached(mgr, 1002));
+}
+
+TEST_F(CloudForeignTabletEvictionTest, StaleOwnedSetDisablesEviction) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    mgr.set_owned_tablets({}, 1);
+    config::tablet_ownership_max_age_sec = 1;
+    idle();
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+
+    config::enable_foreign_tablet_eviction = false;
+    mgr.set_owned_tablets({}, 2);
+    sweep(mgr);
+    EXPECT_TRUE(cached(mgr, 1001));
+    config::enable_foreign_tablet_eviction = true;
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+}
+
+TEST_F(CloudForeignTabletEvictionTest, OwnershipChangesTakeEffectOnNextSet) {
+    CloudTabletMgr mgr(_engine);
+    use(mgr, 1001);
+    use(mgr, 1002);
+    mgr.set_owned_tablets({1001}, 10);
+    // 1002 becomes owned, 1001 foreign.
+    mgr.set_owned_tablets({1002}, 20);
+    // A late publish computed before the last one is ignored.
+    mgr.set_owned_tablets({1001}, 15);
+    idle();
+    sweep(mgr);
+    EXPECT_FALSE(cached(mgr, 1001));
+    EXPECT_TRUE(cached(mgr, 1002));
 }
 
 } // namespace doris

@@ -396,6 +396,18 @@ struct TPythonPackageInfo {
     2: optional string version
 }
 
+// The full set of tablets a backend owns in its compute group: those whose primary backend it is.
+struct TPublishTabletOwnershipRequest {
+    1: optional string cluster_id
+    // When the frontend computed the set, in ms since the epoch.
+    2: optional i64 generated_at_ms
+    3: optional list<Types.TTabletId> owned_tablet_ids
+}
+
+struct TPublishTabletOwnershipResponse {
+    1: optional Status.TStatus status
+}
+
 service BackendService {
     AgentService.TAgentResult submit_tasks(1:list<AgentService.TAgentTaskRequest> tasks);
 
@@ -455,4 +467,6 @@ service BackendService {
 
     // Get installed pip packages for a specific Python version
     list<TPythonPackageInfo> get_python_packages(1:string python_version);
+
+    TPublishTabletOwnershipResponse publish_tablet_ownership(1: TPublishTabletOwnershipRequest request);
 }
