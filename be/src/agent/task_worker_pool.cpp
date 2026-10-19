@@ -1714,17 +1714,21 @@ void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
         break;
     }
 
-    CloudStorageEngine::CompactionFinishCallback on_full_finish;
-    if (report_finish && compaction_type == CompactionType::FULL_COMPACTION) {
-        on_full_finish = report;
+    // Full and cumulative compactions report when the task ends; a base compaction when it is
+    // submitted.
+    const bool reports_at_end = compaction_type == CompactionType::FULL_COMPACTION ||
+                                compaction_type == CompactionType::CUMULATIVE_COMPACTION;
+    CloudStorageEngine::CompactionFinishCallback on_finish;
+    if (report_finish && reports_at_end) {
+        on_finish = report;
     }
     Status status = engine.submit_compaction_task(tablet, compaction_type,
-                                                  /*trigger_method=*/1, on_full_finish);
+                                                  /*trigger_method=*/1, on_finish);
     if (!status.ok()) {
         LOG(WARNING) << "failed to submit cloud compaction task. tablet_id=" << tablet->tablet_id()
                      << ", type=" << compaction_req.type << ", error=" << status;
         report(status);
-    } else if (compaction_type != CompactionType::FULL_COMPACTION) {
+    } else if (!reports_at_end) {
         report(status);
     }
 }

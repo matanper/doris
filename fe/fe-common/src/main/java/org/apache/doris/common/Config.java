@@ -3123,6 +3123,53 @@ public class Config extends ConfigBase {
                     + "seconds."})
     public static long final_compaction_cooldown_second = 21600;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "存算分离模式下，对 rowset 积压多、且近期没有 cumulative compaction 的 tablet，向其所在计算组的 BE 发起 "
+                    + "cumulative compaction；BE 只对其缓存中的 tablet 自动 compaction，重启后未被访问的 tablet 依赖它",
+            "In cloud mode, send a cumulative compaction to each tablet with a rowset backlog and no recent "
+                    + "cumulative compaction, on its backend in the compute group that loads it. A backend only "
+                    + "compacts the tablets it has cached, so after a restart the tablets nothing reads or loads "
+                    + "depend on this."})
+    public static boolean enable_compaction_debt_dispatch = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "rowset 数不少于这个值的 tablet 才算有积压",
+            "A tablet has a rowset backlog when it has at least this many rowsets."})
+    public static long compaction_debt_min_rowsets = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 在这么多秒内没有 cumulative compaction 才会被发起",
+            "A tablet is sent a cumulative compaction only when none committed on it for this many seconds."})
+    public static long compaction_debt_idle_second = 1800;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "发起 cumulative compaction 的计算组；为空时使用最近导入或 compaction 该 tablet 的计算组",
+            "Compute group whose backends get the cumulative compactions. When empty, the compute group that "
+                    + "last loaded or compacted the tablet."})
+    public static String compaction_debt_compute_group = "";
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每个 BE 同时由 FE 发起的 cumulative compaction 数上限",
+            "Maximum number of cumulative compactions this scheduler runs at once on one backend."})
+    public static int compaction_debt_max_tasks_per_be = 4;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每轮最多发起的 cumulative compaction 数",
+            "Maximum number of cumulative compactions sent in one scan."})
+    public static int compaction_debt_max_dispatch_per_round = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "BE 在这么多秒内没有报告结束的 cumulative compaction 被视为失败",
+            "A cumulative compaction whose end the backend has not reported after this many seconds counts "
+                    + "as failed."})
+    public static long compaction_debt_task_timeout_second = 3600;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 cumulative compaction 结束后，这么多秒内不会再次发起；BE 此时已缓存该 tablet，会继续自行 compaction",
+            "After a tablet's cumulative compaction ends, it is not sent another for this many seconds; its "
+                    + "backend has the tablet cached by then and keeps compacting it."})
+    public static long compaction_debt_cooldown_second = 900;
+
     @ConfField(description = {"(已弃用，被 arrow_flight_max_connection 替代) Arrow Flight Server 中所有用户 token 的缓存上限，"
             + "超过后 LRU 淘汰，arrow flight sql 是无状态的协议，连接通常不会主动断开，"
             + "bearer token 从 cache 淘汰的同时会 unregister Connection.",

@@ -89,7 +89,7 @@ public class CloudEnv extends Env {
 
     private CleanCopyJobScheduler cleanCopyJobScheduler;
     private CloudSnapshotHandler cloudSnapshotHandler;
-    private FinalCompactionScheduler finalCompactionScheduler;
+    private CloudCompactionScheduler cloudCompactionScheduler;
 
     private String cloudInstanceId;
 
@@ -108,11 +108,11 @@ public class CloudEnv extends Env {
         this.cloudSyncVersionDaemon = new CloudSyncVersionDaemon();
         this.cloudFEVersionSynchronizer = new CloudFEVersionSynchronizer();
         this.cloudSnapshotHandler = CloudSnapshotHandler.getInstance();
-        this.finalCompactionScheduler = new FinalCompactionScheduler();
+        this.cloudCompactionScheduler = new CloudCompactionScheduler();
     }
 
-    public FinalCompactionScheduler getFinalCompactionScheduler() {
-        return this.finalCompactionScheduler;
+    public CloudCompactionScheduler getCloudCompactionScheduler() {
+        return this.cloudCompactionScheduler;
     }
 
     public CloudTabletRebalancer getCloudTabletRebalancer() {
@@ -184,7 +184,7 @@ public class CloudEnv extends Env {
         }
         upgradeMgr.start();
         cloudSnapshotHandler.start();
-        finalCompactionScheduler.start();
+        cloudCompactionScheduler.start();
     }
 
     public CloudFEVersionSynchronizer getCloudFEVersionSynchronizer() {

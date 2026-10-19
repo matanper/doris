@@ -143,11 +143,11 @@ public:
     // Called once with the outcome of a submitted full compaction.
     using CompactionFinishCallback = std::function<void(const Status&)>;
 
-    // `on_full_finish` is used by full compactions only. It is called when the task ends, but not
-    // when this returns an error, which means the task was never submitted.
+    // `on_finish` is used by full and cumulative compactions. It is called when the task ends, but
+    // not when this returns an error, which means the task was never submitted.
     Status submit_compaction_task(const CloudTabletSPtr& tablet, CompactionType compaction_type,
                                   int trigger_method = 0,
-                                  CompactionFinishCallback on_full_finish = nullptr);
+                                  CompactionFinishCallback on_finish = nullptr);
 
     // Stops the full compaction submitted on the tablet: a queued one before it starts, a running
     // one at the next block it merges.
@@ -224,7 +224,8 @@ private:
     Status _adjust_compaction_thread_num();
     Status _submit_base_compaction_task(const CloudTabletSPtr& tablet, int trigger_method = 0);
     Status _submit_cumulative_compaction_task(const CloudTabletSPtr& tablet,
-                                              int trigger_method = 0);
+                                              int trigger_method = 0,
+                                              CompactionFinishCallback on_finish = nullptr);
     Status _submit_full_compaction_task(const CloudTabletSPtr& tablet, int trigger_method = 0,
                                         CompactionFinishCallback on_finish = nullptr);
     // True when max_parallel_cumu_compactions_per_tablet cumulative compactions are submitted on

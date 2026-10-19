@@ -136,7 +136,7 @@ public class MasterImpl {
             // Only compactions dispatched by the final compaction scheduler are reported; their
             // signature is the tablet id.
             if (Config.isCloudMode()) {
-                ((CloudEnv) Env.getCurrentEnv()).getFinalCompactionScheduler()
+                ((CloudEnv) Env.getCurrentEnv()).getCloudCompactionScheduler()
                         .onTaskFinished(backendId, signature, taskStatus);
             }
             return result;
