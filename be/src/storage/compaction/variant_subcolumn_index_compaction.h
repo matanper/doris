@@ -52,11 +52,36 @@ struct VariantSubcolumnIndexCandidate {
     std::vector<const TabletIndex*> indexes;
 };
 
+// Why candidate indexes were left to the writer to rebuild; each index counts once, under the
+// first reason that applies in this order.
+struct VariantSubcolumnIndexRebuildReasons {
+    size_t skipped = 0;    // an earlier index compaction of the VARIANT column failed
+    size_t sparse = 0;     // some input segment keeps the path in its sparse column
+    size_t non_string = 0; // some input segment stores the path with a non-string type
+    size_t absent = 0;     // some input segment has no sub-column for the path
+    size_t properties = 0; // some input rowset lacks the index or built it with other properties
+    size_t file = 0;       // some input segment lacks the index file
+};
+
 struct VariantSubcolumnIndexSelection {
     std::vector<VariantSubcolumnIndexToCompact> merge;
     // candidate indexes left to the writer to rebuild
     size_t rebuild = 0;
+    VariantSubcolumnIndexRebuildReasons reasons;
 };
+
+// How a set of segments stores one path of a VARIANT column.
+enum class VariantPathStorage {
+    STRING,     // every segment materializes it as a string sub-column
+    SPARSE,     // some segment keeps it in the sparse column
+    NON_STRING, // some segment materializes it with a non-string type
+    ABSENT,     // some segment does not store it at all, and no segment is SPARSE or NON_STRING
+};
+
+// The storage of `path` across `segments`. An empty segment list is ABSENT: it does not prove
+// the path is a string sub-column.
+VariantPathStorage variant_path_storage(const std::vector<VariantSegmentPaths>& segments,
+                                        const std::string& path);
 
 // True when every segment stores `path` as a materialized string sub-column and none keeps it in
 // a sparse column. An empty segment list is not enough to prove it.

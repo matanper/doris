@@ -59,6 +59,7 @@
 #include "storage/compaction/cumulative_compaction.h"
 #include "storage/compaction/cumulative_compaction_policy.h"
 #include "storage/compaction/cumulative_compaction_time_series_policy.h"
+#include "storage/compaction/index_compaction_preload.h"
 #include "storage/compaction/variant_subcolumn_index_compaction.h"
 #include "storage/compaction_task_tracker.h"
 #include "storage/data_dir.h"
@@ -724,6 +725,19 @@ bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_merged(
         "variant_subcolumn_index_compaction_merged");
 bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_rebuilt(
         "variant_subcolumn_index_compaction_rebuilt");
+// The rebuilt indexes by the reason they could not be merged.
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_skipped(
+        "variant_subcolumn_index_compaction_rebuilt_skipped");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_sparse(
+        "variant_subcolumn_index_compaction_rebuilt_sparse");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_non_string(
+        "variant_subcolumn_index_compaction_rebuilt_non_string");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_absent(
+        "variant_subcolumn_index_compaction_rebuilt_absent");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_properties(
+        "variant_subcolumn_index_compaction_rebuilt_properties");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_rebuilt_file(
+        "variant_subcolumn_index_compaction_rebuilt_file");
 } // namespace
 
 Status Compaction::do_inverted_index_compaction() {
@@ -847,6 +861,37 @@ Status Compaction::do_inverted_index_compaction() {
     std::unordered_map<RowsetId, Rowset*> rs_id_to_rowset_map;
     for (auto&& rs : _input_rowsets) {
         rs_id_to_rowset_map.emplace(rs->rowset_id(), rs.get());
+    }
+
+    if (config::enable_index_compaction_preload &&
+        _cur_tablet_schema->get_inverted_index_storage_format() >=
+                InvertedIndexStorageFormatPB::V2) {
+        // The merges below read every source index file in many small pieces; reading each file
+        // once up front turns their cache misses into a few large remote reads.
+        std::vector<IndexFilePreloadTarget> targets;
+        for (const auto& m : src_seg_to_id_map) {
+            const auto& [rowset_id, seg_id] = m.first;
+            auto it = rs_id_to_rowset_map.find(rowset_id);
+            if (it == rs_id_to_rowset_map.end()) {
+                continue;
+            }
+            auto* rowset = it->second;
+            auto fs = rowset->rowset_meta()->fs();
+            auto seg_path = rowset->segment_path(seg_id);
+            if (fs == nullptr || !seg_path.has_value()) {
+                continue;
+            }
+            const auto file_info = rowset->rowset_meta()->inverted_index_file_info(seg_id);
+            const int64_t file_size = file_info.has_index_size() && file_info.index_size() > 0
+                                              ? file_info.index_size()
+                                              : -1;
+            auto prefix = InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value());
+            targets.push_back({.fs = fs,
+                               .path = InvertedIndexDescriptor::get_index_file_path_v2(prefix),
+                               .file_size = file_size,
+                               .tablet_id = _tablet->tablet_id()});
+        }
+        preload_index_files(targets);
     }
 
     // src index dirs
@@ -1336,6 +1381,12 @@ void Compaction::construct_variant_subcolumn_index_compaction(RowsetWriterContex
                                    });
             });
     g_variant_subcolumn_index_compaction_rebuilt << selection.rebuild;
+    g_variant_subcolumn_index_rebuilt_skipped << selection.reasons.skipped;
+    g_variant_subcolumn_index_rebuilt_sparse << selection.reasons.sparse;
+    g_variant_subcolumn_index_rebuilt_non_string << selection.reasons.non_string;
+    g_variant_subcolumn_index_rebuilt_absent << selection.reasons.absent;
+    g_variant_subcolumn_index_rebuilt_properties << selection.reasons.properties;
+    g_variant_subcolumn_index_rebuilt_file << selection.reasons.file;
     ctx.variant_subcolumn_indexes_to_compact = std::move(selection.merge);
 }
 
