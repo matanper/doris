@@ -253,7 +253,7 @@ Status IndexBuilder::update_inverted_index_info() {
                 without_index_uids.empty() ? &_alter_index_ids : &without_index_uids));
 
         auto input_rowset_meta = input_rowset->rowset_meta();
-        RowsetMetaSharedPtr rowset_meta = std::make_shared<RowsetMeta>();
+        RowsetMetaSharedPtr rowset_meta = RowsetMeta::create_shared();
         rowset_meta->set_num_rows(input_rowset_meta->num_rows());
         if (output_rs_tablet_schema->get_inverted_index_storage_format() ==
             InvertedIndexStorageFormatPB::V1) {

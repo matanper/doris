@@ -41,7 +41,7 @@ CloudRowsetWriter::~CloudRowsetWriter() {
 
 Status CloudRowsetWriter::init(const RowsetWriterContext& rowset_writer_context) {
     _context = rowset_writer_context;
-    _rowset_meta = std::make_shared<RowsetMeta>();
+    _rowset_meta = RowsetMeta::create_shared();
 
     if (_context.is_local_rowset()) {
         // In cloud mode, this branch implies it is an intermediate rowset for external merge sort,
