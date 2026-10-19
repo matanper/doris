@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
 #include "core/block/block.h"
@@ -47,6 +48,7 @@
 #include "storage/rowset/rowset_meta.h"
 #include "storage/rowset/rowset_reader_context.h"
 #include "storage/schema.h"
+#include "storage/segment/column_reader.h"
 #include "storage/segment/lazy_init_segment_iterator.h"
 #include "storage/segment/segment.h"
 #include "storage/tablet/tablet_meta.h"
@@ -264,6 +266,12 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     bool should_use_cache = use_cache || (_read_context->reader_type == ReaderType::READER_QUERY &&
                                           enable_segment_cache);
 
+    if (_pinned_segments == nullptr && should_use_cache &&
+        config::enable_compaction_pin_input_segments &&
+        segment_v2::ColumnReader::is_compaction_reader_type(_read_context->reader_type)) {
+        _pinned_segments = std::make_shared<segment_v2::PinnedSegments>();
+    }
+
     auto segment_count = _rowset->num_segments();
     auto [seg_start, seg_end] = _segment_offsets;
     // If seg_start == seg_end, it means that the segments of a rowset is not
@@ -290,8 +298,8 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
         /// and prevents excessive memory consumption, especially for wide tables.
         if (_segment_row_ranges.empty()) {
             _read_options.row_ranges.clear();
-            iter = std::make_unique<LazyInitSegmentIterator>(_rowset, i, should_use_cache,
-                                                             _input_schema, _read_options);
+            iter = std::make_unique<LazyInitSegmentIterator>(
+                    _rowset, i, should_use_cache, _input_schema, _read_options, _pinned_segments);
         } else {
             DCHECK_EQ(seg_end - seg_start, _segment_row_ranges.size());
             auto local_options = _read_options;
@@ -300,8 +308,8 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                 local_options.condition_cache_digest =
                         local_options.row_ranges.get_digest(local_options.condition_cache_digest);
             }
-            iter = std::make_unique<LazyInitSegmentIterator>(_rowset, i, should_use_cache,
-                                                             _input_schema, local_options);
+            iter = std::make_unique<LazyInitSegmentIterator>(
+                    _rowset, i, should_use_cache, _input_schema, local_options, _pinned_segments);
         }
 
         if (iter->empty()) {

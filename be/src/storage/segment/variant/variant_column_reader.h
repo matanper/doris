@@ -210,6 +210,11 @@ public:
 
     const VariantStatistics* get_stats() const { return _statistics.get(); }
 
+    // Heap the external meta of this reader holds once all of it is loaded; 0 before.
+    int64_t external_meta_bytes() const {
+        return _external_meta_bytes.load(std::memory_order_relaxed);
+    }
+
     // Expose raw root column reader for test assertions (e.g., dedup checks).
     const std::shared_ptr<ColumnReader>& get_root_column_reader() const {
         return _root_column_reader;
@@ -437,7 +442,7 @@ private:
     // Externalized meta reader (optional)
     std::unique_ptr<VariantExternalMetaReader> _ext_meta_reader;
     // Heap allocated by loading all the external meta, and the bvars counting it; set once.
-    int64_t _external_meta_bytes = 0;
+    std::atomic<int64_t> _external_meta_bytes = 0;
     bvar::Adder<int64_t>* _external_meta_readers_counter = nullptr;
     bvar::Adder<int64_t>* _external_meta_bytes_counter = nullptr;
 

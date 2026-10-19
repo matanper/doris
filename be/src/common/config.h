@@ -1464,6 +1464,9 @@ DECLARE_mBool(inverted_index_compaction_enable);
 DECLARE_mBool(enable_variant_subcolumn_index_compaction);
 DECLARE_mBool(enable_index_compaction_preload);
 DECLARE_mBool(enable_compaction_release_input_segments);
+// A compaction keeps each input segment it opened for the rest of the task, so that reading
+// the inputs once per column group opens every segment once.
+DECLARE_mBool(enable_compaction_pin_input_segments);
 DECLARE_mBool(enable_compaction_data_preload);
 DECLARE_mInt64(index_compaction_preload_chunk_bytes);
 DECLARE_Int32(index_compaction_preload_threads);
@@ -1512,6 +1515,8 @@ DECLARE_mBool(enable_shrink_memory);
 DECLARE_Int32(segment_cache_capacity);
 DECLARE_Int32(segment_cache_fd_percentage);
 DECLARE_Int32(segment_cache_memory_percentage);
+DECLARE_mDouble(segment_cache_recharge_ratio);
+DECLARE_mInt64(segment_cache_recharge_min_bytes);
 DECLARE_Bool(enable_segment_cache_prune);
 
 DECLARE_mInt32(estimated_mem_per_column_reader);

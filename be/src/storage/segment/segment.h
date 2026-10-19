@@ -178,6 +178,14 @@ public:
     // another method `get_metadata_size` not include the column reader, only the segment object itself.
     int64_t meta_mem_usage() const { return _meta_mem_usage; }
 
+    // Heap this segment holds: the estimate in meta_mem_usage(), plus what parsing its column
+    // metas, creating its column readers, loading their external meta and opening its index file
+    // allocated and kept. Updates the segment_real_retained_bytes bvar.
+    int64_t real_mem_usage();
+    // The charge the segment cache holds this segment with.
+    int64_t cache_charge() const { return _cache_charge.load(std::memory_order_relaxed); }
+    void set_cache_charge(int64_t charge) { _cache_charge = charge; }
+
     // Get the inner file column's data type.
     // When `read_options` is provided, the decision (e.g. flat-leaf vs hierarchical) can depend
     // on the reader type and tablet schema; when it is nullptr, we treat it as a query reader.
@@ -283,6 +291,10 @@ private:
     // The memory consumed by querying is tracked in segment iterator.
     int64_t _meta_mem_usage;
     int64_t _tracked_meta_mem_usage = 0;
+    std::atomic<int64_t> _column_meta_bytes {0};
+    std::atomic<int64_t> _cache_charge {0};
+    // The value last added to segment_real_retained_bytes for this segment.
+    std::atomic<int64_t> _reported_real_bytes {0};
     // The bvar counting this segment as inserted into the segment cache, if any.
     bvar::Adder<int64_t>* _cache_loader_counter = nullptr;
 
