@@ -303,7 +303,40 @@ Segment::Segment(uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr table
           _tablet_schema(std::move(tablet_schema)),
           _idx_file_info(std::move(idx_file_info)) {}
 
+namespace {
+// Live segments by the kind of reader that inserted them into the segment cache.
+bvar::Adder<int64_t> g_segment_cache_loaded_by_query("segment_cache_loaded_segments_by_query");
+bvar::Adder<int64_t> g_segment_cache_loaded_by_compaction(
+        "segment_cache_loaded_segments_by_compaction");
+bvar::Adder<int64_t> g_segment_cache_loaded_by_other("segment_cache_loaded_segments_by_other");
+} // namespace
+
+void Segment::set_cache_loader(ReaderType reader_type) {
+    if (_cache_loader_counter != nullptr) {
+        return;
+    }
+    switch (reader_type) {
+    case ReaderType::READER_QUERY:
+        _cache_loader_counter = &g_segment_cache_loaded_by_query;
+        break;
+    case ReaderType::READER_BASE_COMPACTION:
+    case ReaderType::READER_CUMULATIVE_COMPACTION:
+    case ReaderType::READER_COLD_DATA_COMPACTION:
+    case ReaderType::READER_SEGMENT_COMPACTION:
+    case ReaderType::READER_FULL_COMPACTION:
+        _cache_loader_counter = &g_segment_cache_loaded_by_compaction;
+        break;
+    default:
+        _cache_loader_counter = &g_segment_cache_loaded_by_other;
+        break;
+    }
+    *_cache_loader_counter << 1;
+}
+
 Segment::~Segment() {
+    if (_cache_loader_counter != nullptr) {
+        *_cache_loader_counter << -1;
+    }
     g_segment_estimate_mem_bytes << -_tracked_meta_mem_usage;
     // if failed, fix `_tracked_meta_mem_usage` accuracy
     DCHECK(_tracked_meta_mem_usage == meta_mem_usage());

@@ -78,6 +78,7 @@
 #include "storage/rowset/rowset_meta.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
+#include "storage/segment/segment_loader.h"
 #include "storage/storage_engine.h"
 #include "storage/storage_policy.h"
 #include "storage/tablet/tablet.h"
@@ -176,12 +177,27 @@ Compaction::Compaction(BaseTabletSPtr tablet, const std::string& label)
 
 Compaction::~Compaction() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
+    if (config::enable_compaction_release_input_segments) {
+        release_input_segments(_input_rowsets);
+    }
     _output_rs_writer.reset();
     _tablet.reset();
     _input_rowsets.clear();
     _output_rowset.reset();
     _cur_tablet_schema.reset();
     _rowid_conversion.reset();
+}
+
+void Compaction::release_input_segments(const std::vector<RowsetSharedPtr>& input_rowsets) {
+    auto* loader = SegmentLoader::instance();
+    if (loader == nullptr) {
+        return;
+    }
+    for (const auto& rowset : input_rowsets) {
+        if (rowset != nullptr) {
+            loader->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        }
+    }
 }
 
 std::string Compaction::input_version_range_str() const {

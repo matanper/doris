@@ -18,6 +18,7 @@
 #pragma once
 
 #include <butil/macros.h>
+#include <bvar/bvar.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gen_cpp/segment_v2.pb.h>
 #include <glog/logging.h>
@@ -226,6 +227,10 @@ public:
     static StoragePageCache::CacheKey get_segment_footer_cache_key(
             const io::FileReaderSPtr& file_reader);
 
+    // Records the kind of reader that inserted this segment into the segment cache, for the
+    // segment_cache_loaded_segments_by_* bvars.
+    void set_cache_loader(ReaderType reader_type);
+
 private:
     DISALLOW_COPY_AND_ASSIGN(Segment);
     Segment(uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
@@ -278,6 +283,8 @@ private:
     // The memory consumed by querying is tracked in segment iterator.
     int64_t _meta_mem_usage;
     int64_t _tracked_meta_mem_usage = 0;
+    // The bvar counting this segment as inserted into the segment cache, if any.
+    bvar::Adder<int64_t>* _cache_loader_counter = nullptr;
 
     RowsetId _rowset_id;
     TabletSchemaSPtr _tablet_schema;

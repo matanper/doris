@@ -107,7 +107,7 @@ TEST_F(CloudDroppedTabletCompactionTest, topn_skips_dropped_tablet) {
     CloudTabletMgr mgr(_engine);
     auto tablet = make_tablet(20001);
     tablet->_approximate_cumu_num_deltas = 5000;
-    mgr.put_tablet_for_UT(tablet);
+    mgr.put_tablet_in_cache_for_UT(tablet);
     auto filter_out = [](CloudTablet*) { return false; };
 
     std::vector<std::shared_ptr<CloudTablet>> picked;
@@ -125,6 +125,9 @@ TEST_F(CloudDroppedTabletCompactionTest, topn_skips_dropped_tablet) {
     EXPECT_TRUE(picked.empty());
     // The dropped tablet's backlog no longer counts toward the reported max score either.
     EXPECT_EQ(max_score, 0);
+    // And it left the tablet cache.
+    tablet.reset();
+    EXPECT_TRUE(mgr.get_weak_tablets().empty());
 }
 
 TEST_F(CloudDroppedTabletCompactionTest, max_score_metric_falls_once_backlog_is_dropped) {

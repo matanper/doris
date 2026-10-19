@@ -74,6 +74,7 @@ Status SegmentLoader::load_segment(const BetaRowsetSharedPtr& rowset, int64_t se
     }
     if (use_cache && !config::disable_segment_cache) {
         // memory of SegmentCache::CacheValue will be handled by SegmentCache
+        segment->set_cache_loader(io_ctx != nullptr ? io_ctx->reader_type : ReaderType::UNKNOWN);
         auto* cache_value = new SegmentCache::CacheValue(segment);
         _cache_mem_usage += segment->meta_mem_usage();
         _segment_cache->insert(cache_key, *cache_value, cache_handle);

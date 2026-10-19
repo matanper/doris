@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <bvar/bvar.h>
 #include <gen_cpp/segment_v2.pb.h>
 #include <sys/types.h>
 
@@ -203,7 +204,7 @@ public:
     virtual const SubcolumnColumnMetaInfo::Node* get_subcolumn_meta_by_path(
             const PathInData& relative_path) const;
 
-    ~VariantColumnReader() override = default;
+    ~VariantColumnReader() override;
 
     FieldType get_meta_type() override { return FieldType::OLAP_FIELD_TYPE_VARIANT; }
 
@@ -435,6 +436,10 @@ private:
 
     // Externalized meta reader (optional)
     std::unique_ptr<VariantExternalMetaReader> _ext_meta_reader;
+    // Heap allocated by loading all the external meta, and the bvars counting it; set once.
+    int64_t _external_meta_bytes = 0;
+    bvar::Adder<int64_t>* _external_meta_readers_counter = nullptr;
+    bvar::Adder<int64_t>* _external_meta_bytes_counter = nullptr;
 
     io::FileReaderSPtr _segment_file_reader;
     uint64_t _num_rows {0};
