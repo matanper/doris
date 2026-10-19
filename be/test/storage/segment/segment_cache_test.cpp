@@ -19,6 +19,7 @@
 #include <gen_cpp/Descriptors_types.h>
 #include <gen_cpp/Types_types.h>
 #include <gen_cpp/internal_service.pb.h>
+#include <bvar/bvar.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
 #include <stdlib.h>
@@ -52,6 +53,7 @@
 #include "storage/rowset/beta_rowset.h"
 #include "storage/schema.h"
 #include "storage/segment/segment.h"
+#include "storage/compaction/compaction.h"
 #include "storage/segment/segment_loader.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
@@ -374,6 +376,36 @@ TEST_F(SegmentCacheTest, vec_sequence_col) {
     // get the value from sequence column
     auto seq_v = read_block.get_by_position(4).column->get_int(0);
     ASSERT_EQ(100, seq_v);
+
+    // A compaction that read the rowset drops its segments from the segment cache when it ends,
+    // and the cache counts them by the kind of reader that loaded them.
+    {
+        auto loaded_by_compaction = []() {
+            return std::stoll(bvar::Variable::describe_exposed(
+                    "segment_cache_loaded_segments_by_compaction"));
+        };
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        const int64_t before = loaded_by_compaction();
+        io::IOContext io_ctx;
+        io_ctx.reader_type = ReaderType::READER_CUMULATIVE_COMPACTION;
+        {
+            SegmentCacheHandle compaction_handle;
+            ASSERT_TRUE(SegmentLoader::instance()
+                                ->load_segments(rowset_ptr, &compaction_handle, true, false,
+                                                nullptr, &io_ctx)
+                                .ok());
+            EXPECT_EQ(loaded_by_compaction(), before + 1);
+            Compaction::release_input_segments({rowset});
+            SegmentCacheHandle probe;
+            EXPECT_FALSE(SegmentLoader::instance()->_segment_cache->lookup(
+                    SegmentCache::CacheKey(rowset->rowset_id(), 0), &probe));
+            // Still held by the reader.
+            EXPECT_EQ(loaded_by_compaction(), before + 1);
+        }
+        segments.clear();
+        iter.reset();
+        EXPECT_EQ(loaded_by_compaction(), before);
+    }
 
     res = engine_ref->tablet_manager()->drop_tablet(request.tablet_id, request.replica_id, false);
     ASSERT_TRUE(res.ok());

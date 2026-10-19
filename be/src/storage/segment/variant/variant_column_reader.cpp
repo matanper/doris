@@ -41,6 +41,7 @@
 #include "exec/common/variant_util.h"
 #include "io/fs/file_reader.h"
 #include "runtime/descriptors.h"
+#include "runtime/memory/untracked_heap_account.h"
 #include "storage/key_coder.h"
 #include "storage/olap_common.h"
 #include "storage/segment/column_meta_accessor.h"
@@ -1434,6 +1435,24 @@ Status VariantColumnReader::create_path_reader(
     return st;
 }
 
+namespace {
+// Live readers holding all their external meta, and the heap it took, by the kind of reader that
+// loaded it.
+bvar::Adder<int64_t> g_external_meta_query_readers("variant_external_meta_loaded_by_query_readers");
+bvar::Adder<int64_t> g_external_meta_query_bytes("variant_external_meta_loaded_by_query_bytes");
+bvar::Adder<int64_t> g_external_meta_compaction_readers(
+        "variant_external_meta_loaded_by_compaction_readers");
+bvar::Adder<int64_t> g_external_meta_compaction_bytes(
+        "variant_external_meta_loaded_by_compaction_bytes");
+} // namespace
+
+VariantColumnReader::~VariantColumnReader() {
+    if (_external_meta_readers_counter != nullptr) {
+        *_external_meta_readers_counter << -1;
+        *_external_meta_bytes_counter << -_external_meta_bytes;
+    }
+}
+
 Status VariantColumnReader::load_external_meta_once(OlapReaderStatistics* stats,
                                                     const io::IOContext* source_io_ctx) {
     if (!_ext_meta_reader || !_ext_meta_reader->available()) {
@@ -1446,8 +1465,23 @@ Status VariantColumnReader::load_external_meta_once(OlapReaderStatistics* stats,
                                                _tablet_schema->column_by_uid(_root_unique_id))
                                                ? _statistics.get()
                                                : nullptr;
-    return _ext_meta_reader->load_all_once(_subcolumns_meta_info.get(), variant_stats, stats,
-                                           source_io_ctx);
+    const bool first = _external_meta_readers_counter == nullptr;
+    const int64_t allocated_before = first ? thread_net_allocated_bytes() : 0;
+    auto st = _ext_meta_reader->load_all_once(_subcolumns_meta_info.get(), variant_stats, stats,
+                                              source_io_ctx);
+    if (first && st.ok()) {
+        const bool by_query =
+                source_io_ctx != nullptr && source_io_ctx->reader_type == ReaderType::READER_QUERY;
+        _external_meta_readers_counter =
+                by_query ? &g_external_meta_query_readers : &g_external_meta_compaction_readers;
+        _external_meta_bytes_counter =
+                by_query ? &g_external_meta_query_bytes : &g_external_meta_compaction_bytes;
+        _external_meta_bytes =
+                std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
+        *_external_meta_readers_counter << 1;
+        *_external_meta_bytes_counter << _external_meta_bytes;
+    }
+    return st;
 }
 
 TabletIndexes VariantColumnReader::find_subcolumn_tablet_indexes(const TabletColumn& column,

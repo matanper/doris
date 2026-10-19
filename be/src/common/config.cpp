@@ -1422,8 +1422,12 @@ DEFINE_mBool(enable_variant_subcolumn_index_compaction, "true");
 // through the file cache, in chunks of index_compaction_preload_chunk_bytes, on at most
 // index_compaction_preload_threads threads shared by all compactions.
 DEFINE_mBool(enable_index_compaction_preload, "true");
+// When a compaction ends, whatever its outcome, drop its input segments from the segment cache.
+// Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
+// the segment cache does not count, so its memory bound does not hold for them.
+DEFINE_mBool(enable_compaction_release_input_segments, "true");
 DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
-DEFINE_Int32(index_compaction_preload_threads, "16");
+DEFINE_Int32(index_compaction_preload_threads, "64");
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory
