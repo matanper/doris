@@ -102,6 +102,7 @@ DECLARE_mInt64(cloud_dropped_tablet_probe_interval_s);
 DECLARE_mInt32(compaction_timeout_seconds);
 DECLARE_mInt32(lease_compaction_interval_seconds);
 DECLARE_mBool(enable_parallel_cumu_compaction);
+DECLARE_mInt32(max_parallel_cumu_compactions_per_tablet);
 DECLARE_mDouble(base_compaction_thread_num_factor);
 DECLARE_mDouble(cumu_compaction_thread_num_factor);
 DECLARE_mInt32(check_auto_compaction_interval_seconds);

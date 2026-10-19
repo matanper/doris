@@ -37,6 +37,7 @@
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet/tablet_meta.h"
+#include "util/defer_op.h"
 #include "util/time.h"
 
 namespace doris {
@@ -256,6 +257,38 @@ TEST_F(CloudDroppedTabletCompactionTest, execute_compact_stops_when_lease_finds_
     EXPECT_FALSE(st.ok());
     EXPECT_NE(st.to_string().find("dropped"), std::string::npos) << st;
     EXPECT_TRUE(tablet->is_dropped());
+}
+
+TEST_F(CloudDroppedTabletCompactionTest, parallel_cumu_compactions_per_tablet_are_capped) {
+    auto old_parallel = config::enable_parallel_cumu_compaction;
+    auto old_limit = config::max_parallel_cumu_compactions_per_tablet;
+    Defer restore {[&]() {
+        config::enable_parallel_cumu_compaction = old_parallel;
+        config::max_parallel_cumu_compactions_per_tablet = old_limit;
+        _engine._submitted_cumu_compactions.clear();
+    }};
+    config::enable_parallel_cumu_compaction = true;
+    auto tablet = make_tablet(20009);
+    tablet->_approximate_cumu_num_deltas = 5000;
+    _engine.tablet_mgr().put_tablet_for_UT(tablet);
+    _engine._submitted_cumu_compactions[tablet->tablet_id()].push_back(
+            std::make_shared<CloudCumulativeCompaction>(_engine, tablet));
+
+    config::max_parallel_cumu_compactions_per_tablet = 1;
+    EXPECT_TRUE(
+            _engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true)
+                    .empty());
+    EXPECT_TRUE(_engine.parallel_cumu_compaction_limit_reached(tablet->tablet_id()));
+
+    config::max_parallel_cumu_compactions_per_tablet = 2;
+    EXPECT_EQ(_engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true)
+                      .size(),
+              1);
+    EXPECT_FALSE(_engine.parallel_cumu_compaction_limit_reached(tablet->tablet_id()));
+
+    // 0 means no limit.
+    config::max_parallel_cumu_compactions_per_tablet = 0;
+    EXPECT_FALSE(_engine.parallel_cumu_compaction_limit_reached(tablet->tablet_id()));
 }
 
 } // namespace doris

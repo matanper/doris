@@ -73,6 +73,9 @@ public:
     // alive until their readers release them.
     static void release_input_segments(const std::vector<RowsetSharedPtr>& input_rowsets);
 
+    // Reads every input segment data file once through the file cache.
+    void preload_input_segment_files();
+
     // Pick input rowsets satisfied to compact
     virtual Status prepare_compact() = 0;
 

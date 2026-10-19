@@ -1426,6 +1426,9 @@ DEFINE_mBool(enable_index_compaction_preload, "true");
 // Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
 // the segment cache does not count, so its memory bound does not hold for them.
 DEFINE_mBool(enable_compaction_release_input_segments, "true");
+// Before merging, read each input segment data file once through the file cache, on the index
+// compaction preload pool.
+DEFINE_mBool(enable_compaction_data_preload, "true");
 DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
 DEFINE_Int32(index_compaction_preload_threads, "64");
 // Only for debug, do not use in production

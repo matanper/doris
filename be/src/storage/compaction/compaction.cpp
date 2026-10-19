@@ -275,7 +275,36 @@ int64_t Compaction::merge_way_num() {
     return way_num;
 }
 
+void Compaction::preload_input_segment_files() {
+    std::vector<IndexFilePreloadTarget> targets;
+    for (const auto& rowset : _input_rowsets) {
+        auto fs = rowset->rowset_meta()->fs();
+        if (fs == nullptr) {
+            continue;
+        }
+        for (int64_t seg_id = 0; seg_id < rowset->num_segments(); ++seg_id) {
+            auto path = rowset->segment_path(seg_id);
+            if (!path.has_value()) {
+                continue;
+            }
+            const int64_t file_size =
+                    rowset->rowset_meta()->segment_file_size(cast_set<int>(seg_id));
+            targets.push_back({.fs = fs,
+                               .path = std::move(path.value()),
+                               .file_size = file_size > 0 ? file_size : -1,
+                               .tablet_id = _tablet->tablet_id()});
+        }
+    }
+    preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
+}
+
 Status Compaction::merge_input_rowsets() {
+    if (config::enable_compaction_data_preload) {
+        // Vertical compaction reads every input segment once per column group, starting each
+        // pass with small reads of each segment one after another; reading each segment file
+        // once up front turns their cache misses into a few large remote reads.
+        preload_input_segment_files();
+    }
     std::vector<RowsetReaderSharedPtr> input_rs_readers;
     input_rs_readers.reserve(_input_rowsets.size());
     for (auto& rowset : _input_rowsets) {
