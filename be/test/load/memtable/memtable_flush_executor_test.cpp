@@ -23,7 +23,10 @@
 #include <gtest/gtest.h>
 #include <sys/file.h>
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "common/config.h"
 #include "io/fs/local_file_system.h"
@@ -31,7 +34,10 @@
 #include "load/memtable/memtable.h"
 #include "runtime/descriptor_helper.h"
 #include "runtime/exec_env.h"
+#include "runtime/memory/mem_tracker.h"
+#include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
+#include "core/pod_array.h"
 #include "storage/options.h"
 #include "storage/schema.h"
 #include "storage/storage_engine.h"
@@ -204,6 +210,117 @@ TEST(MemTableFlushExecutorTest, TestThreadPoolMinMaxRelationship) {
 
     // Cleanup
     tear_down();
+}
+
+namespace {
+
+class FlushLimitConfig {
+public:
+    FlushLimitConfig(int32_t limit, bool adaptive)
+            : _limit(config::memtable_flush_running_count_limit),
+              _adaptive(config::enable_adaptive_memtable_flush_running_count_limit) {
+        config::memtable_flush_running_count_limit = limit;
+        config::enable_adaptive_memtable_flush_running_count_limit = adaptive;
+    }
+    ~FlushLimitConfig() {
+        config::memtable_flush_running_count_limit = _limit;
+        config::enable_adaptive_memtable_flush_running_count_limit = _adaptive;
+    }
+
+private:
+    int32_t _limit;
+    bool _adaptive;
+};
+
+} // namespace
+
+// A writer at its token's flush limit waits, and is woken as soon as one of the token's flushes
+// ends, without polling.
+TEST(MemTableFlushExecutorTest, FlushSlotWaitEndsWhenAFlushEnds) {
+    FlushLimitConfig limit(2, false);
+    auto token = FlushToken::create_shared(nullptr, nullptr);
+    token->on_flush_started();
+    token->on_flush_started();
+    std::atomic<bool> done {false};
+    std::thread writer([&] {
+        token->wait_for_flush_slot(nullptr);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(done);
+    const auto ended = std::chrono::steady_clock::now();
+    token->on_flush_finished();
+    writer.join();
+    EXPECT_TRUE(done);
+    EXPECT_LT(std::chrono::steady_clock::now() - ended, std::chrono::milliseconds(80));
+    token->on_flush_finished();
+}
+
+// A waiting writer stops waiting once it is cancelled, and a raised limit frees it.
+TEST(MemTableFlushExecutorTest, FlushSlotWaitFollowsCancelAndLimit) {
+    FlushLimitConfig limit(1, false);
+    auto token = FlushToken::create_shared(nullptr, nullptr);
+    token->on_flush_started();
+    std::atomic<bool> cancelled {false};
+    std::thread writer([&] { token->wait_for_flush_slot([&] { return cancelled.load(); }); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    cancelled = true;
+    writer.join();
+
+    std::atomic<bool> done {false};
+    std::thread raised([&] {
+        token->wait_for_flush_slot(nullptr);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_FALSE(done);
+    config::memtable_flush_running_count_limit = 2;
+    raised.join();
+    EXPECT_TRUE(done);
+    token->on_flush_finished();
+}
+
+// With the adaptive limit, each live token may run at least its share of the flush pool.
+TEST(MemTableFlushExecutorTest, AdaptiveFlushLimitSharesThePool) {
+    MemTableFlushExecutor executor;
+    executor.init(1);
+    const int threads = executor.flush_pool()->max_threads();
+    auto token = FlushToken::create_shared(nullptr, nullptr);
+    const int64_t tokens =
+            std::stoll(bvar::Variable::describe_exposed("memtable_flush_live_tokens"));
+    ASSERT_GE(tokens, 1);
+    {
+        FlushLimitConfig limit(2, false);
+        EXPECT_EQ(FlushToken::flush_running_count_limit(), 2);
+    }
+    {
+        FlushLimitConfig limit(2, true);
+        EXPECT_EQ(FlushToken::flush_running_count_limit(),
+                  std::max<int64_t>(2, threads / tokens));
+    }
+    {
+        FlushLimitConfig limit(100000, true);
+        EXPECT_EQ(FlushToken::flush_running_count_limit(), 100000);
+    }
+}
+
+// A memtable's memory_usage(), which the memtable memory limiter sums for flushing memtables,
+// counts what its flush allocates through Doris allocators under its tracker; memory allocated
+// with plain new, as CLucene allocates index writer buffers, is not counted.
+TEST(MemTableFlushExecutorTest, FlushAllocationsCountInTheMemtableTracker) {
+    auto limiter = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::LOAD, "FlushMemory");
+    SCOPED_ATTACH_TASK(limiter);
+    auto memtable_tracker = std::make_shared<MemTracker>("MemTableFlush");
+    {
+        SCOPED_CONSUME_MEM_TRACKER(memtable_tracker);
+        PaddedPODArray<char> block_data;
+        block_data.resize(16 << 20);
+        EXPECT_GE(memtable_tracker->consumption(), 16 << 20);
+        const int64_t before = memtable_tracker->consumption();
+        std::unique_ptr<char[]> untracked(new char[16 << 20]);
+        untracked[0] = 1;
+        EXPECT_LT(memtable_tracker->consumption() - before, 1 << 20);
+    }
 }
 
 } // namespace doris

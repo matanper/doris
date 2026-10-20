@@ -777,7 +777,8 @@ DEFINE_mInt64(write_buffer_size_for_agg, "104857600");
 DEFINE_mInt64(min_write_buffer_size_for_partial_update, "1048576");
 DEFINE_mBool(memtable_flush_release_input_columns, "true");
 // max parallel flush task per memtable writer
-DEFINE_mInt32(memtable_flush_running_count_limit, "2");
+DEFINE_mInt32(memtable_flush_running_count_limit, "32");
+DEFINE_mBool(enable_adaptive_memtable_flush_running_count_limit, "true");
 
 // maximum sleep time to wait for memory when writing or flushing memtable.
 DEFINE_mInt32(memtable_wait_for_memory_sleep_time_s, "300");
@@ -1816,9 +1817,9 @@ DEFINE_mInt64(load_s3_upload_buffer_backpressure_bytes, "0");
 DEFINE_mInt32(load_s3_upload_buffer_backpressure_resume_percent, "80");
 DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
 DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
-DEFINE_Int64(file_cache_writer_thread_num, "32");
+DEFINE_mInt64(file_cache_writer_thread_num, "32");
 DEFINE_Int64(file_cache_writer_queue_size, "256");
-DEFINE_Int64(file_cache_writer_load_thread_num, "8");
+DEFINE_mInt64(file_cache_writer_load_thread_num, "8");
 DEFINE_Int64(file_cache_writer_load_queue_size, "256");
 DEFINE_mInt64(file_cache_writer_backlog_bytes, "2147483648");
 

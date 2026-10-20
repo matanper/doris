@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 
 #include "common/config.h"
 #include "common/exception.h"
@@ -319,6 +320,29 @@ bvar::Adder<uint64_t> s3_file_cache_write_load_queue(
 // Load parts go to their own pool, so they never queue behind compaction copies; other parts are
 // skipped once their backlog reaches file_cache_writer_backlog_bytes, so a compaction burst
 // cannot hold buffer memory waiting for the cache disk.
+// Resizes `pool` to `wanted` threads when the config changed at runtime. `seen` holds the
+// config value last applied, starting from the first one observed, which the pool was built with.
+static void follow_thread_num_config(ThreadPool* pool, int64_t wanted, std::atomic<int64_t>* seen) {
+    int64_t last = seen->load(std::memory_order_relaxed);
+    if (last == wanted) {
+        return;
+    }
+    if (last < 0) {
+        seen->compare_exchange_strong(last, wanted);
+        return;
+    }
+    if (wanted <= 0 || !seen->compare_exchange_strong(last, wanted)) {
+        return;
+    }
+    const int threads = static_cast<int>(wanted);
+    if (pool->min_threads() > threads) {
+        static_cast<void>(pool->set_min_threads(threads));
+    }
+    if (!pool->set_max_threads(threads).ok()) {
+        LOG(WARNING) << "failed to resize the file cache writer pool to " << threads;
+    }
+}
+
 static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
     // From here the buffer only waits for the cache copy, which the upload bounds do not
     // cover.
@@ -330,6 +354,14 @@ static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
     if (pool == nullptr) {
         s3_file_cache_write_dropped << 1;
         return;
+    }
+    static std::atomic<int64_t> load_threads_seen {-1};
+    static std::atomic<int64_t> threads_seen {-1};
+    if (load) {
+        follow_thread_num_config(pool, config::file_cache_writer_load_thread_num,
+                                 &load_threads_seen);
+    } else {
+        follow_thread_num_config(pool, config::file_cache_writer_thread_num, &threads_seen);
     }
     const auto bytes = static_cast<int64_t>(buffer->get_size());
     if (!load) {

@@ -174,10 +174,7 @@ Status DeltaWriter::write(const Block* block, const DorisVector<uint32_t>& row_i
     }
     {
         SCOPED_TIMER(_wait_flush_limit_timer);
-        while (_memtable_writer->flush_running_count() >=
-               config::memtable_flush_running_count_limit) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        _memtable_writer->wait_for_flush_slot([this] { return _is_cancelled; });
     }
     return _memtable_writer->write(block, row_idxs, memtable_flushed);
 }

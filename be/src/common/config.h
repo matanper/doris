@@ -853,6 +853,9 @@ DECLARE_mInt64(min_write_buffer_size_for_partial_update);
 DECLARE_mBool(memtable_flush_release_input_columns);
 // max parallel flush task per memtable writer
 DECLARE_mInt32(memtable_flush_running_count_limit);
+// Let each memtable writer run at least (flush pool threads / live writers) flushes at once, so
+// that loads writing few tablets, as with random bucketing, can use an idle flush pool.
+DECLARE_mBool(enable_adaptive_memtable_flush_running_count_limit);
 
 // maximum sleep time to wait for memory when writing or flushing memtable.
 DECLARE_mInt32(memtable_wait_for_memory_sleep_time_s);
@@ -1950,14 +1953,16 @@ DECLARE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms);
 // upload thread, so a slow or contended file cache cannot hold upload threads. A part that
 // finds the queue full is not cached. Only applies while enable_flush_file_cache_async is on.
 DECLARE_mBool(enable_file_cache_write_off_upload_thread);
-// Max threads of S3FileCacheWriterThreadPool.
-DECLARE_Int64(file_cache_writer_thread_num);
+// Max threads of S3FileCacheWriterThreadPool; a change applies at the next copy.
+DECLARE_mInt64(file_cache_writer_thread_num);
 // Max queued part copies of S3FileCacheWriterThreadPool. Each holds one s3_write_buffer_size
 // buffer until it is copied.
 DECLARE_Int64(file_cache_writer_queue_size);
 // Threads and queue of S3FileCacheWriterLoadThreadPool, which copies the parts of load writers
-// into the file cache, so they never wait behind compaction copies.
-DECLARE_Int64(file_cache_writer_load_thread_num);
+// into the file cache, so they never wait behind compaction copies. The pool exists only when
+// the thread num is positive at startup; a later change of it applies at the next copy. The
+// queue size is read at startup.
+DECLARE_mInt64(file_cache_writer_load_thread_num);
 DECLARE_Int64(file_cache_writer_load_queue_size);
 // Bytes of non-load parts queued for or in a file cache copy at which a further part is not
 // copied: it is already in S3, so only its cache warm-up is lost. <= 0 means no bound.

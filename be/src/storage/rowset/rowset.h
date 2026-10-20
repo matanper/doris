@@ -239,6 +239,9 @@ public:
     // this function is called by reader to increase reference of rowset
     void acquire() { ++_refs_by_reader; }
 
+    // The readers of this rowset that are alive.
+    uint64_t refs_by_reader() const { return _refs_by_reader.load(); }
+
     void release() {
         // if the refs by reader is 0 and the rowset is closed, should release the resouce
         uint64_t current_refs = --_refs_by_reader;

@@ -29,8 +29,12 @@
 #include <random>
 #include <ranges>
 #include <set>
+#include <thread>
+
+#include <bvar/bvar.h>
 
 #include "cloud/cloud_meta_mgr.h"
+#include "cloud/config.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_warm_up_manager.h"
 #include "common/config.h"
@@ -38,6 +42,7 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
+#include "storage/rowset/rowset_reader.h"
 #include "storage/tablet/tablet_meta.h"
 #include "util/uid_util.h"
 
@@ -78,6 +83,44 @@ protected:
     std::shared_ptr<CloudTablet> _tablet;
     CloudStorageEngine _engine;
 };
+
+// An unused rowset that something else still references is counted as stuck once it has been
+// unused for unused_rowset_stuck_log_sec, with a live reader counted separately, and the counts
+// leave the bvars with the tablet.
+TEST_F(CloudTabletWarmUpStateTest, StuckUnusedRowsetsAreCounted) {
+    auto exposed = [](const char* name) {
+        return std::stoll(bvar::Variable::describe_exposed(name));
+    };
+    const int64_t old_sec = config::unused_rowset_stuck_log_sec;
+    config::unused_rowset_stuck_log_sec = 1;
+    const int64_t stuck_before = exposed("unused_rowsets_stuck_count");
+    const int64_t reader_before = exposed("unused_rowsets_stuck_with_reader_count");
+
+    auto held = create_rowset(Version(2, 2));
+    auto read = create_rowset(Version(3, 3));
+    ASSERT_NE(held, nullptr);
+    ASSERT_NE(read, nullptr);
+    RowsetReaderSharedPtr reader;
+    ASSERT_TRUE(read->create_reader(&reader).ok());
+    _tablet->add_unused_rowsets({held, read});
+    RowsetSharedPtr holder = held;
+    read.reset();
+
+    _tablet->remove_unused_rowsets();
+    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    _tablet->remove_unused_rowsets();
+    _tablet->remove_unused_rowsets();
+    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 2);
+    EXPECT_EQ(exposed("unused_rowsets_stuck_with_reader_count") - reader_before, 1);
+    EXPECT_TRUE(_tablet->need_remove_unused_rowsets());
+
+    _tablet.reset();
+    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 0);
+    EXPECT_EQ(exposed("unused_rowsets_stuck_with_reader_count") - reader_before, 0);
+    config::unused_rowset_stuck_log_sec = old_sec;
+}
 
 // Test get_rowset_warmup_state for non-existent rowset
 TEST_F(CloudTabletWarmUpStateTest, TestGetRowsetWarmupStateNonExistent) {

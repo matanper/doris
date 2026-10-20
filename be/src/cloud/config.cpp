@@ -43,6 +43,8 @@ DEFINE_Validator(tablet_cache_stale_sweep_time_sec,
                  [](const int64_t config) -> bool { return config >= 0; });
 DEFINE_mBool(enable_foreign_tablet_eviction, "true");
 DEFINE_mInt64(foreign_tablet_idle_evict_sec, "600");
+DEFINE_mInt64(unused_rowset_stuck_log_sec, "1800");
+DEFINE_mInt64(unused_rowset_stuck_log_per_minute, "20");
 DEFINE_mInt64(tablet_ownership_max_age_sec, "1200");
 DEFINE_mInt32(tablet_sync_interval_s, "1800");
 DEFINE_mInt32(init_scanner_sync_rowsets_parallelism, "10");
