@@ -1875,6 +1875,21 @@ DECLARE_mInt32(aws_client_request_timeout_ms);
 
 // write as inverted index tmp directory
 DECLARE_String(tmp_file_dir);
+// Comma-separated absolute dirs for index writers' and index compaction's temporary files,
+// round-robin, instead of <storage_root_path>/<tmp_file_dir>. Each is emptied at startup, so the
+// BE refuses to start on a dir that equals or contains a storage_root_path, equals, contains or
+// lies inside a file_cache_path (except exactly <file_cache_path>/index_tmp) or the log or conf
+// dir, or is a mount point, and on a dir it cannot write. Empty: the store paths' tmp dirs.
+DECLARE_String(index_tmp_file_dirs);
+// An index_tmp_file_dirs dir whose file system has less free space than this is passed over;
+// when all are, a store path's tmp dir is used (bvar index_tmp_file_dir_fallback). <= 0: no
+// check.
+DECLARE_mInt64(index_tmp_file_dir_min_free_bytes);
+// A top-level entry of an index tmp dir that no live writer owns and under which nothing changed
+// for this long is what a failed or cancelled writer left, and is removed. <= 0: never.
+DECLARE_mInt32(index_tmp_orphan_max_age_minutes);
+// How often the index tmp dirs are swept for such entries.
+DECLARE_mInt32(index_tmp_orphan_sweep_interval_seconds);
 
 // the directory for storing the trino-connector plugins.
 DECLARE_String(trino_connector_plugin_dir);
