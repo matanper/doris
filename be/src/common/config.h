@@ -1471,7 +1471,9 @@ DECLARE_mBool(enable_compaction_data_preload);
 DECLARE_mInt64(index_compaction_preload_chunk_bytes);
 DECLARE_mInt32(index_compaction_preload_threads);
 // Start the compaction data preload without waiting for it: the merge reads blocks as they
-// arrive, and the chunks not started when the merge ends are skipped.
+// arrive, and the chunks not started when the merge ends are skipped. Off by default: with many
+// compactions sharing the preload pool, the merges get ahead of it and fetch the blocks it has
+// not reached themselves, one small remote read at a time.
 DECLARE_mBool(enable_compaction_async_data_preload);
 // Nice value of the threads running cumulative compactions and the compaction preload, from 0
 // (unchanged) to 19, so that loads get the CPU first. A thread takes the value when it starts
