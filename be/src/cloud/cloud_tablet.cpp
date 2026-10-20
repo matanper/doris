@@ -76,6 +76,11 @@ bvar::LatencyRecorder g_base_compaction_get_delete_bitmap_lock_time_ms(
 
 bvar::Adder<int64_t> g_unused_rowsets_count("unused_rowsets_count");
 bvar::Adder<int64_t> g_unused_rowsets_bytes("unused_rowsets_bytes");
+// Unused rowsets still referenced elsewhere after unused_rowset_stuck_log_sec.
+bvar::Adder<int64_t> g_stuck_unused_rowsets_count("unused_rowsets_stuck_count");
+bvar::Adder<int64_t> g_stuck_unused_rowsets_bytes("unused_rowsets_stuck_bytes");
+// Of those, the ones some live rowset reader references.
+bvar::Adder<int64_t> g_stuck_unused_rowsets_with_reader("unused_rowsets_stuck_with_reader_count");
 
 bvar::Adder<int64_t> g_capture_prefer_cache_count("capture_prefer_cache_count");
 bvar::Adder<int64_t> g_capture_with_freshness_tolerance_count(
@@ -160,7 +165,11 @@ CloudTablet::CloudTablet(CloudStorageEngine& engine, TabletMetaSharedPtr tablet_
     _visible_version_index.rebuild(_tablet_meta->all_rs_metas() | std::views::keys);
 }
 
-CloudTablet::~CloudTablet() = default;
+CloudTablet::~CloudTablet() {
+    g_stuck_unused_rowsets_count << -_stuck_unused_rowsets;
+    g_stuck_unused_rowsets_bytes << -_stuck_unused_rowsets_bytes;
+    g_stuck_unused_rowsets_with_reader << -_stuck_unused_rowsets_with_reader;
+}
 
 bool CloudTablet::exceed_version_limit(int32_t limit) {
     return _approximate_num_rowsets.load(std::memory_order_relaxed) > limit;
@@ -1094,6 +1103,41 @@ uint64_t CloudTablet::delete_expired_stale_rowsets() {
     return expired_rowsets.size();
 }
 
+void CloudTablet::_log_stuck_unused_rowset(const Rowset& rowset, long use_count, int64_t age_s) {
+    static std::mutex rate_mutex;
+    static int64_t window_start_s = 0;
+    static int64_t logged_in_window = 0;
+    const int64_t now = ::time(nullptr);
+    {
+        std::lock_guard lock(rate_mutex);
+        if (now - window_start_s >= 60) {
+            window_start_s = now;
+            logged_in_window = 0;
+        }
+        if (logged_in_window >= config::unused_rowset_stuck_log_per_minute) {
+            return;
+        }
+        ++logged_in_window;
+    }
+    const int64_t now_ms = now * 1000;
+    auto since_ms = [now_ms](int64_t ms) { return ms > 0 ? (now_ms - ms) / 1000 : -1; };
+    LOG(WARNING) << "stuck unused rowset: tablet_id=" << tablet_id()
+                 << " rowset_id=" << rowset.rowset_id() << " version=" << rowset.version().to_string()
+                 << " use_count=" << use_count << " refs_by_reader=" << rowset.refs_by_reader()
+                 << " age_s=" << age_s << " bytes=" << rowset.total_disk_size()
+                 << " segments=" << rowset.num_segments()
+                 << " cumu_compaction_submitted=" << _engine.has_cumu_compaction(tablet_id())
+                 << " base_compaction_submitted=" << _engine.has_base_compaction(tablet_id())
+                 << " full_compaction_submitted=" << _engine.has_full_compaction(tablet_id())
+                 << " since_cumu_success_s=" << since_ms(last_cumu_compaction_success_time())
+                 << " since_cumu_failure_s=" << since_ms(last_cumu_compaction_failure_time())
+                 << " since_base_success_s=" << since_ms(last_base_compaction_success_time())
+                 << " since_base_failure_s=" << since_ms(last_base_compaction_failure_time())
+                 << " since_rowsets_sync_s="
+                 << (last_sync_rowsets_time_s > 0 ? now - last_sync_rowsets_time_s : -1)
+                 << " tablet_refs=" << weak_from_this().use_count();
+}
+
 bool CloudTablet::need_remove_unused_rowsets() {
     std::lock_guard<std::mutex> lock(_gc_mutex);
     return !_unused_rowsets.empty() || !_unused_delete_bitmap.empty();
@@ -1101,8 +1145,10 @@ bool CloudTablet::need_remove_unused_rowsets() {
 
 void CloudTablet::add_unused_rowsets(const std::vector<RowsetSharedPtr>& rowsets) {
     std::lock_guard<std::mutex> lock(_gc_mutex);
+    const int64_t now = ::time(nullptr);
     for (const auto& rowset : rowsets) {
         _unused_rowsets[rowset->rowset_id()] = rowset;
+        _unused_rowset_ages.try_emplace(rowset->rowset_id(), UnusedRowsetAge {.added_s = now});
         g_unused_rowsets_bytes << rowset->total_disk_size();
     }
     g_unused_rowsets_count << rowsets.size();
@@ -1114,15 +1160,37 @@ void CloudTablet::remove_unused_rowsets() {
     OlapStopWatch watch;
     {
         std::lock_guard<std::mutex> lock(_gc_mutex);
+        const int64_t now = ::time(nullptr);
+        const int64_t stuck_after_s = config::unused_rowset_stuck_log_sec;
+        int64_t stuck = 0;
+        int64_t stuck_bytes = 0;
+        int64_t stuck_with_reader = 0;
         // 1. remove unused rowsets's cache data and delete bitmap
         for (auto it = _unused_rowsets.begin(); it != _unused_rowsets.end();) {
             auto& rs = it->second;
             if (rs.use_count() > 1) {
-                LOG(WARNING) << "tablet_id:" << tablet_id() << " rowset: " << rs->rowset_id()
-                             << " has " << rs.use_count() << " references, it cannot be removed";
+                auto age_it = _unused_rowset_ages.find(rs->rowset_id());
+                const int64_t age_s =
+                        age_it == _unused_rowset_ages.end() ? 0 : now - age_it->second.added_s;
+                if (stuck_after_s > 0 && age_s >= stuck_after_s) {
+                    ++stuck;
+                    stuck_bytes += rs->total_disk_size();
+                    if (rs->refs_by_reader() > 0) {
+                        ++stuck_with_reader;
+                    }
+                    if (age_it != _unused_rowset_ages.end() && !age_it->second.logged) {
+                        age_it->second.logged = true;
+                        _log_stuck_unused_rowset(*rs, rs.use_count(), age_s);
+                    }
+                } else {
+                    LOG_EVERY_N(WARNING, 1000)
+                            << "tablet_id:" << tablet_id() << " rowset: " << rs->rowset_id()
+                            << " has " << rs.use_count() << " references, it cannot be removed";
+                }
                 ++it;
                 continue;
             }
+            _unused_rowset_ages.erase(rs->rowset_id());
             tablet_meta()->remove_rowset_delete_bitmap(rs->rowset_id(), rs->version());
             _rowset_warm_up_states.erase(rs->rowset_id());
             rs->clear_cache();
@@ -1131,6 +1199,12 @@ void CloudTablet::remove_unused_rowsets() {
             removed_rowsets.push_back(std::move(rs));
             it = _unused_rowsets.erase(it);
         }
+        g_stuck_unused_rowsets_count << stuck - _stuck_unused_rowsets;
+        g_stuck_unused_rowsets_bytes << stuck_bytes - _stuck_unused_rowsets_bytes;
+        g_stuck_unused_rowsets_with_reader << stuck_with_reader - _stuck_unused_rowsets_with_reader;
+        _stuck_unused_rowsets = stuck;
+        _stuck_unused_rowsets_bytes = stuck_bytes;
+        _stuck_unused_rowsets_with_reader = stuck_with_reader;
     }
 
     {

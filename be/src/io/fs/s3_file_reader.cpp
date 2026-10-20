@@ -33,6 +33,7 @@
 
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/metrics/doris_metrics.h"
+#include "cpp/obj_retry_strategy.h"
 #include "io/cache/block_file_cache.h"
 #include "io/fs/err_utils.h"
 #include "io/fs/obj_storage_client.h"
@@ -228,6 +229,9 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
             retry_count++;
             int wait_time = std::min(base_wait_time * (1 << retry_count),
                                      max_wait_time); // Exponential backoff
+            if (config::enable_s3_retry_full_jitter) {
+                wait_time = static_cast<int>(full_jitter_delay_ms(wait_time));
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_time));
             _s3_stats.retry_sleep_time_ms += wait_time;
             total_sleep_time += wait_time;

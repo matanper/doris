@@ -21,6 +21,8 @@
 #include <bvar/reducer.h>
 #include <glog/logging.h>
 
+#include <random>
+
 namespace doris {
 
 bvar::Adder<int64_t> object_request_retry_count("object_request_retry_count");
@@ -35,8 +37,28 @@ void record_object_request_failed(int http_code) {
     }
 }
 
-S3CustomRetryStrategy::S3CustomRetryStrategy(int maxRetries, bool retry_slow_down)
-        : DefaultRetryStrategy(maxRetries), _retry_slow_down(retry_slow_down) {}
+long full_jitter_delay_ms(long max_delay_ms) {
+    if (max_delay_ms <= 0) {
+        return 0;
+    }
+    thread_local std::mt19937_64 rng {std::random_device {}()};
+    return std::uniform_int_distribution<long>(0, max_delay_ms)(rng);
+}
+
+S3CustomRetryStrategy::S3CustomRetryStrategy(int maxRetries, bool retry_slow_down,
+                                             std::function<bool()> full_jitter)
+        : DefaultRetryStrategy(maxRetries),
+          _retry_slow_down(retry_slow_down),
+          _full_jitter(std::move(full_jitter)) {}
+
+long S3CustomRetryStrategy::CalculateDelayBeforeNextRetry(
+        const Aws::Client::AWSError<Aws::Client::CoreErrors>& error, long attemptedRetries) const {
+    const long delay = DefaultRetryStrategy::CalculateDelayBeforeNextRetry(error, attemptedRetries);
+    if (_full_jitter == nullptr || !_full_jitter()) {
+        return delay;
+    }
+    return full_jitter_delay_ms(delay);
+}
 
 S3CustomRetryStrategy::~S3CustomRetryStrategy() = default;
 
