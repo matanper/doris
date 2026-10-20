@@ -128,6 +128,18 @@ private:
 
 class VariantTypedPathIndexMergeTest : public IndexStorageTestFixture {
 protected:
+    // Other tests leave index compaction off.
+    void SetUp() override {
+        IndexStorageTestFixture::SetUp();
+        _old_index_compaction = config::inverted_index_compaction_enable;
+        config::inverted_index_compaction_enable = true;
+    }
+    void TearDown() override {
+        config::inverted_index_compaction_enable = _old_index_compaction;
+        IndexStorageTestFixture::TearDown();
+    }
+    bool _old_index_compaction = true;
+
     IndexTabletOptions options(int64_t tablet_id, const std::set<int64_t>& index_ids = {20001, 20002,
                                                                              20003}) {
         IndexTabletOptions options;
