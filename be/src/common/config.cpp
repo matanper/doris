@@ -1435,6 +1435,9 @@ DEFINE_mInt32(index_compaction_preload_threads, "64");
 DEFINE_Validator(index_compaction_preload_threads,
                  [](const int32_t config) -> bool { return config > 0; });
 DEFINE_mBool(enable_compaction_async_data_preload, "true");
+DEFINE_mInt32(cumu_compaction_thread_nice, "0");
+DEFINE_Validator(cumu_compaction_thread_nice,
+                 [](const int32_t config) -> bool { return config >= 0 && config <= 19; });
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory

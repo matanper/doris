@@ -35,6 +35,7 @@
 #include "util/countdown_latch.h"
 #include "util/slice.h"
 #include "util/stopwatch.hpp"
+#include "util/thread.h"
 #include "util/threadpool.h"
 
 namespace doris {
@@ -198,6 +199,8 @@ std::unique_ptr<PreloadTask> start_preload_cached_files(
     for (const auto& [f, offset] : order) {
         PreloadChunk chunk {cached[f], offset, std::min(chunk_size, sizes[f] - offset)};
         auto st = pool->submit_func([chunk, state, queue]() {
+            // Runs at the priority of the compactions it serves.
+            static_cast<void>(Thread::set_self_nice(config::cumu_compaction_thread_nice));
             if (state->cancelled) {
                 g_preload_skipped_chunks << 1;
                 state->chunk_done();

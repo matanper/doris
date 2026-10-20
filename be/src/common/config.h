@@ -1469,6 +1469,11 @@ DECLARE_mInt32(index_compaction_preload_threads);
 // Start the compaction data preload without waiting for it: the merge reads blocks as they
 // arrive, and the chunks not started when the merge ends are skipped.
 DECLARE_mBool(enable_compaction_async_data_preload);
+// Nice value of the threads running cumulative compactions and the compaction preload, from 0
+// (unchanged) to 19, so that loads get the CPU first. A thread takes the value when it starts
+// its next task; lowering it again needs CAP_SYS_NICE, so without it a lower value only
+// applies to threads not raised yet.
+DECLARE_mInt32(cumu_compaction_thread_nice);
 // Only for debug, do not use in production
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory
