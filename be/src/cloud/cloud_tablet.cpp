@@ -166,6 +166,9 @@ CloudTablet::CloudTablet(CloudStorageEngine& engine, TabletMetaSharedPtr tablet_
 }
 
 CloudTablet::~CloudTablet() {
+    // A tablet dropped from the tablet map with unused rowsets left takes them off the counts.
+    g_unused_rowsets_count << -static_cast<int64_t>(_unused_rowsets.size());
+    g_unused_rowsets_bytes << -_unused_rowsets_bytes;
     g_stuck_unused_rowsets_count << -_stuck_unused_rowsets;
     g_stuck_unused_rowsets_bytes << -_stuck_unused_rowsets_bytes;
     g_stuck_unused_rowsets_with_reader << -_stuck_unused_rowsets_with_reader;
@@ -1147,11 +1150,17 @@ void CloudTablet::add_unused_rowsets(const std::vector<RowsetSharedPtr>& rowsets
     std::lock_guard<std::mutex> lock(_gc_mutex);
     const int64_t now = ::time(nullptr);
     for (const auto& rowset : rowsets) {
-        _unused_rowsets[rowset->rowset_id()] = rowset;
-        _unused_rowset_ages.try_emplace(rowset->rowset_id(), UnusedRowsetAge {.added_s = now});
-        g_unused_rowsets_bytes << rowset->total_disk_size();
+        auto [it, inserted] = _unused_rowsets.try_emplace(rowset->rowset_id(), rowset);
+        if (!inserted) {
+            continue;
+        }
+        const int64_t bytes = rowset->total_disk_size();
+        _unused_rowset_ages.insert_or_assign(rowset->rowset_id(),
+                                             UnusedRowsetAge {.added_s = now, .bytes = bytes});
+        _unused_rowsets_bytes += bytes;
+        g_unused_rowsets_count << 1;
+        g_unused_rowsets_bytes << bytes;
     }
-    g_unused_rowsets_count << rowsets.size();
 }
 
 void CloudTablet::remove_unused_rowsets() {
@@ -1190,12 +1199,18 @@ void CloudTablet::remove_unused_rowsets() {
                 ++it;
                 continue;
             }
-            _unused_rowset_ages.erase(rs->rowset_id());
+            int64_t bytes = rs->total_disk_size();
+            if (auto age_it = _unused_rowset_ages.find(rs->rowset_id());
+                age_it != _unused_rowset_ages.end()) {
+                bytes = age_it->second.bytes;
+                _unused_rowset_ages.erase(age_it);
+            }
             tablet_meta()->remove_rowset_delete_bitmap(rs->rowset_id(), rs->version());
             _rowset_warm_up_states.erase(rs->rowset_id());
             rs->clear_cache();
+            _unused_rowsets_bytes -= bytes;
             g_unused_rowsets_count << -1;
-            g_unused_rowsets_bytes << -rs->total_disk_size();
+            g_unused_rowsets_bytes << -bytes;
             removed_rowsets.push_back(std::move(rs));
             it = _unused_rowsets.erase(it);
         }
