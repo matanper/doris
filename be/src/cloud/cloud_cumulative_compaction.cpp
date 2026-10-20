@@ -250,6 +250,8 @@ Status CloudCumulativeCompaction::execute_compact() {
             .tag("input_rowsets_index_size", _input_rowsets_index_size)
             .tag("input_rowsets_total_size", _input_rowsets_total_size)
             .tag("output_rows", _output_rowset->num_rows())
+            .tag("merged_rows", _stats.merged_rows)
+            .tag("filtered_rows", _stats.filtered_rows)
             .tag("output_segments", _output_rowset->num_segments())
             .tag("output_rowset_data_size", _output_rowset->data_disk_size())
             .tag("output_rowset_index_size", _output_rowset->index_disk_size())
