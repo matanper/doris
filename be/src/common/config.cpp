@@ -1165,6 +1165,10 @@ DEFINE_mInt32(cold_data_compaction_interval_sec, "1800");
 DEFINE_mInt32(cold_data_compaction_score_threshold, "100");
 
 DEFINE_String(tmp_file_dir, "tmp");
+DEFINE_String(index_tmp_file_dirs, "");
+DEFINE_mInt64(index_tmp_file_dir_min_free_bytes, "21474836480");
+DEFINE_mInt32(index_tmp_orphan_max_age_minutes, "60");
+DEFINE_mInt32(index_tmp_orphan_sweep_interval_seconds, "300");
 
 DEFINE_Int32(min_s3_file_system_thread_num, "16");
 DEFINE_Int32(max_s3_file_system_thread_num, "64");

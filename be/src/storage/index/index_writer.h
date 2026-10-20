@@ -22,6 +22,11 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <memory>
 #include <string>
 #include <vector>
@@ -73,31 +78,95 @@ public:
     static bool check_support_ann_index(const TabletColumn& column);
 };
 
-class TmpFileDirs {
+// Names of top-level entries of the index tmp dirs that live writers use, as prefixes: an index
+// file writer's "<rowset>_<segment>_" and an index compaction's "<rowset>". The orphan sweeper
+// never removes an entry a registered prefix covers.
+class IndexTmpRegistry {
 public:
-    TmpFileDirs(const std::vector<doris::StorePath>& store_paths) {
-        for (const auto& store_path : store_paths) {
-            _tmp_file_dirs.emplace_back(store_path.path + "/" + config::tmp_file_dir);
-        }
-    };
+    static IndexTmpRegistry& instance();
 
-    Status init() {
-        for (auto& tmp_file_dir : _tmp_file_dirs) {
-            // delete the tmp dir to avoid the tmp files left by last crash
-            RETURN_IF_ERROR(io::global_local_filesystem()->delete_directory(tmp_file_dir));
-            RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(tmp_file_dir));
-        }
-        return Status::OK();
-    };
-
-    io::Path get_tmp_file_dir() {
-        size_t cur_index = _next_index.fetch_add(1);
-        return _tmp_file_dirs[cur_index % _tmp_file_dirs.size()];
-    };
+    void add(const std::string& prefix);
+    void remove(const std::string& prefix);
+    // Whether a registered prefix is a prefix of `name`.
+    bool covers(const std::string& name) const;
 
 private:
+    mutable std::mutex _mutex;
+    std::map<std::string, int> _prefixes;
+};
+
+// Registers a prefix in IndexTmpRegistry for its lifetime.
+class ScopedIndexTmpPrefix {
+public:
+    explicit ScopedIndexTmpPrefix(std::string prefix) : _prefix(std::move(prefix)) {
+        IndexTmpRegistry::instance().add(_prefix);
+    }
+    ~ScopedIndexTmpPrefix() { IndexTmpRegistry::instance().remove(_prefix); }
+    ScopedIndexTmpPrefix(const ScopedIndexTmpPrefix&) = delete;
+    ScopedIndexTmpPrefix& operator=(const ScopedIndexTmpPrefix&) = delete;
+
+private:
+    std::string _prefix;
+};
+
+// The local directories index writers and index compaction put their temporary files in:
+// <storage_root_path>/<tmp_file_dir> for every store path, or the dirs of
+// config::index_tmp_file_dirs when it is set. Each is emptied at startup.
+class TmpFileDirs {
+public:
+    TmpFileDirs(const std::vector<doris::StorePath>& store_paths);
+    // Stops the orphan sweeper.
+    ~TmpFileDirs();
+
+    // Empties and creates the dirs. With config::index_tmp_file_dirs, refuses, before deleting
+    // anything, a dir validate_index_tmp_dir() rejects, and fails when a dir cannot be written.
+    Status init();
+
+    // The next dir, round-robin. With config::index_tmp_file_dirs, a dir whose file system has
+    // less than config::index_tmp_file_dir_min_free_bytes free is passed over; when all are,
+    // a store path's tmp dir is returned.
+    io::Path get_tmp_file_dir();
+
+    // Why `dir` may not be an index tmp dir: it must be absolute, must not equal or contain a
+    // store path, must not equal, contain or lie inside a file cache path or a protected dir
+    // (log, conf) other than being exactly <file cache path>/index_tmp, and must not be a mount
+    // point.
+    static Status validate_index_tmp_dir(const std::string& dir,
+                                         const std::vector<std::string>& store_paths,
+                                         const std::vector<std::string>& cache_paths,
+                                         const std::vector<std::string>& protected_dirs);
+
+    // Replaces the free-space probe of the index tmp dirs.
+    void set_free_bytes_function_for_test(std::function<int64_t(const io::Path&)> fn) {
+        _free_bytes_fn = std::move(fn);
+    }
+
+    const std::vector<io::Path>& index_tmp_dirs() const { return _index_tmp_dirs; }
+
+    // Starts a thread that runs sweep_orphans() every index_tmp_orphan_sweep_interval_seconds.
+    void start_orphan_sweeper();
+
+    // Removes the top-level entries of every tmp dir that no registered prefix covers and that
+    // nothing under has changed for index_tmp_orphan_max_age_minutes: what failed or cancelled
+    // writers left. Symbolic links are left alone and never followed. Returns the entries
+    // removed.
+    size_t sweep_orphans();
+
+private:
+    int64_t free_bytes(size_t index);
+
     std::vector<io::Path> _tmp_file_dirs;
     std::atomic_size_t _next_index {0}; // use for round-robin
+    std::vector<io::Path> _index_tmp_dirs;
+    std::atomic_size_t _next_index_tmp {0};
+    std::function<int64_t(const io::Path&)> _free_bytes_fn;
+    // Free bytes of each index tmp dir's file system, and when they were read, in ms.
+    std::unique_ptr<std::atomic<int64_t>[]> _free;
+    std::unique_ptr<std::atomic<int64_t>[]> _free_read_ms;
+    std::mutex _sweeper_mutex;
+    std::condition_variable _sweeper_cv;
+    bool _sweeper_stop = false;
+    std::thread _sweeper;
 };
 
 } // namespace segment_v2
