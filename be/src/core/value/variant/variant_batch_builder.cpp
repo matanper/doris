@@ -20,6 +20,7 @@
 #include <parallel_hashmap/phmap.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -31,6 +32,7 @@
 #include <utility>
 
 #include "common/exception.h"
+#include "common/logging.h"
 #include "core/custom_allocator.h"
 #include "core/pod_array.h"
 #include "core/value/large_int_value.h"
@@ -119,11 +121,30 @@ void require_import_utf8(StringRef value, const char* description) {
     }
 }
 
-void validate_utf8_string_ref(StringRef value, const char* description) {
-    validate_string_ref(value, description);
-    if (value.size != 0 && !validate_utf8(value.data, value.size)) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT, "Variant {} is not valid UTF-8", description);
+thread_local bool repair_invalid_utf8_on_read = false;
+
+// Logs the first repairs in full and then every 10000th, so the stored bytes can be traced without
+// flooding the log when one hot value is read by many queries.
+void log_repaired_utf8(const char* description, StringRef value) {
+    static std::atomic<int64_t> repairs {0};
+    const int64_t count = repairs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count > 64 && count % 10000 != 0) {
+        return;
     }
+    constexpr size_t MAX_LOGGED_BYTES = 256;
+    static constexpr char HEX[] = "0123456789abcdef";
+    std::string hex;
+    const size_t logged = std::min(value.size, MAX_LOGGED_BYTES);
+    hex.reserve(logged * 2);
+    for (size_t i = 0; i < logged; ++i) {
+        const auto byte = static_cast<uint8_t>(value.data[i]);
+        hex.push_back(HEX[byte >> 4]);
+        hex.push_back(HEX[byte & 0x0f]);
+    }
+    LOG(WARNING) << "Variant " << description
+                 << " read from storage is not valid UTF-8; invalid bytes replaced with U+FFFD."
+                 << " size=" << value.size << " hex=" << hex
+                 << (value.size > logged ? "..." : "") << " repairs_so_far=" << count;
 }
 
 template <typename String>
@@ -153,6 +174,78 @@ void release_batch_container(Container& container) noexcept {
 }
 
 } // namespace
+
+VariantRepairInvalidUtf8Scope::VariantRepairInvalidUtf8Scope() noexcept
+        : _previous(repair_invalid_utf8_on_read) {
+    repair_invalid_utf8_on_read = true;
+}
+
+VariantRepairInvalidUtf8Scope::~VariantRepairInvalidUtf8Scope() {
+    repair_invalid_utf8_on_read = _previous;
+}
+
+bool VariantRepairInvalidUtf8Scope::active() noexcept {
+    return repair_invalid_utf8_on_read;
+}
+
+std::string repair_invalid_utf8(StringRef value) {
+    static constexpr char REPLACEMENT[] = "\xEF\xBF\xBD";
+    const auto* bytes = reinterpret_cast<const uint8_t*>(value.data);
+    const size_t size = value.size;
+    std::string out;
+    out.reserve(size + 8);
+    size_t i = 0;
+    while (i < size) {
+        const uint8_t lead = bytes[i];
+        if (lead < 0x80) {
+            out.push_back(static_cast<char>(lead));
+            ++i;
+            continue;
+        }
+        size_t length = 0;
+        uint8_t second_min = 0x80;
+        uint8_t second_max = 0xBF;
+        if (lead >= 0xC2 && lead <= 0xDF) {
+            length = 2;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            length = 3;
+            if (lead == 0xE0) {
+                second_min = 0xA0;
+            } else if (lead == 0xED) {
+                second_max = 0x9F;
+            }
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            length = 4;
+            if (lead == 0xF0) {
+                second_min = 0x90;
+            } else if (lead == 0xF4) {
+                second_max = 0x8F;
+            }
+        }
+        if (length == 0) {
+            out.append(REPLACEMENT, 3);
+            ++i;
+            continue;
+        }
+        size_t matched = 1;
+        while (matched < length && i + matched < size) {
+            const uint8_t next = bytes[i + matched];
+            const uint8_t min = matched == 1 ? second_min : 0x80;
+            const uint8_t max = matched == 1 ? second_max : 0xBF;
+            if (next < min || next > max) {
+                break;
+            }
+            ++matched;
+        }
+        if (matched == length) {
+            out.append(value.data + i, length);
+        } else {
+            out.append(REPLACEMENT, 3);
+        }
+        i += matched;
+    }
+    return out;
+}
 
 struct VariantMetadataBuilder::Impl {
     using KeyMapValue = std::pair<const StringRef, uint32_t>;
@@ -187,7 +280,14 @@ uint32_t VariantMetadataBuilder::register_key(StringRef key) {
     if (existing != _impl->key_to_temporary_id.end()) {
         return existing->second;
     }
-    validate_utf8_string_ref(key, "metadata key");
+    if (key.size != 0 && !validate_utf8(key.data, key.size)) {
+        if (!repair_invalid_utf8_on_read) {
+            throw Exception(ErrorCode::INVALID_ARGUMENT, "Variant metadata key is not valid UTF-8");
+        }
+        log_repaired_utf8("metadata key", key);
+        const std::string repaired = repair_invalid_utf8(key);
+        return register_key(StringRef(repaired.data(), repaired.size()));
+    }
     if (_impl->keys.size() == std::numeric_limits<uint32_t>::max()) {
         throw Exception(ErrorCode::INVALID_ARGUMENT,
                         "Variant metadata dictionary exceeds the uint32 key limit");
@@ -1873,6 +1973,17 @@ void VariantBatchBuilder::Row::add_binary(StringRef value) {
 }
 
 void VariantBatchBuilder::Row::add_string(StringRef value) {
+    if (repair_invalid_utf8_on_read) {
+        validate_string_ref(value, "string");
+        if (value.size == 0 || validate_utf8(value.data, value.size)) {
+            add_valid_utf8_string(value);
+            return;
+        }
+        log_repaired_utf8("string", value);
+        const std::string repaired = repair_invalid_utf8(value);
+        add_valid_utf8_string(StringRef(repaired.data(), repaired.size()));
+        return;
+    }
     _add_scalar(VariantScalarRef::string(value));
 }
 
