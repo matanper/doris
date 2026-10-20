@@ -1339,6 +1339,12 @@ DECLARE_mBool(enable_file_cache_write_from_s3_file_writer);
 // block's pages makes dirty page cache pile up against the BE's memory limit, which turns reclaim
 // into waits on writeback for every allocating thread.
 DECLARE_mBool(file_cache_drop_page_cache_after_write);
+// With file_cache_drop_page_cache_after_write, a closed block file only starts its writeback; its
+// pages are dropped later, oldest first, once the bytes written back but not yet dropped exceed
+// this bound, and the writer that crosses it waits for those oldest files. This bounds the dirty
+// and cached pages of written blocks without a writeback wait on every block close. <= 0 waits
+// for each file's writeback on its close, as before.
+DECLARE_mInt64(file_cache_page_cache_drop_pending_bytes);
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}]
@@ -1936,6 +1942,13 @@ DECLARE_Int64(file_cache_writer_thread_num);
 // Max queued part copies of S3FileCacheWriterThreadPool. Each holds one s3_write_buffer_size
 // buffer until it is copied.
 DECLARE_Int64(file_cache_writer_queue_size);
+// Threads and queue of S3FileCacheWriterLoadThreadPool, which copies the parts of load writers
+// into the file cache, so they never wait behind compaction copies.
+DECLARE_Int64(file_cache_writer_load_thread_num);
+DECLARE_Int64(file_cache_writer_load_queue_size);
+// Bytes of non-load parts queued for or in a file cache copy at which a further part is not
+// copied: it is already in S3, so only its cache warm-up is lost. <= 0 means no bound.
+DECLARE_mInt64(file_cache_writer_backlog_bytes);
 
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);
