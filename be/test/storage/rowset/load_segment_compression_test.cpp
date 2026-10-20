@@ -19,6 +19,8 @@
 #include <gen_cpp/segment_v2.pb.h>
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -27,7 +29,9 @@
 #include "common/config.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
+#include "storage/index/index_writer.h"
 #include "storage/olap_define.h"
+#include "storage/options.h"
 #include "storage/rowset/beta_rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_reader.h"
@@ -317,6 +321,122 @@ TEST(ZstdCompressionLevelTest, level_controls_ratio_and_output_round_trips) {
     const size_t fast = compress_at(1);
     const size_t strong = compress_at(19);
     EXPECT_LT(strong, fast);
+}
+
+namespace {
+
+TabletSchemaSPtr create_wide_schema() {
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_short_key_columns(1);
+    schema_pb.set_num_rows_per_row_block(1024);
+    schema_pb.set_compression_type(segment_v2::ZSTD);
+    schema_pb.set_next_column_unique_id(8);
+    ColumnPB* key = schema_pb.add_column();
+    key->set_unique_id(1);
+    key->set_name("k1");
+    key->set_type("BIGINT");
+    key->set_is_key(true);
+    key->set_length(8);
+    key->set_index_length(8);
+    key->set_is_nullable(false);
+    for (int i = 2; i <= 7; ++i) {
+        ColumnPB* value = schema_pb.add_column();
+        value->set_unique_id(i);
+        value->set_name("v" + std::to_string(i));
+        value->set_type(i % 3 == 0 ? "BIGINT" : "VARCHAR");
+        value->set_is_key(false);
+        value->set_length(i % 3 == 0 ? 8 : 65533);
+        value->set_index_length(i % 3 == 0 ? 8 : 16);
+        value->set_is_nullable(true);
+    }
+    schema_pb.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
+    for (int i : {2, 4, 5}) {
+        auto* index = schema_pb.add_index();
+        index->set_index_id(100 + i);
+        index->set_index_name("idx_v" + std::to_string(i));
+        index->set_index_type(IndexType::INVERTED);
+        index->add_col_unique_id(i);
+        if (i != 2) {
+            (*index->mutable_properties())["parser"] = "english";
+            (*index->mutable_properties())["support_phrase"] = "true";
+        }
+    }
+    auto schema = std::make_shared<TabletSchema>();
+    schema->init_from_pb(schema_pb);
+    return schema;
+}
+
+Block make_wide_block(const TabletSchemaSPtr& schema, int64_t rows) {
+    Block block = schema->create_block();
+    auto columns = std::move(block).mutate_columns();
+    for (int64_t row = 0; row < rows; ++row) {
+        columns[0]->insert_data(reinterpret_cast<const char*>(&row), sizeof(row));
+        for (size_t c = 1; c < columns.size(); ++c) {
+            if ((row + c) % 17 == 0) {
+                columns[c]->insert_default();
+                continue;
+            }
+            if (c % 3 == 2) {
+                int64_t v = row * static_cast<int64_t>(c) % 1000;
+                columns[c]->insert_data(reinterpret_cast<const char*>(&v), sizeof(v));
+            } else {
+                std::string v = "event " + std::to_string(row % (37 * c)) + " from host-" +
+                                std::to_string(row % 11) + " user " + std::to_string(row % 301);
+                columns[c]->insert_data(v.data(), v.size());
+            }
+        }
+    }
+    block.set_columns(std::move(columns));
+    return block;
+}
+
+std::string read_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+} // namespace
+
+// Value columns appended in parallel write the same segment file as one by one, at the load's
+// ZSTD level.
+TEST_F(LoadSegmentCompressionTest, parallel_column_append_writes_the_same_segment) {
+    auto schema = create_wide_schema();
+    std::vector<StorePath> paths;
+    paths.emplace_back(std::string(kLoadCompressionDir) + "/tmp_store", -1);
+    auto tmp_dirs = std::make_unique<segment_v2::TmpFileDirs>(paths);
+    ASSERT_TRUE(tmp_dirs->init().ok());
+    ExecEnv::GetInstance()->set_tmp_file_dir(std::move(tmp_dirs));
+    config::load_segment_compression_type = "";
+    config::load_segment_zstd_compression_level = 7;
+    const int32_t old_parallelism = config::segment_column_write_parallelism;
+    std::vector<std::string> data;
+    for (int32_t parallelism : {1, 1, 8}) {
+        config::segment_column_write_parallelism = parallelism;
+        RowsetWriterContext context;
+        context.rowset_id = _engine->next_rowset_id();
+        context.rowset_type = BETA_ROWSET;
+        context.rowset_state = VISIBLE;
+        context.tablet_schema = schema;
+        context.tablet_path = kLoadCompressionDir;
+        context.version = {2, 2};
+        context.segments_overlap = NONOVERLAPPING;
+        context.max_rows_per_segment = UINT32_MAX;
+        context.write_type = DataWriteType::TYPE_DIRECT;
+        auto writer = RowsetFactory::create_rowset_writer(*_engine, context, false);
+        ASSERT_TRUE(writer.has_value()) << writer.error();
+        Block block = make_wide_block(schema, 30000);
+        ASSERT_TRUE(writer.value()->flush_single_block(&block).ok());
+        RowsetSharedPtr rowset;
+        ASSERT_TRUE(writer.value()->build(rowset).ok());
+        auto path = rowset->segment_path(0);
+        ASSERT_TRUE(path.has_value());
+        data.push_back(read_file(path.value()));
+        ASSERT_FALSE(data.back().empty());
+    }
+    config::segment_column_write_parallelism = old_parallelism;
+    ASSERT_TRUE(data[0] == data[1]) << data[0].size() << " vs " << data[1].size();
+    EXPECT_TRUE(data[0] == data[2]) << data[0].size() << " vs " << data[2].size();
 }
 
 } // namespace doris
