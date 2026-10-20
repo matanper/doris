@@ -297,6 +297,16 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths,
                     .set_max_threads(cast_set<int>(config::file_cache_writer_thread_num))
                     .set_max_queue_size(cast_set<int>(config::file_cache_writer_queue_size))
                     .build(&_s3_file_cache_writer_thread_pool));
+    if (config::file_cache_writer_load_thread_num > 0) {
+        static_cast<void>(ThreadPoolBuilder("S3FileCacheWriterLoadThreadPool")
+                                  .set_min_threads(cast_set<int>(std::min<int64_t>(
+                                          2, config::file_cache_writer_load_thread_num)))
+                                  .set_max_threads(cast_set<int>(
+                                          config::file_cache_writer_load_thread_num))
+                                  .set_max_queue_size(cast_set<int>(
+                                          config::file_cache_writer_load_queue_size))
+                                  .build(&_s3_file_cache_writer_load_thread_pool));
+    }
 
     // min num equal to fragment pool's min num
     // max num is useless because it will start as many as requested in the past
@@ -924,6 +934,7 @@ void ExecEnv::destroy() {
     SAFE_SHUTDOWN(_compaction_s3_file_upload_thread_pool);
     // After both upload pools, which submit to it.
     SAFE_SHUTDOWN(_s3_file_cache_writer_thread_pool);
+    SAFE_SHUTDOWN(_s3_file_cache_writer_load_thread_pool);
     SAFE_SHUTDOWN(_s3_file_system_thread_pool);
     SAFE_SHUTDOWN(_peer_race_s3_thread_pool);
     SAFE_SHUTDOWN(_send_batch_thread_pool);
@@ -983,6 +994,7 @@ void ExecEnv::destroy() {
     _compaction_non_block_close_thread_pool.reset(nullptr);
     _compaction_s3_file_upload_thread_pool.reset(nullptr);
     _s3_file_cache_writer_thread_pool.reset(nullptr);
+    _s3_file_cache_writer_load_thread_pool.reset(nullptr);
     _s3_file_system_thread_pool.reset(nullptr);
     _peer_race_s3_thread_pool.reset(nullptr);
     _send_table_stats_thread_pool.reset(nullptr);

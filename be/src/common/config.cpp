@@ -1291,6 +1291,7 @@ DEFINE_Bool(enable_file_cache, "false");
 // query-side file cache writes enabled.
 DEFINE_mBool(enable_file_cache_write_from_s3_file_writer, "true");
 DEFINE_mBool(file_cache_drop_page_cache_after_write, "true");
+DEFINE_mInt64(file_cache_page_cache_drop_pending_bytes, "268435456");
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: {"path": "/path/to/file_cache", "total_size":53687091200, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}
@@ -1813,6 +1814,9 @@ DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
 DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
 DEFINE_Int64(file_cache_writer_thread_num, "32");
 DEFINE_Int64(file_cache_writer_queue_size, "256");
+DEFINE_Int64(file_cache_writer_load_thread_num, "8");
+DEFINE_Int64(file_cache_writer_load_queue_size, "256");
+DEFINE_mInt64(file_cache_writer_backlog_bytes, "2147483648");
 
 // The min thread num for NonBlockCloseThreadPool
 DEFINE_Int64(min_nonblock_close_thread_num, "12");
