@@ -69,13 +69,20 @@ std::set<std::thread::id> FakeIndexWriter::threads;
 
 class ParallelismConfig {
 public:
-    explicit ParallelismConfig(int32_t parallelism) : _old(config::index_finish_parallelism) {
+    explicit ParallelismConfig(int32_t parallelism)
+            : _old(config::index_finish_parallelism),
+              _old_min_bytes(config::segment_write_task_min_bytes) {
         config::index_finish_parallelism = parallelism;
+        config::segment_write_task_min_bytes = 0;
     }
-    ~ParallelismConfig() { config::index_finish_parallelism = _old; }
+    ~ParallelismConfig() {
+        config::index_finish_parallelism = _old;
+        config::segment_write_task_min_bytes = _old_min_bytes;
+    }
 
 private:
     int32_t _old;
+    int64_t _old_min_bytes;
 };
 
 std::vector<std::unique_ptr<FakeIndexWriter>> make_writers(int n) {

@@ -476,6 +476,7 @@ TEST_F(VerticalCompactionVariantV2Test, ParallelSubcolumnWritesTheSameSegments) 
     for (int32_t parallelism : {1, 1, 8}) {
         ScopedConfig subcolumns(&config::variant_subcolumn_write_parallelism, parallelism);
         ScopedConfig columns(&config::segment_column_write_parallelism, parallelism);
+        ScopedConfig min_bytes(&config::segment_write_task_min_bytes, int64_t {0});
         std::vector<RowsetSharedPtr> inputs;
         for (const auto& rows : generated) {
             inputs.push_back(write_rowset(rows, version++));

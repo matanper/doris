@@ -14,10 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#include <bvar/bvar.h>
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -41,6 +43,7 @@
 #include "exec/common/variant_util.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
+#include "runtime/thread_context.h"
 #include "storage/data_dir.h"
 #include "storage/merger.h"
 #include "storage/predicate/column_predicate.h"
@@ -57,6 +60,8 @@
 #include <iterator>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <time.h>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -72,6 +77,10 @@
 // parallelism on and off, and checks that every segment file is the same.
 namespace doris {
 namespace {
+
+int64_t exposed(const std::string& name) {
+    return std::stoll(bvar::Variable::describe_exposed(name));
+}
 
 constexpr const char* kStressDir = "./ut_dir/parallel_segment_write_stress_test";
 
@@ -328,6 +337,28 @@ protected:
     }
 
     RowsetSharedPtr write_rowset(const InputRows& in, int64_t version, bool v2) {
+        Block block = make_block(in, v2);
+        return write_block(&block, version);
+    }
+
+    Block make_block(const InputRows& in, bool v2) {
+        auto keys = ColumnInt64::create();
+        for (auto ts : in.ts) {
+            keys->insert_value(ts);
+        }
+        Block block;
+        block.insert({std::move(keys), std::make_shared<DataTypeInt64>(), "ts"});
+        block.insert(string_column(in.org, "org"));
+        block.insert(string_column(in.raw, "raw"));
+        block.insert(variant_column(in.event, 3, v2));
+        block.insert(string_column(in.source, "source"));
+        block.insert(variant_column(in.tags, 5, v2));
+        block.insert(variant_column(in.internal_tags, 6, v2));
+        block.insert(string_column(in.log_source, "log_source"));
+        return block;
+    }
+
+    RowsetSharedPtr write_block(Block* block, int64_t version) {
         RowsetWriterContext ctx;
         RowsetId rowset_id;
         rowset_id.init(++_next_rowset);
@@ -346,22 +377,9 @@ protected:
         auto writer_result = RowsetFactory::create_rowset_writer(*_engine, ctx, false);
         EXPECT_TRUE(writer_result.has_value()) << writer_result.error();
         auto writer = std::move(writer_result).value();
-        auto keys = ColumnInt64::create();
-        for (auto ts : in.ts) {
-            keys->insert_value(ts);
-        }
-        Block block;
-        block.insert({std::move(keys), std::make_shared<DataTypeInt64>(), "ts"});
-        block.insert(string_column(in.org, "org"));
-        block.insert(string_column(in.raw, "raw"));
-        block.insert(variant_column(in.event, 3, v2));
-        block.insert(string_column(in.source, "source"));
-        block.insert(variant_column(in.tags, 5, v2));
-        block.insert(variant_column(in.internal_tags, 6, v2));
-        block.insert(string_column(in.log_source, "log_source"));
         // flush_single_block is the memtable flush entry point, which writes through
         // VerticalSegmentWriter.
-        Status st = writer->flush_single_block(&block);
+        Status st = writer->flush_single_block(block);
         EXPECT_TRUE(st.ok()) << st.to_string();
         RowsetSharedPtr rowset;
         st = writer->build(rowset);
@@ -425,12 +443,18 @@ protected:
         }
         std::vector<std::string> expected_loads;
         std::string expected_compaction;
-        // Serial once for the reference, then parallel several times to give races a chance.
-        for (int round = 0; round < 4; ++round) {
+        // Serial once for the reference, then parallel with the default task size, with every
+        // column and subcolumn its own task, and with small multi-column chunks.
+        const int64_t min_bytes[] = {config::segment_write_task_min_bytes,
+                                     config::segment_write_task_min_bytes, 0, 16384, 0};
+        for (int round = 0; round < 5; ++round) {
             const int32_t parallelism = round == 0 ? 1 : 8;
             ScopedValue columns(&config::segment_column_write_parallelism, parallelism);
             ScopedValue subcolumns(&config::variant_subcolumn_write_parallelism, parallelism);
             ScopedValue finish(&config::index_finish_parallelism, parallelism);
+            ScopedValue task_bytes(&config::segment_write_task_min_bytes, min_bytes[round]);
+            const int64_t tasks_before = exposed("segment_write_parallel_tasks");
+            const int64_t inline_before = exposed("segment_write_inline_tasks");
             std::vector<RowsetSharedPtr> rowsets;
             for (int64_t r = 0; r < 3; ++r) {
                 rowsets.push_back(write_rowset(inputs[r], 2 + r, v2));
@@ -447,6 +471,10 @@ protected:
             }
             const std::string compacted = segment_bytes(compact(rowsets));
             ASSERT_FALSE(compacted.empty());
+            std::cout << "round " << round << " min_bytes=" << min_bytes[round] << " pool tasks="
+                      << exposed("segment_write_parallel_tasks") - tasks_before
+                      << " inline tasks=" << exposed("segment_write_inline_tasks") - inline_before
+                      << std::endl;
             if (round == 0) {
                 expected_compaction = compacted;
             } else {
@@ -462,7 +490,7 @@ protected:
     std::unique_ptr<DataDir> _data_dir;
     TabletSchemaSPtr _schema;
     TabletSharedPtr _tablet;
-    int64_t _next_rowset = 900000;
+    std::atomic<int64_t> _next_rowset {900000};
 };
 
 TEST_F(ParallelSegmentWriteStressTest, VariantV2LogTableSegmentsAreIdentical) {
@@ -471,6 +499,217 @@ TEST_F(ParallelSegmentWriteStressTest, VariantV2LogTableSegmentsAreIdentical) {
 
 TEST_F(ParallelSegmentWriteStressTest, VariantV1LogTableSegmentsAreIdentical) {
     run(820002, false);
+}
+
+static double process_cpu_seconds() {
+    timespec ts {};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+static double wall_seconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+// Load flush and compaction CPU, wall time and pool tasks per row of the log table, written
+// serially, with every column and subcolumn a pool task, and with the default task size. The
+// flushes write one memtable-sized block each; the compaction merges in its own block size.
+// Runs only when PARALLEL_WRITE_BENCH_ROWS gives the rows per flush.
+TEST_F(ParallelSegmentWriteStressTest, LoadAndCompactionCost) {
+    const char* rows_env = std::getenv("PARALLEL_WRITE_BENCH_ROWS");
+    if (rows_env == nullptr) {
+        GTEST_SKIP() << "set PARALLEL_WRITE_BENCH_ROWS to run";
+    }
+    const int64_t rows = std::atoll(rows_env);
+    struct Mode {
+        const char* name;
+        int32_t parallelism;
+        int64_t min_bytes;
+    };
+    const Mode modes[] = {{"serial", 1, config::segment_write_task_min_bytes},
+                          {"per-column-tasks", 8, 0},
+                          {"chunked", 8, config::segment_write_task_min_bytes}};
+    for (bool v2 : {false, true}) {
+        create_tablet(v2 ? 830002 : 830001);
+        std::vector<InputRows> inputs;
+        for (int64_t r = 0; r < 3; ++r) {
+            inputs.push_back(make_rows(r, rows));
+        }
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            for (const Mode& mode : modes) {
+                ScopedValue columns(&config::segment_column_write_parallelism, mode.parallelism);
+                ScopedValue subcolumns(&config::variant_subcolumn_write_parallelism,
+                                       mode.parallelism);
+                ScopedValue finish(&config::index_finish_parallelism, mode.parallelism);
+                ScopedValue task_bytes(&config::segment_write_task_min_bytes, mode.min_bytes);
+                std::vector<Block> blocks;
+                for (const auto& in : inputs) {
+                    blocks.push_back(make_block(in, v2));
+                }
+                int64_t tasks = exposed("segment_write_parallel_tasks");
+                double cpu = process_cpu_seconds();
+                double wall = wall_seconds();
+                std::vector<RowsetSharedPtr> rowsets;
+                for (int64_t r = 0; r < 3; ++r) {
+                    rowsets.push_back(write_block(&blocks[r], 2 + r));
+                    ASSERT_NE(rowsets.back(), nullptr);
+                }
+                const double load_cpu = process_cpu_seconds() - cpu;
+                const double load_wall = wall_seconds() - wall;
+                const int64_t load_tasks = exposed("segment_write_parallel_tasks") - tasks;
+                tasks = exposed("segment_write_parallel_tasks");
+                cpu = process_cpu_seconds();
+                wall = wall_seconds();
+                auto output = compact(rowsets);
+                ASSERT_NE(output, nullptr);
+                const double compaction_cpu = process_cpu_seconds() - cpu;
+                const double compaction_wall = wall_seconds() - wall;
+                const int64_t compaction_tasks = exposed("segment_write_parallel_tasks") - tasks;
+                const auto total = static_cast<double>(3 * rows);
+                std::cout << "WRITE_BENCH variant=" << (v2 ? "v2" : "v1") << " mode=" << mode.name
+                          << " load_cpu_s=" << load_cpu << " load_wall_s=" << load_wall
+                          << " load_tasks_per_krow=" << load_tasks * 1000.0 / total
+                          << " compaction_cpu_s=" << compaction_cpu
+                          << " compaction_wall_s=" << compaction_wall
+                          << " compaction_tasks_per_krow=" << compaction_tasks * 1000.0 / total
+                          << std::endl;
+            }
+        }
+    }
+}
+
+// Memtable flush wall time, p50 / p90 / max over many flushes, while another thread compacts
+// continuously, for each write mode. Runs only when PARALLEL_WRITE_BENCH_ROWS gives the rows per
+// flush.
+TEST_F(ParallelSegmentWriteStressTest, FlushTailUnderCompaction) {
+    const char* rows_env = std::getenv("PARALLEL_WRITE_BENCH_ROWS");
+    if (rows_env == nullptr) {
+        GTEST_SKIP() << "set PARALLEL_WRITE_BENCH_ROWS to run";
+    }
+    const int64_t rows = std::atoll(rows_env);
+    const int flushes = 24;
+    struct Mode {
+        const char* name;
+        int32_t parallelism;
+        int64_t min_bytes;
+    };
+    const Mode modes[] = {{"serial", 1, config::segment_write_task_min_bytes},
+                          {"per-column-tasks", 8, 0},
+                          {"chunked", 8, config::segment_write_task_min_bytes}};
+    create_tablet(830003);
+    std::vector<InputRows> inputs;
+    for (int64_t r = 0; r < 4; ++r) {
+        inputs.push_back(make_rows(r, rows));
+    }
+    std::vector<RowsetSharedPtr> compaction_inputs;
+    for (int64_t r = 0; r < 3; ++r) {
+        compaction_inputs.push_back(write_rowset(inputs[r], 2 + r, false));
+        ASSERT_NE(compaction_inputs.back(), nullptr);
+    }
+    for (const Mode& mode : modes) {
+        ScopedValue columns(&config::segment_column_write_parallelism, mode.parallelism);
+        ScopedValue subcolumns(&config::variant_subcolumn_write_parallelism, mode.parallelism);
+        ScopedValue finish(&config::index_finish_parallelism, mode.parallelism);
+        ScopedValue task_bytes(&config::segment_write_task_min_bytes, mode.min_bytes);
+        std::atomic<bool> stop {false};
+        std::atomic<int> compactions {0};
+        std::vector<std::thread> compactors;
+        for (int t = 0; t < 4; ++t) {
+            compactors.emplace_back([&]() {
+                SCOPED_INIT_THREAD_CONTEXT();
+                while (!stop.load()) {
+                    if (compact(compaction_inputs) != nullptr) {
+                        ++compactions;
+                    }
+                }
+            });
+        }
+        std::vector<double> walls;
+        for (int i = 0; i < flushes; ++i) {
+            Block block = make_block(inputs[3], false);
+            const double start = wall_seconds();
+            auto rowset = write_block(&block, 10 + i);
+            walls.push_back((wall_seconds() - start) * 1000);
+            ASSERT_NE(rowset, nullptr);
+        }
+        stop = true;
+        for (auto& t : compactors) {
+            t.join();
+        }
+        std::sort(walls.begin(), walls.end());
+        std::cout << "FLUSH_TAIL mode=" << mode.name << " rows=" << rows
+                  << " p50_ms=" << walls[walls.size() / 2]
+                  << " p90_ms=" << walls[walls.size() * 9 / 10] << " max_ms=" << walls.back()
+                  << " concurrent_compactions=" << compactions.load() << std::endl;
+    }
+}
+
+// Tasks smaller than a chunk together run on the calling thread, in order, with no pool task.
+TEST(ChunkedSegmentWriteTasksTest, SmallTasksRunOnTheCallingThread) {
+    ScopedValue min_bytes(&config::segment_write_task_min_bytes, int64_t {1000});
+    const int64_t pool_before = exposed("segment_write_parallel_tasks");
+    std::vector<int> order;
+    const auto caller = std::this_thread::get_id();
+    bool on_caller = true;
+    segment_v2::ChunkedSegmentWriteTasks tasks(8);
+    for (int i = 0; i < 10; ++i) {
+        tasks.add(100, [&, i]() {
+            order.push_back(i);
+            on_caller = on_caller && std::this_thread::get_id() == caller;
+            return Status::OK();
+        });
+    }
+    EXPECT_TRUE(order.empty());
+    ASSERT_TRUE(tasks.wait().ok());
+    EXPECT_EQ(order, (std::vector<int> {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+    EXPECT_TRUE(on_caller);
+    EXPECT_EQ(exposed("segment_write_parallel_tasks") - pool_before, 0);
+}
+
+// Tasks are grouped into chunks of at least segment_write_task_min_bytes, one pool task each,
+// and every task runs once; a failing task fails the run and skips the rest of its chunk.
+TEST(ChunkedSegmentWriteTasksTest, LargeInputsRunInChunks) {
+    ScopedValue min_bytes(&config::segment_write_task_min_bytes, int64_t {1000});
+    const int64_t pool_before = exposed("segment_write_parallel_tasks");
+    std::atomic<int> ran {0};
+    segment_v2::ChunkedSegmentWriteTasks tasks(8);
+    for (int i = 0; i < 40; ++i) {
+        tasks.add(250, [&ran]() {
+            ++ran;
+            return Status::OK();
+        });
+    }
+    ASSERT_TRUE(tasks.wait().ok());
+    EXPECT_EQ(ran, 40);
+    EXPECT_EQ(exposed("segment_write_parallel_tasks") - pool_before, 10);
+
+    std::atomic<int> ran_after_failure {0};
+    segment_v2::ChunkedSegmentWriteTasks failing(8);
+    for (int i = 0; i < 8; ++i) {
+        failing.add(250, [&ran_after_failure, i]() -> Status {
+            if (i == 4) {
+                return Status::InternalError("injected");
+            }
+            if (i > 4 && i < 8) {
+                ++ran_after_failure;
+            }
+            return Status::OK();
+        });
+    }
+    EXPECT_FALSE(failing.wait().ok());
+    EXPECT_EQ(ran_after_failure, 0);
+
+    segment_v2::ChunkedSegmentWriteTasks serial(1);
+    int serial_ran = 0;
+    for (int i = 0; i < 3; ++i) {
+        serial.add(5000, [&serial_ran]() {
+            ++serial_ran;
+            return Status::OK();
+        });
+        EXPECT_EQ(serial_ran, i + 1);
+    }
+    EXPECT_TRUE(serial.wait().ok());
 }
 
 // A task that throws on a pool thread fails its group with the exception's status, instead of

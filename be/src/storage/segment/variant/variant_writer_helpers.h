@@ -87,7 +87,8 @@ struct PendingSubcolumnWrite {
 };
 
 // Converts and appends the pending subcolumns, each on its own convertor, on SegmentWritePool and
-// the calling thread, at most config::variant_subcolumn_write_parallelism at once.
+// the calling thread, at most config::variant_subcolumn_write_parallelism at once, in runs of at
+// least config::segment_write_task_min_bytes of input.
 Status write_pending_subcolumns(std::vector<PendingSubcolumnWrite>* pending, size_t num_rows);
 
 // Converts only present values. Missing logical rows are appended as NULL; ARRAY uses a one-path

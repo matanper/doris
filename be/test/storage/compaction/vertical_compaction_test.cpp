@@ -2118,6 +2118,9 @@ TEST_F(VerticalCompactionTest, ParallelValueGroupAppendWritesTheSameSegment) {
     }
     TabletSharedPtr tablet = create_tablet(*tablet_schema, false);
     const int32_t old_parallelism = config::segment_column_write_parallelism;
+    const int64_t old_min_bytes = config::segment_write_task_min_bytes;
+    // Every column of every block is its own pool task.
+    config::segment_write_task_min_bytes = 0;
     std::vector<std::string> outputs;
     for (int32_t parallelism : {1, 1, 8}) {
         config::segment_column_write_parallelism = parallelism;
@@ -2149,6 +2152,7 @@ TEST_F(VerticalCompactionTest, ParallelValueGroupAppendWritesTheSameSegment) {
         ASSERT_FALSE(outputs.back().empty());
     }
     config::segment_column_write_parallelism = old_parallelism;
+    config::segment_write_task_min_bytes = old_min_bytes;
     ASSERT_TRUE(outputs[0] == outputs[1]) << outputs[0].size() << " vs " << outputs[1].size();
     EXPECT_TRUE(outputs[0] == outputs[2]) << outputs[0].size() << " vs " << outputs[2].size();
 }
