@@ -21,6 +21,7 @@
 #include <limits>
 #include <utility>
 
+#include "common/config.h"
 #include "common/cast_set.h"
 #include "common/exception.h"
 #include "core/assert_cast.h"
@@ -178,6 +179,11 @@ Status VariantV2ColumnWriter::_write_root(const IColumn* root_jsonb, int& column
 Status VariantV2ColumnWriter::_write_materialized(const VariantShreddedColumns& shredded,
                                                   OlapBlockDataConvertor* converter,
                                                   int& column_id) {
+    // With variant_subcolumn_write_parallelism, the path writers are created here in path order
+    // and their values are converted and appended afterwards in parallel; the writers keep their
+    // pages in memory until write_data(), which runs in path order.
+    const bool parallel = config::variant_subcolumn_write_parallelism > 1;
+    std::vector<variant_writer_helpers::PendingSubcolumnWrite> pending;
     for (const VariantPathColumn& path_column : shredded.materialized) {
         if (!path_column.column || path_column.column->size() != path_column.rowids.size()) {
             return Status::InvalidArgument(
@@ -194,14 +200,23 @@ Status VariantV2ColumnWriter::_write_materialized(const VariantShreddedColumns& 
                 _opts, *_tablet_column, current_column_id, path_column.path, path_column.type,
                 cast_set<int64_t>(path_column.rowids.size()), _num_rows, nullptr, true, &indexes,
                 &opts, &writer, &tablet_column));
-        RETURN_IF_ERROR(variant_writer_helpers::append_sparse_converted_column(
-                tablet_column, writer.get(), converter, current_column_id, path_column.type,
-                path_column.column, path_column.rowids, _num_rows));
+        if (parallel) {
+            // The convertor slot keeps the shared convertor's ids in step with the column ids.
+            converter->add_column_data_convertor(tablet_column);
+            pending.push_back({tablet_column, path_column.type, path_column.column, writer.get(),
+                               true,
+                               std::span<const uint32_t>(path_column.rowids.data(),
+                                                         path_column.rowids.size())});
+        } else {
+            RETURN_IF_ERROR(variant_writer_helpers::append_sparse_converted_column(
+                    tablet_column, writer.get(), converter, current_column_id, path_column.type,
+                    path_column.column, path_column.rowids, _num_rows));
+        }
         _subcolumn_indexes.push_back(std::move(indexes));
         _subcolumn_opts.push_back(opts);
         _subcolumn_writers.push_back(std::move(writer));
     }
-    return Status::OK();
+    return variant_writer_helpers::write_pending_subcolumns(&pending, _num_rows);
 }
 
 Status VariantV2ColumnWriter::_write_binary(const VariantShreddedColumns& shredded,

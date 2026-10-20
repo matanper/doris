@@ -1518,6 +1518,10 @@ DECLARE_mInt32(index_finish_thread_num);
 DECLARE_mInt32(segment_column_write_parallelism);
 // Max threads of SegmentWritePool; 0 means the number of cores.
 DECLARE_mInt32(segment_write_thread_num);
+// How many subcolumns of a VARIANT column are converted and appended at once when a segment is
+// written, on SegmentWritePool and the writing thread; their data is still written in path
+// order. <= 1 appends them one by one.
+DECLARE_mInt32(variant_subcolumn_write_parallelism);
 // wheather index by RAM directory when base compaction
 DECLARE_mBool(inverted_index_ram_dir_enable_when_base_compaction);
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a
