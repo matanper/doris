@@ -875,6 +875,8 @@ Status Compaction::do_inverted_index_compaction() {
         !ctx.has_index_compaction()) {
         return Status::OK();
     }
+    TEST_SYNC_POINT_CALLBACK("Compaction::do_inverted_index_compaction:columns",
+                             &ctx.columns_to_do_index_compaction);
 
     auto error_handler = [this](int64_t index_id, int64_t column_uniq_id) {
         LOG(WARNING) << "failed to do index compaction"
@@ -1402,6 +1404,7 @@ static bool check_rowset_has_inverted_index(const RowsetSharedPtr& src_rs, int32
 
     auto fs = rowset->rowset_meta()->fs();
     DBUG_EXECUTE_IF("Compaction::construct_skip_inverted_index_get_fs_error", { fs = nullptr; })
+    TEST_SYNC_POINT_CALLBACK("Compaction::check_rowset_has_inverted_index:fs", rowset, &fs);
     if (!fs) {
         LOG(WARNING) << "get fs failed, resource_id=" << rowset->rowset_meta()->resource_id();
         return false;
