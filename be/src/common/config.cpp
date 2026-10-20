@@ -1275,6 +1275,7 @@ DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
 DEFINE_mInt32(variant_nested_group_max_depth, "10");
 DEFINE_mBool(variant_nested_group_discard_scalar_on_conflict, "true");
 DEFINE_mBool(variant_v2_validate_internal_block, "false");
+DEFINE_mBool(variant_v2_check_read_paths, "false");
 DEFINE_mBool(variant_v2_bounded_column_growth, "true");
 
 DEFINE_Validator(variant_max_json_key_length,
