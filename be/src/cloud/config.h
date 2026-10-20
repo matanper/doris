@@ -170,6 +170,9 @@ DECLARE_mInt64(hole_rowset_max_versions);
 // tablet get their prefix rowset [s, v] when the range is created. A reader of any other
 // intermediate version gets its prefix when it asks for it.
 DECLARE_mInt64(hole_rowset_eager_prefix_versions);
+// Drop a tablet's trailing hole rowset when a longer one replaces it, instead of keeping it on
+// the stale path. Its versions stay readable through the new range and on-demand prefixes.
+DECLARE_mBool(hole_rowset_drop_extended_tail);
 
 // When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
 // no rows in a load without building a rowset writer for it, as long as the tablet is cached on

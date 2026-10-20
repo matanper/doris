@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <bvar/bvar.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest.h>
 
@@ -193,6 +194,56 @@ TEST_F(CloudHoleRowsetRangeTest, ApplyPendingExtendsTrailingHole) {
         ASSERT_EQ(_tablet->max_version_unlocked(), v);
         ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, v}}));
     }
+    expect_all_versions_capturable(*_tablet);
+}
+
+// A tablet that most loads do not write keeps one hole rowset as its versions advance: each
+// longer range replaces the trailing one, which is dropped instead of kept on the stale path, and
+// every version stays readable.
+TEST_F(CloudHoleRowsetRangeTest, ExtendedTailIsDroppedNotStaled) {
+    config::hole_rowset_eager_prefix_versions = 0;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+    const auto dropped_before =
+            std::stoll(bvar::Variable::describe_exposed("hole_rowset_tail_dropped_count"));
+    for (int64_t v = 2; v <= 40; ++v) {
+        add_empty_pending(_tablet.get(), v);
+        _tablet->apply_visible_pending_rowsets();
+        ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, v}}));
+        EXPECT_TRUE(_tablet->_stale_rs_version_map.empty()) << v;
+        EXPECT_EQ(_tablet->tablet_meta()->all_rs_metas().size(), 2) << v;
+    }
+    EXPECT_EQ(std::stoll(bvar::Variable::describe_exposed("hole_rowset_tail_dropped_count")) -
+                      dropped_before,
+              38);
+    EXPECT_TRUE(_tablet->_timestamped_version_tracker._stale_version_path_map.empty());
+    expect_all_versions_capturable(*_tablet);
+}
+
+// With the drop disabled the replaced trailing hole rowsets stay on the stale path, as before.
+TEST_F(CloudHoleRowsetRangeTest, ExtendedTailIsStaledWhenDropDisabled) {
+    config::hole_rowset_eager_prefix_versions = 0;
+    config::hole_rowset_drop_extended_tail = false;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+    for (int64_t v = 2; v <= 10; ++v) {
+        add_empty_pending(_tablet.get(), v);
+        _tablet->apply_visible_pending_rowsets();
+    }
+    EXPECT_EQ(_tablet->_stale_rs_version_map.size(), 8);
+    expect_all_versions_capturable(*_tablet);
+    config::hole_rowset_drop_extended_tail = true;
+}
+
+// A trailing hole rowset a reader holds is not extended, so it is neither dropped nor replaced.
+TEST_F(CloudHoleRowsetRangeTest, HeldTailIsNotDropped) {
+    config::hole_rowset_eager_prefix_versions = 0;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+    add_empty_pending(_tablet.get(), 2);
+    _tablet->apply_visible_pending_rowsets();
+    auto held = _tablet->get_rowset_by_version({2, 2});
+    ASSERT_NE(held, nullptr);
+    add_empty_pending(_tablet.get(), 3);
+    _tablet->apply_visible_pending_rowsets();
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 2}, {3, 3}}));
     expect_all_versions_capturable(*_tablet);
 }
 
