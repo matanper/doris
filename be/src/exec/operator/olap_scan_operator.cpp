@@ -580,6 +580,11 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
             RETURN_IF_ERROR(olap_scanner->init(state(), _conjuncts));
         }
 
+        // Each scanner holds the rowsets of its own splits; the whole read sources are not
+        // needed any more, and holding them would keep every scanned rowset until the query
+        // ends.
+        _read_sources.clear();
+
         const OlapReaderStatistics* stats = scanner_builder.builder_stats();
         io::FileCacheProfileReporter cache_profile(_segment_profile.get());
         cache_profile.update(&stats->file_cache_stats);

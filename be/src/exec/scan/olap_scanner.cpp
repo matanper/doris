@@ -656,9 +656,10 @@ Status OlapScanner::close(RuntimeState* state) {
 }
 
 void OlapScanner::update_realtime_counters() {
-    if (!_has_prepared) {
+    if (!_has_prepared || _tablet_reader == nullptr) {
         // Counter update need prepare successfully, or it maybe core. For example, olap scanner
         // will open tablet reader during prepare, if not prepare successfully, tablet reader == nullptr.
+        // The reader is also released once the scanner reaches its end.
         return;
     }
     OlapScanLocalState* local_state = static_cast<OlapScanLocalState*>(_local_state);
