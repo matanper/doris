@@ -35,6 +35,10 @@
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/index_finish_batch.h"
+#include "storage/rowset/rowset_factory.h"
+#include "storage/rowset/rowset_writer.h"
+#include "storage/rowset/rowset_writer_context.h"
+#include "storage/storage_engine.h"
 #include "common/config.h"
 #include "storage/index/index_writer.h"
 #include "storage/index/inverted/inverted_index_desc.h"
@@ -482,6 +486,121 @@ static void IndexBuildSegment(benchmark::State& state) {
 
 BENCHMARK(IndexBuildSegment)
         ->ArgsProduct({{0, 1, 4, 8, 16}, {50000}})
+        ->Unit(benchmark::kMillisecond)
+        ->UseRealTime();
+
+// A memtable flush of a log-table-like segment: a BIGINT key and one column per text and eq
+// index kind, each with its index, written through the rowset writer as a load does, with
+// segment_column_write_parallelism = index_finish_parallelism = range(0). Reports the flush's
+// wall time per row and the data file's digest.
+static void IndexFlushSegment(benchmark::State& state) {
+    install_analyzers();
+    const int parallelism = static_cast<int>(state.range(0));
+    const auto rows = static_cast<size_t>(state.range(1));
+    const std::vector<int> kinds = {RAW_ALNUM,  MESSAGE_ALNUM, CMD_NGRAM,  PATH_NGRAM,
+                                    NAME_NGRAM, EQ_LOW_CARD,   EQ_HIGH_CARD};
+    static StorageEngine* engine = [] {
+        auto e = std::make_unique<StorageEngine>(EngineOptions {});
+        auto* raw = e.get();
+        ExecEnv::GetInstance()->set_storage_engine(std::move(e));
+        return raw;
+    }();
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    pb.set_num_rows_per_row_block(1024);
+    pb.set_compression_type(segment_v2::ZSTD);
+    pb.set_next_column_unique_id(static_cast<int32_t>(kinds.size()) + 2);
+    pb.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
+    ColumnPB* key = pb.add_column();
+    key->set_unique_id(1);
+    key->set_name("k");
+    key->set_type("BIGINT");
+    key->set_is_key(true);
+    key->set_length(8);
+    key->set_index_length(8);
+    key->set_is_nullable(false);
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        ColumnPB* c = pb.add_column();
+        c->set_unique_id(static_cast<int32_t>(i) + 2);
+        c->set_name(std::string("c_") + kind_name(kinds[i]));
+        c->set_type("STRING");
+        c->set_is_key(false);
+        c->set_length(INT32_MAX);
+        c->set_is_nullable(true);
+        auto meta = index_meta(kinds[i], static_cast<int64_t>(i) + 2);
+        TabletIndexPB index_pb;
+        meta.to_schema_pb(&index_pb);
+        *pb.add_index() = index_pb;
+    }
+    auto schema = std::make_shared<TabletSchema>();
+    schema->init_from_pb(pb);
+    std::vector<std::vector<std::string>> data;
+    for (int k : kinds) {
+        data.push_back(values(k, rows));
+    }
+    const std::string dir = "/tmp/inverted_index_build_bench/flush";
+    std::filesystem::create_directories(dir);
+    const int old_columns = config::segment_column_write_parallelism;
+    const int old_finish = config::index_finish_parallelism;
+    config::segment_column_write_parallelism = parallelism;
+    config::index_finish_parallelism = parallelism;
+    int64_t wall_ns = 0;
+    std::string last_segment;
+    for (auto _ : state) {
+        state.PauseTiming();
+        Block block = schema->create_block();
+        auto columns = std::move(block).mutate_columns();
+        for (size_t r = 0; r < rows; ++r) {
+            int64_t k = static_cast<int64_t>(r);
+            columns[0]->insert_data(reinterpret_cast<const char*>(&k), sizeof(k));
+            for (size_t i = 0; i < kinds.size(); ++i) {
+                columns[i + 1]->insert_data(data[i][r].data(), data[i][r].size());
+            }
+        }
+        block.set_columns(std::move(columns));
+        RowsetWriterContext context;
+        context.rowset_id = engine->next_rowset_id();
+        context.rowset_type = BETA_ROWSET;
+        context.rowset_state = VISIBLE;
+        context.tablet_schema = schema;
+        context.tablet_path = dir;
+        context.version = {2, 2};
+        context.segments_overlap = NONOVERLAPPING;
+        context.max_rows_per_segment = UINT32_MAX;
+        context.write_type = DataWriteType::TYPE_DIRECT;
+        auto writer = RowsetFactory::create_rowset_writer(*engine, context, false);
+        if (!writer.has_value()) {
+            state.SkipWithError("create rowset writer failed");
+            break;
+        }
+        state.ResumeTiming();
+        auto start = std::chrono::steady_clock::now();
+        auto st = writer.value()->flush_single_block(&block);
+        wall_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        state.PauseTiming();
+        RowsetSharedPtr rowset;
+        if (!st.ok() || !writer.value()->build(rowset).ok()) {
+            state.SkipWithError("flush failed");
+            break;
+        }
+        auto path = rowset->segment_path(0);
+        last_segment = path.has_value() ? path.value() : "";
+        state.ResumeTiming();
+    }
+    config::segment_column_write_parallelism = old_columns;
+    config::index_finish_parallelism = old_finish;
+    state.counters["flush_us_per_row"] = static_cast<double>(wall_ns) / 1e3 /
+                                         static_cast<double>(rows * state.iterations());
+    char digest[16];
+    snprintf(digest, sizeof(digest), "%08x", file_digest(last_segment));
+    state.SetLabel(digest);
+}
+
+BENCHMARK(IndexFlushSegment)
+        ->ArgsProduct({{1, 4, 8, 16}, {50000}})
         ->Unit(benchmark::kMillisecond)
         ->UseRealTime();
 

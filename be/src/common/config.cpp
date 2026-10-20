@@ -1454,6 +1454,8 @@ DEFINE_mBool(debug_inverted_index_compaction, "false");
 DEFINE_mBool(inverted_index_ram_dir_enable, "true");
 DEFINE_mInt32(index_finish_parallelism, "8");
 DEFINE_mInt32(index_finish_thread_num, "0");
+DEFINE_mInt32(segment_column_write_parallelism, "8");
+DEFINE_mInt32(segment_write_thread_num, "0");
 // wheather index by RAM directory when base compaction
 DEFINE_mBool(inverted_index_ram_dir_enable_when_base_compaction, "true");
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a

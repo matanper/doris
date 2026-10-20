@@ -201,6 +201,13 @@ private:
                                      size_t num_rows, const std::vector<size_t>& short_key_pos);
     Status _check_column_writer_disk_capacity(size_t cid);
     Status _finalize_column_writer_and_update_meta(size_t cid);
+    // Writes column `cid`'s data, which its writer has finished, and records its sizes.
+    Status _write_column_data_and_update_meta(size_t cid);
+    // Whether the value columns may be appended in parallel (segment_column_write_parallelism).
+    bool _parallel_column_append_allowed();
+    // Creates the writers of the value columns from `first_cid` on in column order, appends and
+    // finishes them in parallel, then writes their data in column order.
+    Status _append_value_columns_in_parallel(uint32_t first_cid, bool skip_row_store_column);
 
     bool _is_mow();
     bool _is_mow_with_cluster_key();
