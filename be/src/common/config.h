@@ -1506,6 +1506,12 @@ DECLARE_mInt32(cumu_compaction_thread_nice);
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory
 DECLARE_mBool(inverted_index_ram_dir_enable);
+// How many of a segment's index writers finish at once, when the segment is flushed or a
+// compaction writes it: they share IndexFinishPool, and the writing thread works too. <= 1
+// finishes them one by one on the writing thread.
+DECLARE_mInt32(index_finish_parallelism);
+// Max threads of IndexFinishPool, shared by all segment writers; 0 means the number of cores.
+DECLARE_mInt32(index_finish_thread_num);
 // wheather index by RAM directory when base compaction
 DECLARE_mBool(inverted_index_ram_dir_enable_when_base_compaction);
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a

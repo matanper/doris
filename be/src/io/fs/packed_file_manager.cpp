@@ -60,6 +60,7 @@ namespace {
 bvar::Adder<int64_t> g_packed_file_total_count("packed_file", "total_count");
 bvar::Adder<int64_t> g_packed_file_total_small_file_count("packed_file", "total_small_file_num");
 bvar::Adder<int64_t> g_packed_file_total_size_bytes("packed_file", "total_size_bytes");
+bvar::Adder<int64_t> g_global_index_misses("packed_file", "global_index_misses");
 bvar::IntRecorder g_packed_file_small_file_num_recorder;
 bvar::IntRecorder g_packed_file_file_size_recorder;
 bvar::Window<bvar::IntRecorder> g_packed_file_avg_small_file_num(
@@ -516,7 +517,9 @@ Status PackedFileManager::get_packed_slice_location(const std::string& path,
     std::lock_guard<std::mutex> lock(_global_index_mutex);
     auto it = _global_slice_locations.find(path);
     if (it == _global_slice_locations.end()) {
-        return Status::NotFound("File not found in global packed index: {}", path);
+        g_global_index_misses << 1;
+        // Expected for every file that is not packed, so it carries no stack trace.
+        return Status::NotFound<false>("File not found in global packed index: {}", path);
     }
 
     *location = it->second;
