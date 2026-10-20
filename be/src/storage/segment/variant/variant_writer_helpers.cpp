@@ -39,6 +39,7 @@
 #include "storage/iterator/olap_data_convertor.h"
 #include "storage/rowset/rowset_writer_context.h"
 #include "storage/segment/encoding_info.h"
+#include "storage/segment/segment_write_tasks.h"
 #include "storage/segment/variant/v2/variant_shredder.h"
 #include "storage/types.h"
 
@@ -235,6 +236,22 @@ Status convert_and_write_column(OlapBlockDataConvertor* converter, const TabletC
                                    num_rows));
     converter->clear_source_content(column_id);
     return Status::OK();
+}
+
+Status write_pending_subcolumns(std::vector<PendingSubcolumnWrite>* pending, size_t num_rows) {
+    auto& writes = *pending;
+    return segment_v2::run_segment_write_tasks(
+            writes.size(), config::variant_subcolumn_write_parallelism, [&](size_t i) -> Status {
+                auto& write = writes[i];
+                OlapBlockDataConvertor converter;
+                if (write.sparse) {
+                    return append_sparse_converted_column(write.column, write.writer, &converter, 0,
+                                                          write.type, write.src_column,
+                                                          write.rowids, num_rows);
+                }
+                return convert_and_write_column(&converter, write.column, write.type, write.writer,
+                                                write.src_column, num_rows, 0);
+            });
 }
 
 namespace {
