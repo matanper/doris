@@ -30,6 +30,7 @@
 #include <cstring>
 #include <list>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -342,7 +343,7 @@ Status Compaction::merge_input_rowsets() {
     // The test results show that merger is low-memory-footprint, there is no need to tracker its mem pool
     // if ctx.columns_to_do_index_compaction.size() > 0, it means we need to do inverted index compaction.
     // the row ID conversion matrix needs to be used for inverted index compaction.
-    if (!ctx.columns_to_do_index_compaction.empty() ||
+    if (ctx.has_index_compaction() ||
         (_tablet->keys_type() == KeysType::UNIQUE_KEYS &&
          _tablet->enable_unique_key_merge_on_write())) {
         _stats.rowid_conversion = _rowid_conversion.get();
@@ -783,10 +784,38 @@ Status CompactionMixin::execute_compact_impl(int64_t permits) {
     return Status::OK();
 }
 
+// Typed VARIANT subcolumns whose indexes a compaction merged, and those it rebuilt because some
+// input lacked them, with enable_variant_typed_path_index_compaction.
+bvar::Adder<uint64_t> g_variant_index_merge_paths("compaction_variant_index_merge_paths");
+bvar::Adder<uint64_t> g_variant_index_rebuild_paths("compaction_variant_index_rebuild_paths");
+
+// The VARIANT subcolumn of `schema` whose full path is `path`, or nullptr.
+static const TabletColumn* find_extracted_column(const TabletSchema& schema,
+                                                 const std::string& path) {
+    for (const auto& column : schema.columns()) {
+        if (column->is_extracted_column() && column->path_info_ptr() != nullptr &&
+            column->path_info_ptr()->get_path() == path) {
+            return column.get();
+        }
+    }
+    return nullptr;
+}
+
+// Properties of the index `index_id` in `schema`, if it has one.
+static std::optional<std::map<std::string, std::string>> index_properties(
+        const TabletSchema& schema, int64_t index_id) {
+    for (const auto* index : schema.inverted_indexes()) {
+        if (index->index_id() == index_id) {
+            return index->properties();
+        }
+    }
+    return std::nullopt;
+}
+
 Status Compaction::do_inverted_index_compaction() {
     const auto& ctx = _output_rs_writer->context();
     if (!_enable_inverted_index_compaction || _input_row_num <= 0 ||
-        ctx.columns_to_do_index_compaction.empty()) {
+        !ctx.has_index_compaction()) {
         return Status::OK();
     }
 
@@ -1120,6 +1149,21 @@ Status Compaction::do_inverted_index_compaction() {
             }
         }
     }
+    for (const auto& path : ctx.variant_paths_to_do_index_compaction) {
+        const TabletColumn* column = find_extracted_column(*_cur_tablet_schema, path);
+        if (column == nullptr) {
+            status = Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(
+                    "Can not find the VARIANT subcolumn {} for index compaction", path);
+            LOG(WARNING) << "failed to do index compaction. tablet=" << _tablet->tablet_id()
+                         << ", " << status;
+            break;
+        }
+        for (const auto& index_meta : _cur_tablet_schema->inverted_indexs(*column)) {
+            if (auto st = compact_index(index_meta, column->parent_unique_id()); !st.ok()) {
+                status = st;
+            }
+        }
+    }
 
     // check index compaction status. If status is not ok, we should return error and end this compaction round.
     if (!status.ok()) {
@@ -1149,6 +1193,12 @@ void Compaction::mark_skip_index_compaction(
         }
         for (const auto& index_meta : index_metas) {
             error_handler(index_meta->index_id(), column_uniq_id);
+        }
+    }
+    for (const auto& path : context.variant_paths_to_do_index_compaction) {
+        const TabletColumn* column = find_extracted_column(*_cur_tablet_schema, path);
+        if (column != nullptr) {
+            error_handler(-1, column->parent_unique_id());
         }
     }
 }
@@ -1279,6 +1329,117 @@ static bool check_rowset_has_inverted_index(const RowsetSharedPtr& src_rs, int32
     return true;
 }
 
+// A typed subcolumn's indexes are merged when every segment of every input rowset has all of
+// them, with the properties the output schema has; otherwise the writers build them as usual.
+// Typed paths are materialized in every segment while variant_enable_typed_paths_to_sparse is
+// off, so their index files exist wherever the column was written with these indexes.
+void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& ctx) {
+    struct Candidate {
+        const TabletColumn* column;
+        std::vector<const TabletIndex*> indexes;
+        bool eligible = true;
+    };
+    std::vector<Candidate> candidates;
+    for (const auto& column : _cur_tablet_schema->columns()) {
+        if (!column->is_extracted_column() || column->path_info_ptr() == nullptr ||
+            !column->path_info_ptr()->get_is_typed() || !field_is_slice_type(column->type())) {
+            continue;
+        }
+        const auto* parent = _cur_tablet_schema->try_path_set_info(column->parent_unique_id());
+        if (parent == nullptr) {
+            continue;
+        }
+        auto indexes = _cur_tablet_schema->inverted_indexs(*column);
+        if (!indexes.empty()) {
+            candidates.push_back({.column = column.get(), .indexes = std::move(indexes)});
+        }
+    }
+    if (candidates.empty()) {
+        return;
+    }
+
+    for (const auto& input : _input_rowsets) {
+        auto* rowset = static_cast<BetaRowset*>(input.get());
+        for (auto& candidate : candidates) {
+            if (!candidate.eligible) {
+                continue;
+            }
+            if (rowset->is_skip_index_compaction(candidate.column->parent_unique_id())) {
+                candidate.eligible = false;
+                continue;
+            }
+            for (const auto* index : candidate.indexes) {
+                const auto expected = index_properties(*_cur_tablet_schema, index->index_id());
+                const auto actual = index_properties(*rowset->tablet_schema(), index->index_id());
+                if (!actual.has_value() || actual != expected) {
+                    candidate.eligible = false;
+                    break;
+                }
+            }
+        }
+        auto fs = rowset->rowset_meta()->fs();
+        if (!fs) {
+            return;
+        }
+        for (int i = 0; i < rowset->num_segments(); ++i) {
+            if (std::none_of(candidates.begin(), candidates.end(),
+                             [](const Candidate& c) { return c.eligible; })) {
+                return;
+            }
+            auto seg_path = rowset->segment_path(i);
+            if (!seg_path) {
+                return;
+            }
+            try {
+                IndexFileReader reader(
+                        fs,
+                        std::string {
+                                InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value())},
+                        _cur_tablet_schema->get_inverted_index_storage_format(),
+                        rowset->rowset_meta()->inverted_index_file_info(i),
+                        _tablet->tablet_id());
+                if (!reader.init(config::inverted_index_read_buffer_size).ok()) {
+                    return;
+                }
+                for (auto& candidate : candidates) {
+                    if (!candidate.eligible) {
+                        continue;
+                    }
+                    for (const auto* index : candidate.indexes) {
+                        auto dir = reader.open(index);
+                        if (!dir.has_value()) {
+                            candidate.eligible = false;
+                            break;
+                        }
+                        std::vector<std::string> files;
+                        dir.value()->list(&files);
+                        dir.value()->close();
+                        // null_bitmap, segments_N and segments.gen at least
+                        if (files.size() < 3) {
+                            candidate.eligible = false;
+                            break;
+                        }
+                    }
+                }
+            } catch (CLuceneError& err) {
+                LOG(WARNING) << "tablet[" << _tablet->tablet_id() << "] rowset["
+                             << rowset->rowset_id() << "] skips VARIANT subcolumn index compaction: "
+                             << err.what();
+                return;
+            }
+        }
+    }
+    for (const auto& candidate : candidates) {
+        if (candidate.eligible) {
+            ctx.variant_paths_to_do_index_compaction.insert(
+                    candidate.column->path_info_ptr()->get_path());
+            g_variant_index_merge_paths << 1;
+        } else {
+            g_variant_index_rebuild_paths << 1;
+        }
+    }
+}
+
 void Compaction::construct_index_compaction_columns(RowsetWriterContext& ctx) {
     for (const auto& index : _cur_tablet_schema->inverted_indexes()) {
         auto col_unique_ids = index->col_unique_ids();
@@ -1405,6 +1566,9 @@ Status CompactionMixin::construct_output_rowset_writer(RowsetWriterContext& ctx)
                                                 _tablet->enable_unique_key_merge_on_write()) ||
                                                _tablet->keys_type() == KeysType::DUP_KEYS))) {
         construct_index_compaction_columns(ctx);
+        if (config::enable_variant_typed_path_index_compaction) {
+            construct_variant_index_compaction_paths(ctx);
+        }
     }
     ctx.version = _output_version;
     ctx.rowset_state = VISIBLE;
@@ -1978,6 +2142,9 @@ Status CloudCompactionMixin::construct_output_rowset_writer(RowsetWriterContext&
                                                 _tablet->enable_unique_key_merge_on_write()) ||
                                                _tablet->keys_type() == KeysType::DUP_KEYS))) {
         construct_index_compaction_columns(ctx);
+        if (config::enable_variant_typed_path_index_compaction) {
+            construct_variant_index_compaction_paths(ctx);
+        }
     }
 
     // Use the storage resource of the previous rowset.

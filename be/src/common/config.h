@@ -1472,6 +1472,10 @@ DECLARE_Int32(inverted_index_read_buffer_size);
 DECLARE_Int32(max_depth_in_bkd_tree);
 // index compaction
 DECLARE_mBool(inverted_index_compaction_enable);
+// Index compaction also merges the inverted indexes of VARIANT typed subcolumns (field_pattern
+// indexes on typed paths) when every input segment has them, instead of the segment writers
+// tokenizing every value again.
+DECLARE_mBool(enable_variant_typed_path_index_compaction);
 DECLARE_mBool(enable_compaction_release_input_segments);
 // A compaction keeps each input segment it opened for the rest of the task, so that reading
 // the inputs once per column group opens every segment once.
