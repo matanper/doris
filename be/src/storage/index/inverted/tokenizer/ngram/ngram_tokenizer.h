@@ -56,6 +56,7 @@ private:
                                                int32_t buffer_end) const;
 
     void to_chars(const std::vector<UChar32>& buffer, int32_t start, int32_t size);
+    // The encoding of ICU's UnicodeString, which to_chars matches.
     void to_chars_with_icu(const std::vector<UChar32>& buffer, int32_t start, int32_t size);
 
     int32_t _buffer_start = 0;

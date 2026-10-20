@@ -60,7 +60,6 @@
 #include "storage/compaction/cumulative_compaction_policy.h"
 #include "storage/compaction/cumulative_compaction_time_series_policy.h"
 #include "storage/compaction/index_compaction_preload.h"
-#include "storage/compaction/variant_subcolumn_index_compaction.h"
 #include "storage/compaction_task_tracker.h"
 #include "storage/data_dir.h"
 #include "storage/index/index_file_reader.h"
@@ -324,7 +323,6 @@ Status Compaction::merge_input_rowsets() {
     // if ctx.columns_to_do_index_compaction.size() > 0, it means we need to do inverted index compaction.
     // the row ID conversion matrix needs to be used for inverted index compaction.
     if (!ctx.columns_to_do_index_compaction.empty() ||
-        !ctx.variant_subcolumn_indexes_to_compact.empty() ||
         (_tablet->keys_type() == KeysType::UNIQUE_KEYS &&
          _tablet->enable_unique_key_merge_on_write())) {
         _stats.rowid_conversion = _rowid_conversion.get();
@@ -765,18 +763,10 @@ Status CompactionMixin::execute_compact_impl(int64_t permits) {
     return Status::OK();
 }
 
-namespace {
-bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_merged(
-        "variant_subcolumn_index_compaction_merged");
-bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_rebuilt(
-        "variant_subcolumn_index_compaction_rebuilt");
-} // namespace
-
 Status Compaction::do_inverted_index_compaction() {
     const auto& ctx = _output_rs_writer->context();
     if (!_enable_inverted_index_compaction || _input_row_num <= 0 ||
-        (ctx.columns_to_do_index_compaction.empty() &&
-         ctx.variant_subcolumn_indexes_to_compact.empty())) {
+        ctx.columns_to_do_index_compaction.empty()) {
         return Status::OK();
     }
 
@@ -1075,23 +1065,6 @@ Status Compaction::do_inverted_index_compaction() {
         }
     }
 
-    if (status.ok() && !ctx.variant_subcolumn_indexes_to_compact.empty()) {
-        std::vector<const IndexFileWriter*> dest_writers;
-        for (int dest_segment_id = 0; dest_segment_id < dest_segment_num; dest_segment_id++) {
-            dest_writers.push_back(inverted_index_file_writers[dest_segment_id].get());
-        }
-        status = check_variant_subcolumn_index_outputs(ctx, dest_writers, error_handler);
-        if (status.ok()) {
-            for (const auto& entry : ctx.variant_subcolumn_indexes_to_compact) {
-                if (auto st = compact_index(entry.index.get(), entry.variant_uid); !st.ok()) {
-                    status = st;
-                } else {
-                    g_variant_subcolumn_index_compaction_merged << 1;
-                }
-            }
-        }
-    }
-
     // check index compaction status. If status is not ok, we should return error and end this compaction round.
     if (!status.ok()) {
         return status;
@@ -1121,9 +1094,6 @@ void Compaction::mark_skip_index_compaction(
         for (const auto& index_meta : index_metas) {
             error_handler(index_meta->index_id(), column_uniq_id);
         }
-    }
-    for (const auto& entry : context.variant_subcolumn_indexes_to_compact) {
-        error_handler(entry.index->index_id(), entry.variant_uid);
     }
 }
 
@@ -1317,93 +1287,6 @@ void Compaction::construct_index_compaction_columns(RowsetWriterContext& ctx) {
             ctx.columns_to_do_index_compaction.insert(col_unique_id);
         }
     }
-    construct_variant_subcolumn_index_compaction(ctx);
-}
-
-void Compaction::construct_variant_subcolumn_index_compaction(RowsetWriterContext& ctx) {
-    if (!config::enable_variant_subcolumn_index_compaction) {
-        return;
-    }
-    std::vector<VariantSubcolumnIndexCandidate> candidates;
-    std::set<int32_t> variant_uids;
-    for (const auto& column : _cur_tablet_schema->columns()) {
-        if (!column->is_extracted_column() || column->path_info_ptr() == nullptr ||
-            column->path_info_ptr()->has_nested_part() || !field_is_slice_type(column->type())) {
-            continue;
-        }
-        const int32_t variant_uid = column->parent_unique_id();
-        if (!_cur_tablet_schema->has_column_unique_id(variant_uid)) {
-            continue;
-        }
-        const auto& parent = _cur_tablet_schema->column_by_uid(variant_uid);
-        if (!parent.is_variant_type() || parent.variant_enable_nested_group() ||
-            parent.variant_enable_doc_mode()) {
-            continue;
-        }
-        auto indexes = _cur_tablet_schema->inverted_indexs(*column);
-        if (indexes.empty()) {
-            continue;
-        }
-        candidates.push_back({.variant_uid = variant_uid,
-                              .path = column->path_info_ptr()->copy_pop_front().get_path(),
-                              .type = column->type(),
-                              .indexes = std::move(indexes)});
-        variant_uids.insert(variant_uid);
-    }
-    if (candidates.empty()) {
-        return;
-    }
-
-    std::vector<TabletSchemaSPtr> input_schemas;
-    std::set<int32_t> skipped_variant_uids;
-    std::map<int32_t, std::vector<VariantSegmentPaths>> input_segments;
-    for (const auto& rowset : _input_rowsets) {
-        input_schemas.push_back(rowset->tablet_schema());
-        for (const int32_t variant_uid : variant_uids) {
-            if (rowset->is_skip_index_compaction(variant_uid)) {
-                skipped_variant_uids.insert(variant_uid);
-            }
-        }
-        if (auto st = collect_variant_segment_paths(rowset, variant_uids, &input_segments);
-            !st.ok()) {
-            LOG(WARNING) << "tablet[" << _tablet->tablet_id() << "] rowset[" << rowset->rowset_id()
-                         << "] cannot read variant sub-columns, will rebuild their indexes: " << st;
-            return;
-        }
-    }
-    auto selection = select_variant_subcolumn_indexes(
-            candidates, input_schemas, input_segments, skipped_variant_uids,
-            [this](int32_t variant_uid, const TabletIndex& index) {
-                return std::all_of(_input_rowsets.begin(), _input_rowsets.end(),
-                                   [&](const RowsetSharedPtr& rowset) {
-                                       return check_rowset_has_index_file(
-                                               static_cast<BetaRowset*>(rowset.get()), &index,
-                                               variant_uid, _tablet, _cur_tablet_schema);
-                                   });
-            });
-    g_variant_subcolumn_index_compaction_rebuilt << selection.rebuild;
-    ctx.variant_subcolumn_indexes_to_compact = std::move(selection.merge);
-}
-
-Status Compaction::check_variant_subcolumn_index_outputs(
-        const RowsetWriterContext& ctx, const std::vector<const IndexFileWriter*>& dest_writers,
-        const std::function<void(int64_t, int64_t)>& error_handler) {
-    // A merged index is only valid for a segment that wrote the path as a string sub-column and
-    // left this index to compaction; the writer built no index for it, so any other output
-    // fails this compaction.
-    for (const auto& entry : ctx.variant_subcolumn_indexes_to_compact) {
-        for (const auto* dest_writer : dest_writers) {
-            if (!ctx.variant_subcolumn_index_writes->contains(dest_writer, entry.index->index_id(),
-                                                              entry.index->get_index_suffix())) {
-                error_handler(entry.index->index_id(), entry.variant_uid);
-                return Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(
-                        "tablet {} output does not store variant path {} as a string "
-                        "sub-column in every segment",
-                        _tablet->tablet_id(), entry.path);
-            }
-        }
-    }
-    return Status::OK();
 }
 
 Status CompactionMixin::update_delete_bitmap() {
