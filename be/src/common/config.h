@@ -1831,6 +1831,9 @@ DECLARE_mInt64(s3_put_bytes_per_second_max);
 DECLARE_mInt32(s3_rate_limiter_cpu_cores_override);
 // max s3 client retry times
 DECLARE_mInt32(max_s3_client_retry);
+// Draw each S3 retry delay uniformly from [0, its exponential backoff] ("full jitter"), so that
+// requests throttled together, as by SlowDown, do not all retry together.
+DECLARE_mBool(enable_s3_retry_full_jitter);
 // When meet s3 429 error, the "get" request will
 // sleep s3_read_base_wait_time_ms (*1, *2, *3, *4) ms
 // get try again.
