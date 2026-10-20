@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "common/status.h"
 
@@ -52,6 +53,38 @@ private:
     std::shared_ptr<State> _state;
     int _parallelism;
     int _helpers = 0;
+    bool _waited = false;
+};
+
+// Tasks of one segment write, each with the bytes of input it handles, grouped in the order added
+// into chunks of at least config::segment_write_task_min_bytes. The tasks of a chunk run one after
+// another on one thread, and the chunks run as the tasks of a SegmentWriteTaskGroup. While the
+// tasks added fill at most one chunk they run on the calling thread, in wait(), and no pool thread
+// is used; with parallelism <= 1 each task runs in add(). After a task fails, the tasks of its
+// chunk after it do not run. The tasks must touch disjoint state.
+class ChunkedSegmentWriteTasks {
+public:
+    explicit ChunkedSegmentWriteTasks(int parallelism);
+    ~ChunkedSegmentWriteTasks();
+    ChunkedSegmentWriteTasks(const ChunkedSegmentWriteTasks&) = delete;
+    ChunkedSegmentWriteTasks& operator=(const ChunkedSegmentWriteTasks&) = delete;
+
+    void add(size_t bytes, std::function<Status()> task);
+    Status wait();
+
+private:
+    using Chunk = std::vector<std::function<Status()>>;
+    static Status run_chunk(const Chunk& chunk);
+    void submit(Chunk chunk);
+
+    const int _parallelism;
+    const size_t _min_bytes;
+    Chunk _current;
+    size_t _current_bytes = 0;
+    // The first full chunk, kept back until a second one fills.
+    Chunk _held;
+    std::unique_ptr<SegmentWriteTaskGroup> _group;
+    Status _inline_status;
     bool _waited = false;
 };
 

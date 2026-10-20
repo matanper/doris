@@ -44,6 +44,10 @@ bvar::Adder<uint64_t> g_parallel_tasks("segment_write_parallel_tasks");
 bvar::Adder<uint64_t> g_helper_tasks("segment_write_helper_tasks");
 bvar::Adder<uint64_t> g_pool_rejected("segment_write_pool_rejected");
 bvar::Adder<uint64_t> g_task_exceptions("segment_write_task_exceptions");
+// Tasks of ChunkedSegmentWriteTasks run in chunks on the task group, and run on the writing
+// thread because all of them together were less than two chunks.
+bvar::Adder<uint64_t> g_chunk_tasks("segment_write_chunked_tasks");
+bvar::Adder<uint64_t> g_inline_tasks("segment_write_inline_tasks");
 
 int wanted_threads() {
     return config::segment_write_thread_num > 0
@@ -78,8 +82,6 @@ ThreadPool* write_pool() {
 
 Status run_catching_exceptions(const std::function<Status()>& task) {
     try {
-        doris::enable_thread_catch_bad_alloc++;
-        Defer defer {[&]() { doris::enable_thread_catch_bad_alloc--; }};
         return task();
     } catch (const doris::Exception& e) {
         g_task_exceptions << 1;
@@ -216,6 +218,79 @@ Status SegmentWriteTaskGroup::wait() {
     std::unique_lock lock(_state->mutex);
     _state->idle.wait(lock, [&] { return _state->active == 0; });
     return _state->status;
+}
+
+ChunkedSegmentWriteTasks::ChunkedSegmentWriteTasks(int parallelism)
+        : _parallelism(parallelism),
+          _min_bytes(static_cast<size_t>(std::max<int64_t>(0, config::segment_write_task_min_bytes))) {}
+
+ChunkedSegmentWriteTasks::~ChunkedSegmentWriteTasks() {
+    if (!_waited) {
+        static_cast<void>(wait());
+    }
+}
+
+Status ChunkedSegmentWriteTasks::run_chunk(const Chunk& chunk) {
+    for (const auto& task : chunk) {
+        RETURN_IF_ERROR(run_catching_exceptions(task));
+    }
+    return Status::OK();
+}
+
+void ChunkedSegmentWriteTasks::submit(Chunk chunk) {
+    g_chunk_tasks << chunk.size();
+    if (chunk.size() == 1) {
+        _group->add(std::move(chunk.front()));
+        return;
+    }
+    _group->add([chunk = std::move(chunk)]() { return run_chunk(chunk); });
+}
+
+void ChunkedSegmentWriteTasks::add(size_t bytes, std::function<Status()> task) {
+    if (_parallelism <= 1) {
+        if (_inline_status.ok()) {
+            _inline_status = run_catching_exceptions(task);
+        }
+        return;
+    }
+    _current.push_back(std::move(task));
+    _current_bytes += bytes;
+    if (_current_bytes < _min_bytes) {
+        return;
+    }
+    if (_group == nullptr && _held.empty()) {
+        _held = std::move(_current);
+    } else {
+        if (_group == nullptr) {
+            _group = std::make_unique<SegmentWriteTaskGroup>(_parallelism);
+            submit(std::move(_held));
+        }
+        submit(std::move(_current));
+    }
+    _current = Chunk {};
+    _current_bytes = 0;
+}
+
+Status ChunkedSegmentWriteTasks::wait() {
+    _waited = true;
+    if (_group == nullptr) {
+        g_inline_tasks << _held.size() + _current.size();
+        Status st = _inline_status;
+        if (st.ok()) {
+            st = run_chunk(_held);
+        }
+        if (st.ok()) {
+            st = run_chunk(_current);
+        }
+        _held.clear();
+        _current.clear();
+        return st;
+    }
+    if (!_current.empty()) {
+        submit(std::move(_current));
+        _current = Chunk {};
+    }
+    return _group->wait();
 }
 
 Status run_segment_write_tasks(size_t n, int parallelism,

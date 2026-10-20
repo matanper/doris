@@ -410,6 +410,8 @@ TEST_F(LoadSegmentCompressionTest, parallel_column_append_writes_the_same_segmen
     config::load_segment_compression_type = "";
     config::load_segment_zstd_compression_level = 7;
     const int32_t old_parallelism = config::segment_column_write_parallelism;
+    const int64_t old_min_bytes = config::segment_write_task_min_bytes;
+    config::segment_write_task_min_bytes = 0;
     std::vector<std::string> data;
     for (int32_t parallelism : {1, 1, 8}) {
         config::segment_column_write_parallelism = parallelism;
@@ -435,6 +437,7 @@ TEST_F(LoadSegmentCompressionTest, parallel_column_append_writes_the_same_segmen
         ASSERT_FALSE(data.back().empty());
     }
     config::segment_column_write_parallelism = old_parallelism;
+    config::segment_write_task_min_bytes = old_min_bytes;
     ASSERT_TRUE(data[0] == data[1]) << data[0].size() << " vs " << data[1].size();
     EXPECT_TRUE(data[0] == data[2]) << data[0].size() << " vs " << data[2].size();
 }

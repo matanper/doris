@@ -1405,7 +1405,10 @@ Status VariantV1ColumnWriter::_process_subcolumns(ColumnVariant* ptr,
     // With variant_subcolumn_write_parallelism, the subcolumn writers are created here in path
     // order and their data is converted and appended afterwards in parallel; the writers keep
     // their pages in memory until write_data(), which runs in path order.
-    const bool parallel = config::variant_subcolumn_write_parallelism > 1;
+    // A compaction writes its subcolumns one by one.
+    const bool parallel = config::variant_subcolumn_write_parallelism > 1 &&
+                          !(_opts.rowset_ctx != nullptr &&
+                            _opts.rowset_ctx->write_type == DataWriteType::TYPE_COMPACTION);
     std::vector<variant_writer_helpers::PendingSubcolumnWrite> pending;
 
     auto write_one_subcolumn = [&](const std::string& current_path, const PathInData& relative_path,

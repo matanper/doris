@@ -182,7 +182,10 @@ Status VariantV2ColumnWriter::_write_materialized(const VariantShreddedColumns& 
     // With variant_subcolumn_write_parallelism, the path writers are created here in path order
     // and their values are converted and appended afterwards in parallel; the writers keep their
     // pages in memory until write_data(), which runs in path order.
-    const bool parallel = config::variant_subcolumn_write_parallelism > 1;
+    // A compaction writes its subcolumns one by one.
+    const bool parallel = config::variant_subcolumn_write_parallelism > 1 &&
+                          !(_opts.rowset_ctx != nullptr &&
+                            _opts.rowset_ctx->write_type == DataWriteType::TYPE_COMPACTION);
     std::vector<variant_writer_helpers::PendingSubcolumnWrite> pending;
     for (const VariantPathColumn& path_column : shredded.materialized) {
         if (!path_column.column || path_column.column->size() != path_column.rowids.size()) {

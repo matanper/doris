@@ -51,7 +51,6 @@
 #include "storage/data_dir.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/index_finish_batch.h"
-#include "storage/segment/segment_write_tasks.h"
 #include "storage/index/index_writer.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/primary_key_index.h"
@@ -746,34 +745,7 @@ Status SegmentWriter::append_block(const Block* block, size_t row_pos, size_t nu
     // convert column data from engine format to storage layer format
     std::vector<IOlapColumnDataAccessor*> key_columns;
     IOlapColumnDataAccessor* seq_column = nullptr;
-    // A writer without keys, as for the value column groups of a vertical compaction, converts
-    // and appends its columns in parallel: each column has its own convertor and writer, and the
-    // writers keep their pages in memory until write_data(). VARIANT columns, whose writers may
-    // add subcolumn metas to the shared segment footer, are appended on this thread, in column
-    // order, as the serial path does.
-    const bool parallel_append = !_has_key && config::segment_column_write_parallelism > 1 &&
-                                 _column_writers.size() > 1;
-    if (parallel_append) {
-        auto append = [&](size_t id) -> Status {
-            auto [status, column] = _olap_data_convertor->convert_column_data(id);
-            RETURN_IF_ERROR(status);
-            return _column_writers[id]->append(column->get_nullmap(), column->get_data(),
-                                               num_rows);
-        };
-        SegmentWriteTaskGroup group(config::segment_column_write_parallelism);
-        Status status;
-        for (size_t id = 0; id < _column_writers.size() && status.ok(); ++id) {
-            if (_tablet_schema->column(_column_ids[id]).is_variant_type()) {
-                status = run_catching_exceptions([&]() { return append(id); });
-            } else {
-                group.add([&append, id]() { return append(id); });
-            }
-        }
-        Status tasks = group.wait();
-        RETURN_IF_ERROR(status);
-        RETURN_IF_ERROR(tasks);
-    }
-    for (size_t id = 0; !parallel_append && id < _column_writers.size(); ++id) {
+    for (size_t id = 0; id < _column_writers.size(); ++id) {
         // olap data convertor alway start from id = 0
         auto converted_result = _olap_data_convertor->convert_column_data(id);
         if (!converted_result.first.ok()) {
@@ -1115,7 +1087,9 @@ Status SegmentWriter::_write_zone_map() {
 }
 
 Status SegmentWriter::_write_inverted_index() {
-    IndexFinishBatch batch;
+    IndexFinishBatch batch(_opts.write_type == DataWriteType::TYPE_COMPACTION
+                                   ? IndexFinishLane::COMPACTION
+                                   : IndexFinishLane::LOAD);
     for (auto& column_writer : _column_writers) {
         RETURN_IF_ERROR(column_writer->write_inverted_index());
     }
