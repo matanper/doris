@@ -17,9 +17,12 @@
 
 #include <CLucene.h>
 #include <CLucene/config/repl_wchar.h>
+#include <time.h>
 #include <bvar/bvar.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <map>
 #include <random>
 #include <set>
@@ -27,6 +30,8 @@
 #include <vector>
 
 #include "common/config.h"
+#include "runtime/exec_env.h"
+#include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_reader.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/variant/index_storage_variant_test_base.h"
@@ -70,11 +75,61 @@ std::map<std::string, std::vector<std::pair<int32_t, std::vector<int32_t>>>> pos
     return out;
 }
 
+// ExecEnv creates its IndexPolicyMgr only in ExecEnv::init, which unit tests do not run, and
+// offers no setter. An explicit instantiation may name a private member.
+template <typename Tag, typename Tag::type Member>
+struct PrivateMemberAccess {
+    friend typename Tag::type private_member(Tag) { return Member; }
+};
+struct ExecEnvIndexPolicyMgrTag {
+    using type = IndexPolicyMgr* ExecEnv::*;
+    friend type private_member(ExecEnvIndexPolicyMgrTag);
+};
+template struct PrivateMemberAccess<ExecEnvIndexPolicyMgrTag, &ExecEnv::_index_policy_mgr>;
+
+// Installs the custom analyzers alnum_lower and ngram4_lower for the object's lifetime.
+class ScopedAnalyzers {
+public:
+    ScopedAnalyzers() {
+        TIndexPolicy alnum;
+        alnum.id = 1;
+        alnum.name = "alnum_lower";
+        alnum.type = TIndexPolicyType::ANALYZER;
+        alnum.properties["tokenizer"] = "basic";
+        alnum.properties["token_filter"] = "lowercase";
+        TIndexPolicy ngram;
+        ngram.id = 2;
+        ngram.name = "ngram4";
+        ngram.type = TIndexPolicyType::TOKENIZER;
+        ngram.properties["type"] = "ngram";
+        ngram.properties["min_gram"] = "4";
+        ngram.properties["max_gram"] = "4";
+        TIndexPolicy ngram_lower;
+        ngram_lower.id = 3;
+        ngram_lower.name = "ngram4_lower";
+        ngram_lower.type = TIndexPolicyType::ANALYZER;
+        ngram_lower.properties["tokenizer"] = "ngram4";
+        ngram_lower.properties["token_filter"] = "lowercase";
+        _mgr.apply_policy_changes({alnum, ngram, ngram_lower}, {});
+        auto& slot = ExecEnv::GetInstance()->*private_member(ExecEnvIndexPolicyMgrTag {});
+        _previous = slot;
+        slot = &_mgr;
+    }
+    ~ScopedAnalyzers() {
+        ExecEnv::GetInstance()->*private_member(ExecEnvIndexPolicyMgrTag {}) = _previous;
+    }
+
+private:
+    IndexPolicyMgr _mgr;
+    IndexPolicyMgr* _previous = nullptr;
+};
+
 } // namespace
 
 class VariantTypedPathIndexMergeTest : public IndexStorageTestFixture {
 protected:
-    IndexTabletOptions options(int64_t tablet_id) {
+    IndexTabletOptions options(int64_t tablet_id, const std::set<int64_t>& index_ids = {20001, 20002,
+                                                                             20003}) {
         IndexTabletOptions options;
         options.tablet_id = tablet_id;
         options.index_storage_format = InvertedIndexStorageFormatPB::V3;
@@ -98,14 +153,18 @@ protected:
         auto host = IndexSpec::field_pattern_index(20002, "idx_host", kVariantUid, "host");
         host.properties["parser"] = "unicode";
         auto code = IndexSpec::field_pattern_index(20003, "idx_code", kVariantUid, "code");
-        options.inverted_indexes = {msg, host, code};
+        for (const auto& index : {msg, host, code}) {
+            if (index_ids.contains(index.index_id)) {
+                options.inverted_indexes.push_back(index);
+            }
+        }
         return options;
     }
 
-    static IndexRowsetSpec rowset(int64_t version) {
+    static IndexRowsetSpec rowset(int64_t version, int rows = 600) {
         std::mt19937_64 rng(77 + version);
         std::vector<std::string> jsons;
-        for (int row = 0; row < 600; ++row) {
+        for (int row = 0; row < rows; ++row) {
             std::string json = "{";
             if (row % 7 != 3) {
                 json += R"("msg":"user u)" + std::to_string(rng() % 50) + " logged in from host " +
@@ -127,20 +186,33 @@ protected:
         return spec;
     }
 
-    RowsetSharedPtr write_and_compact(int64_t tablet_id) {
-        EXPECT_TRUE(create_tablet(options(tablet_id)).ok());
+    // The compaction of three written rowsets, and the CPU seconds the compaction took.
+    RowsetSharedPtr write_and_compact(int64_t tablet_id,
+                                      const std::set<int64_t>& index_ids = {20001, 20002, 20003},
+                                      int rows = 600, double* compaction_cpu = nullptr) {
+        EXPECT_TRUE(create_tablet(options(tablet_id, index_ids)).ok());
         std::vector<RowsetSharedPtr> rowsets;
         for (int64_t version = 0; version < 3; ++version) {
-            auto written = write_rowset(rowset(version));
+            auto written = write_rowset(rowset(version, rows));
             EXPECT_TRUE(written.has_value()) << written.error();
             if (!written.has_value()) {
                 return nullptr;
             }
             rowsets.push_back(written.value());
         }
+        const double cpu_before = process_cpu_seconds();
         auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+        if (compaction_cpu != nullptr) {
+            *compaction_cpu = process_cpu_seconds() - cpu_before;
+        }
         EXPECT_TRUE(compacted.has_value()) << compacted.error();
         return compacted.has_value() ? compacted.value() : nullptr;
+    }
+
+    static double process_cpu_seconds() {
+        timespec ts {};
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
     }
 
     static InvertedIndexDirectoryMap directories(const RowsetSharedPtr& rowset,
@@ -192,6 +264,159 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnes) {
         ++compared;
     }
     EXPECT_EQ(compared, 3);
+}
+
+// Typed paths shaped like melian.logs fields, one index per run.
+struct BenchKind {
+    std::string name;
+    std::string path;
+    std::map<std::string, std::string> properties;
+};
+
+class VariantTypedPathIndexMergeBench : public VariantTypedPathIndexMergeTest {
+protected:
+    static constexpr const char* kPaths[] = {"message", "cmd_line", "file_path", "hostname", "uid"};
+
+    IndexTabletOptions bench_options(int64_t tablet_id, const BenchKind& kind) {
+        IndexTabletOptions options;
+        options.tablet_id = tablet_id;
+        options.index_storage_format = InvertedIndexStorageFormatPB::V3;
+        VariantColumnSpec variant;
+        variant.unique_id = kVariantUid;
+        variant.name = "v";
+        variant.max_subcolumns_count = 2048;
+        for (const char* path : kPaths) {
+            variant.predefined_paths.push_back(
+                    VariantPathSpec {.path = path,
+                                     .type = FieldType::OLAP_FIELD_TYPE_STRING,
+                                     .nullable = true,
+                                     .pattern_type = PatternTypePB::MATCH_NAME,
+                                     .array_item_type = {},
+                                     .array_item_nullable = true});
+        }
+        options.variant_columns = {std::move(variant)};
+        if (!kind.path.empty()) {
+            auto index = IndexSpec::field_pattern_index(21001, "idx_" + kind.path, kVariantUid,
+                                                        kind.path);
+            index.properties.insert(kind.properties.begin(), kind.properties.end());
+            options.inverted_indexes = {index};
+        }
+        return options;
+    }
+
+    static std::string word(std::mt19937_64& rng, size_t vocabulary) {
+        static const char* syllables[] = {"ka", "lo", "mi", "ten", "ra", "vex", "sul", "po",
+                                          "dri", "an", "qu", "zor", "el", "ny", "fa", "gim"};
+        uint64_t id = rng() % vocabulary;
+        std::string w;
+        do {
+            w += syllables[id % 16];
+            id /= 16;
+        } while (id != 0);
+        return w;
+    }
+
+    static std::string hex(std::mt19937_64& rng, int n) {
+        static const char digits[] = "0123456789abcdef";
+        std::string out;
+        for (int i = 0; i < n; ++i) {
+            out += digits[rng() % 16];
+        }
+        return out;
+    }
+
+    static IndexRowsetSpec bench_rowset(int64_t version, int rows) {
+        std::mt19937_64 rng(1000 + version);
+        std::vector<std::string> jsons;
+        jsons.reserve(rows);
+        for (int row = 0; row < rows; ++row) {
+            std::string message = "User " + word(rng, 5000) + " " + word(rng, 300) + " session " +
+                                  std::to_string(rng() % 100000) + " from 10." +
+                                  std::to_string(rng() % 256) + "." + std::to_string(rng() % 256) +
+                                  " status=" + word(rng, 40) + " " + word(rng, 2000) + " " +
+                                  word(rng, 2000) + " " + word(rng, 20000);
+            std::string cmd = "C:/Windows/System32/" + word(rng, 200) +
+                              ".exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/" +
+                              word(rng, 3000) + "/AppData/Local/Temp/" + hex(rng, 12) +
+                              ".ps1 -Arg " + hex(rng, 24);
+            std::string path = "/var/lib/" + word(rng, 100) + "/" + word(rng, 2000) + "/" +
+                               hex(rng, 8) + "." + word(rng, 10);
+            std::string host = word(rng, 50) + "-" + word(rng, 4000) + "-" +
+                               std::to_string(rng() % 100) + ".corp";
+            std::string json = R"({"message":")" + message + R"(","cmd_line":")" + cmd +
+                               R"(","file_path":")" + path + R"(","hostname":")" + host +
+                               R"(","uid":")" + hex(rng, 32) + R"(","n":)" +
+                               std::to_string(row) + "}";
+            jsons.push_back(std::move(json));
+        }
+        IndexRowsetSpec spec;
+        spec.version = version;
+        spec.max_rows_per_segment = 10000000;
+        spec.batches.push_back(IndexBatch::single_variant(std::move(jsons),
+                                                          static_cast<int32_t>(version) * rows));
+        return spec;
+    }
+
+    RowsetSharedPtr bench_write_and_compact(int64_t tablet_id, const BenchKind& kind, int rows,
+                                            double* compaction_cpu) {
+        EXPECT_TRUE(create_tablet(bench_options(tablet_id, kind)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            auto written = write_rowset(bench_rowset(version, rows));
+            EXPECT_TRUE(written.has_value()) << written.error();
+            if (!written.has_value()) {
+                return nullptr;
+            }
+            rowsets.push_back(written.value());
+        }
+        const double cpu_before = process_cpu_seconds();
+        auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+        *compaction_cpu = process_cpu_seconds() - cpu_before;
+        EXPECT_TRUE(compacted.has_value()) << compacted.error();
+        return compacted.has_value() ? compacted.value() : nullptr;
+    }
+};
+
+// Compaction CPU with each index kind merged and rebuilt. Runs only when
+// VARIANT_INDEX_MERGE_BENCH_ROWS gives the rows per input rowset.
+TEST_F(VariantTypedPathIndexMergeBench, MergeVersusRebuildCpu) {
+    const char* rows_env = std::getenv("VARIANT_INDEX_MERGE_BENCH_ROWS");
+    if (rows_env == nullptr) {
+        GTEST_SKIP() << "set VARIANT_INDEX_MERGE_BENCH_ROWS to run";
+    }
+    const int rows = std::atoi(rows_env);
+    ScopedAnalyzers analyzers;
+    // Ordered inputs with large segments would be linked rather than merged.
+    const bool old_ordered = config::enable_ordered_data_compaction;
+    config::enable_ordered_data_compaction = false;
+    const std::map<std::string, std::string> ngram_phrase {{"analyzer", "ngram4_lower"},
+                                                           {"support_phrase", "true"}};
+    const std::vector<BenchKind> kinds {
+            {"no index", "", {}},
+            {"alnum_lower+phrase", "message", {{"analyzer", "alnum_lower"}, {"support_phrase", "true"}}},
+            {"ngram4_lower+phrase cmd", "cmd_line", ngram_phrase},
+            {"ngram4_lower+phrase path", "file_path", ngram_phrase},
+            {"ngram4_lower+phrase name", "hostname", ngram_phrase},
+            {"eq high-card", "uid", {}},
+    };
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    int64_t tablet_id = 132000;
+    for (const auto& kind : kinds) {
+        for (bool merge : {false, true, false, true}) {
+            config::enable_variant_typed_path_index_compaction = merge;
+            double cpu = 0;
+            const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+            auto compacted = bench_write_and_compact(++tablet_id, kind, rows, &cpu);
+            ASSERT_NE(compacted, nullptr);
+            std::cout << "MERGE_BENCH kind=" << kind.name << " mode="
+                      << (merge ? "merge" : "rebuild") << " merged_paths="
+                      << exposed("compaction_variant_index_merge_paths") - merged_before
+                      << " rows=" << compacted->num_rows() << " compaction_cpu_s=" << cpu
+                      << std::endl;
+        }
+    }
+    config::enable_variant_typed_path_index_compaction = old_flag;
+    config::enable_ordered_data_compaction = old_ordered;
 }
 
 } // namespace doris::index_storage_test
