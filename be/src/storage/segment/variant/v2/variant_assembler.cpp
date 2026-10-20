@@ -194,7 +194,13 @@ struct ObjectEmitter {
     ObjectEmitter() { scopes.reserve(8); }
 
     static size_t component_end(StringRef path, size_t offset) {
-        DCHECK_LE(offset, path.size);
+        // A depth larger than the path's component count would step past the end of the path, and
+        // the unsigned size below would then let memchr run over whatever memory follows it.
+        if (offset > path.size) [[unlikely]] {
+            throw Exception(ErrorCode::CORRUPTION,
+                            "Variant path of {} bytes has fewer components than its depth",
+                            path.size);
+        }
         if (offset == path.size) {
             return path.size;
         }

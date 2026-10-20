@@ -106,10 +106,10 @@ UInt128 PathInData::get_parts_hash(const Parts& parts_, bool is_typed_) {
 }
 
 void PathInData::build_path(const Parts& other_parts) {
+    path.clear();
     if (other_parts.empty()) {
         return;
     }
-    path.clear();
     auto it = other_parts.begin();
     path += it->key;
     ++it;
@@ -119,10 +119,13 @@ void PathInData::build_path(const Parts& other_parts) {
     }
 }
 void PathInData::build_parts(const Parts& other_parts) {
+    // Assignment rebuilds the parts of a path that may already have some: an empty source must
+    // leave none behind, or they would describe a path string that is no longer there.
+    parts.clear();
+    has_nested = false;
     if (other_parts.empty()) {
         return;
     }
-    parts.clear();
     parts.reserve(other_parts.size());
     const char* begin = path.data();
     for (const auto& part : other_parts) {
