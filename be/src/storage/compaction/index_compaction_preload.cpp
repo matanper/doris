@@ -82,13 +82,20 @@ void count_cached_bytes(const io::FileReader& reader) {
     }
 }
 
+int wanted_preload_threads() {
+    if (config::index_compaction_preload_threads > 0) {
+        return config::index_compaction_preload_threads;
+    }
+    return std::max(64, 2 * config::compaction_task_num_per_fast_disk);
+}
+
 ThreadPool* preload_pool() {
     static std::once_flag once;
     static std::unique_ptr<ThreadPool> pool;
     std::call_once(once, [] {
         auto st = ThreadPoolBuilder("IndexCompactionPreload")
                           .set_min_threads(1)
-                          .set_max_threads(std::max(1, config::index_compaction_preload_threads))
+                          .set_max_threads(wanted_preload_threads())
                           .build(&pool);
         if (!st.ok()) {
             LOG(WARNING) << "failed to create the index compaction preload pool: " << st;
@@ -97,7 +104,7 @@ ThreadPool* preload_pool() {
     });
     if (pool != nullptr) {
         // The size follows the config, which can change at runtime.
-        const int wanted = std::max(1, config::index_compaction_preload_threads);
+        const int wanted = wanted_preload_threads();
         if (pool->max_threads() != wanted) {
             static std::mutex resize_mutex;
             std::lock_guard lock(resize_mutex);

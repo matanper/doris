@@ -893,6 +893,37 @@ Status Compaction::do_inverted_index_compaction() {
         rs_id_to_rowset_map.emplace(rs->rowset_id(), rs.get());
     }
 
+    if (config::enable_index_compaction_preload &&
+        _cur_tablet_schema->get_inverted_index_storage_format() >=
+                InvertedIndexStorageFormatPB::V2) {
+        // The merges below read every source index file in many small pieces; reading each file
+        // once up front turns them into a few large remote reads.
+        std::vector<IndexFilePreloadTarget> targets;
+        for (const auto& m : src_seg_to_id_map) {
+            const auto& [rowset_id, seg_id] = m.first;
+            auto it = rs_id_to_rowset_map.find(rowset_id);
+            if (it == rs_id_to_rowset_map.end()) {
+                continue;
+            }
+            auto* rowset = it->second;
+            auto fs = rowset->rowset_meta()->fs();
+            auto seg_path = rowset->segment_path(seg_id);
+            if (fs == nullptr || !seg_path.has_value()) {
+                continue;
+            }
+            const auto file_info = rowset->rowset_meta()->inverted_index_file_info(seg_id);
+            const int64_t file_size = file_info.has_index_size() && file_info.index_size() > 0
+                                              ? file_info.index_size()
+                                              : -1;
+            auto prefix = InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value());
+            targets.push_back({.fs = fs,
+                               .path = InvertedIndexDescriptor::get_index_file_path_v2(prefix),
+                               .file_size = file_size,
+                               .tablet_id = _tablet->tablet_id()});
+        }
+        preload_index_files(targets);
+    }
+
     // src index dirs
     std::vector<std::unique_ptr<IndexFileReader>> index_file_readers(src_segment_num);
     for (const auto& m : src_seg_to_id_map) {
