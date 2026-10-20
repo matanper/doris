@@ -85,6 +85,8 @@ bvar::Adder<int64_t> g_capture_with_freshness_tolerance_fallback_count(
 bvar::Adder<int64_t> g_rowset_warmup_state_missing_count("rowset_warmup_state_missing_count");
 bvar::Adder<int64_t> g_hole_rowset_range_created_count("hole_rowset_range_created_count");
 bvar::Adder<int64_t> g_hole_rowset_range_extended_count("hole_rowset_range_extended_count");
+// Trailing hole rowsets dropped when a longer range replaced them, rather than staled.
+bvar::Adder<int64_t> g_hole_rowset_tail_dropped_count("hole_rowset_tail_dropped_count");
 bvar::Adder<int64_t> g_hole_rowset_range_split_count("hole_rowset_range_split_count");
 bvar::Adder<int64_t> g_hole_rowset_prefix_on_demand_count("hole_rowset_prefix_on_demand_count");
 bvar::Adder<int64_t> g_hole_rowset_prefix_shared_count("hole_rowset_prefix_shared_count");
@@ -720,12 +722,20 @@ Status CloudTablet::add_hole_rowsets(const Version& versions,
         // Rowsets moved to the stale path in one step: the trailing hole rowset being extended
         // and the prefix rowsets [start, v] of the new range.
         std::vector<RowsetSharedPtr> to_stale;
+        // The trailing hole rowset the new range replaces, when nothing holds it. Every version it
+        // covered stays readable: its end through an on-demand prefix of the new range, as for
+        // any version inside a range, so the stale path need not keep it.
+        RowsetSharedPtr dropped_tail;
         if (next == _max_version + 1) {
             if (auto tail = _extendable_tail_hole_rowset();
                 tail != nullptr && tail->end_version() - tail->start_version() + 1 < max_versions) {
                 start = tail->start_version();
                 range_template = tail->rowset_meta();
-                to_stale.push_back(std::move(tail));
+                if (config::hole_rowset_drop_extended_tail) {
+                    dropped_tail = std::move(tail);
+                } else {
+                    to_stale.push_back(std::move(tail));
+                }
                 g_hole_rowset_range_extended_count << 1;
             }
         }
@@ -761,6 +771,10 @@ Status CloudTablet::add_hole_rowsets(const Version& versions,
         for (auto& prefix : prefixes) {
             _timestamped_version_tracker.add_version(prefix->version());
             to_stale.push_back(std::move(prefix));
+        }
+        if (dropped_tail != nullptr) {
+            _drop_live_rowset(dropped_tail->version());
+            g_hole_rowset_tail_dropped_count << 1;
         }
         delete_rowsets(to_stale, meta_lock);
         std::vector<RowsetSharedPtr> live {hole_rowset};
