@@ -2062,7 +2062,7 @@ Status Tablet::_cooldown_data(RowsetSharedPtr rowset) {
               << ", old rowset_id=" << old_rowset->rowset_id().to_string();
 
     // gen a new rowset
-    auto new_rowset_meta = std::make_shared<RowsetMeta>();
+    auto new_rowset_meta = RowsetMeta::create_shared();
     new_rowset_meta->init(old_rowset->rowset_meta().get());
     new_rowset_meta->set_rowset_id(new_rowset_id);
     new_rowset_meta->set_remote_storage_resource(std::move(storage_resource));
@@ -2296,7 +2296,7 @@ Status Tablet::_follow_cooldowned_data() {
         to_delete.assign(rs_it, overlap_rowsets.end());
         to_add.reserve(cooldown_meta_pb.rs_metas().end() - rs_pb_it);
         for (; rs_pb_it != cooldown_meta_pb.rs_metas().end(); ++rs_pb_it) {
-            auto rs_meta = std::make_shared<RowsetMeta>();
+            auto rs_meta = RowsetMeta::create_shared();
             rs_meta->init_from_pb(*rs_pb_it);
             RowsetSharedPtr rs;
             RETURN_IF_ERROR(

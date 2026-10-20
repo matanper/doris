@@ -813,6 +813,10 @@ DECLARE_mInt32(je_dirty_decay_ms);
 // threads purge by decay, and the daemon also forces an `arena.<all>.decay` every
 // `memory_gc_sleep_time_ms`.
 DECLARE_mInt32(je_dirty_decay_ms_over_soft_limit);
+// Allocate RowsetMeta and Rowset objects, and the blocks of the file cache, from a jemalloc arena
+// of their own, apart from the short-lived objects of the same sizes that loads, compactions and
+// scans churn through, so those slabs empty out and are returned. Read once, on first use.
+DECLARE_Bool(enable_rowset_metadata_arena);
 
 // to forward compatibility, will be removed later
 DECLARE_mBool(enable_token_check);

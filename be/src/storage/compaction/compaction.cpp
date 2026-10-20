@@ -497,7 +497,7 @@ Status CompactionMixin::do_compact_ordered_rowsets() {
                                 input_segment_rows.end());
     }
     // build output rowset
-    RowsetMetaSharedPtr rowset_meta = std::make_shared<RowsetMeta>();
+    RowsetMetaSharedPtr rowset_meta = RowsetMeta::create_shared();
     rowset_meta->set_num_rows(_input_row_num);
     rowset_meta->set_total_disk_size(_input_rowsets_data_size + _input_rowsets_index_size);
     rowset_meta->set_data_disk_size(_input_rowsets_data_size);

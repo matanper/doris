@@ -299,7 +299,7 @@ struct GetRowsetsCntl : std::enable_shared_from_this<GetRowsetsCntl> {
                 }};
                 std::vector<RowsetMetaSharedPtr> rs_metas;
                 for (auto&& rs_pb : response.rowsets()) {
-                    auto rs_meta = std::make_shared<RowsetMeta>();
+                    auto rs_meta = RowsetMeta::create_shared();
                     if (!rs_meta->init_from_pb(rs_pb)) {
                         self->result =
                                 ResultError(Status::InternalError("failed to init rowset from pb"));
