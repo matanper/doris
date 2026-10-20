@@ -23,10 +23,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <cstring>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <map>
 #include <memory>
@@ -86,6 +86,7 @@
 #include "storage/task/engine_checksum_task.h"
 #include "storage/txn/txn_manager.h"
 #include "storage/utils.h"
+#include "util/defer_op.h"
 #include "util/pretty_printer.h"
 #include "util/time.h"
 #include "util/trace.h"
@@ -274,7 +275,7 @@ int64_t Compaction::merge_way_num() {
     return way_num;
 }
 
-void Compaction::preload_input_segment_files() {
+void Compaction::preload_input_segment_files(bool async) {
     std::vector<IndexFilePreloadTarget> targets;
     for (const auto& rowset : _input_rowsets) {
         auto fs = rowset->rowset_meta()->fs();
@@ -294,15 +295,22 @@ void Compaction::preload_input_segment_files() {
                                .tablet_id = _tablet->tablet_id()});
         }
     }
-    preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
+    if (async) {
+        _input_preload = start_preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
+    } else {
+        preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
+    }
 }
 
 Status Compaction::merge_input_rowsets() {
+    // The preload is only of use to the merge; what it has not started by then is skipped.
+    Defer cancel_preload {[this]() { _input_preload.reset(); }};
     if (config::enable_compaction_data_preload) {
         // Vertical compaction reads every input segment once per column group, starting each
         // pass with small reads of each segment one after another; reading each segment file
-        // once up front turns their cache misses into a few large remote reads.
-        preload_input_segment_files();
+        // once up front turns their cache misses into a few large remote reads. Started without
+        // waiting, the merge reads each block once it arrives, the first column groups' first.
+        preload_input_segment_files(config::enable_compaction_async_data_preload);
     }
     std::vector<RowsetReaderSharedPtr> input_rs_readers;
     input_rs_readers.reserve(_input_rowsets.size());

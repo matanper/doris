@@ -1431,7 +1431,10 @@ DEFINE_mBool(enable_compaction_data_preload, "true");
 // The compaction preload pool: files are read in chunks of index_compaction_preload_chunk_bytes on
 // at most index_compaction_preload_threads threads shared by all compactions.
 DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
-DEFINE_Int32(index_compaction_preload_threads, "64");
+DEFINE_mInt32(index_compaction_preload_threads, "64");
+DEFINE_Validator(index_compaction_preload_threads,
+                 [](const int32_t config) -> bool { return config > 0; });
+DEFINE_mBool(enable_compaction_async_data_preload, "true");
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory

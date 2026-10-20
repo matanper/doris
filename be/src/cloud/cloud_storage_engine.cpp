@@ -17,6 +17,7 @@
 
 #include "cloud/cloud_storage_engine.h"
 
+#include <bvar/bvar.h>
 #include <bvar/reducer.h>
 #include <gen_cpp/PlanNodes_types.h>
 #include <gen_cpp/cloud.pb.h>
@@ -65,6 +66,7 @@
 #include "storage/compaction_task_tracker.h"
 #include "storage/storage_policy.h"
 #include "util/parse_util.h"
+#include "util/stopwatch.hpp"
 #include "util/time.h"
 
 namespace doris {
@@ -528,6 +530,13 @@ Status CloudStorageEngine::_adjust_compaction_thread_num() {
     return Status::OK();
 }
 
+namespace {
+// The compaction producer thread: how long a round of picking and submitting tablets takes, and
+// how long preparing one cumulative compaction takes on it.
+bvar::LatencyRecorder g_compaction_producer_round_ms("compaction_producer_round_ms");
+bvar::LatencyRecorder g_cumu_compaction_prepare_us("cumu_compaction_prepare_us");
+} // namespace
+
 void CloudStorageEngine::_compaction_tasks_producer_callback() {
     LOG(INFO) << "try to start compaction producer process!";
 
@@ -607,6 +616,7 @@ void CloudStorageEngine::_compaction_tasks_producer_callback() {
         int64_t end_time = UnixMillis();
         DorisMetrics::instance()->compaction_producer_callback_a_round_time->set_value(end_time -
                                                                                        cur_time);
+        g_compaction_producer_round_ms << end_time - cur_time;
     } while (!_stop_background_threads_latch.wait_for(std::chrono::milliseconds(interval)));
 }
 
@@ -1012,7 +1022,10 @@ Status CloudStorageEngine::_submit_cumulative_compaction_task(const CloudTabletS
         }
     }
     auto compaction = std::make_shared<CloudCumulativeCompaction>(*this, tablet);
+    MonotonicStopWatch prepare_watch;
+    prepare_watch.start();
     auto st = compaction->prepare_compact();
+    g_cumu_compaction_prepare_us << prepare_watch.elapsed_time() / 1000;
     if (!st.ok()) {
         long now = duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
