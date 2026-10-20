@@ -58,6 +58,7 @@
 #include "storage/options.h"
 #include "storage/rowid_conversion.h"
 #include "storage/rowset/beta_rowset.h"
+#include "storage/rowset/beta_rowset_reader.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
@@ -696,6 +697,74 @@ TEST_F(VerticalCompactionTest, TestRowSourcesBufferSpillThreshold) {
         ++read_back;
     }
     EXPECT_EQ(read_back, expected_total);
+}
+
+// A rowset reader counts into the statistics its read context gives, and creates statistics of
+// its own only when the context has none; clones never share them, and both read the same rows.
+TEST_F(VerticalCompactionTest, RowsetReaderStatisticsAreOwnedOnlyWithoutAContext) {
+    std::vector<std::vector<std::vector<std::tuple<int64_t, int64_t>>>> input_data;
+    generate_input_data(1, 2, 1000, NONOVERLAPPING, input_data);
+    TabletSchemaSPtr tablet_schema = create_schema();
+    RowsetSharedPtr rowset = create_rowset(tablet_schema, NONOVERLAPPING, input_data[0], 0);
+
+    auto read_all = [&](RowsetReaderSharedPtr& reader, OlapReaderStatistics* context_stats) {
+        RowsetReaderContext reader_context;
+        reader_context.tablet_schema = tablet_schema;
+        reader_context.need_ordered_result = false;
+        std::vector<uint32_t> return_columns = {0, 1};
+        reader_context.return_columns = &return_columns;
+        reader_context.stats = context_stats;
+        EXPECT_TRUE(reader->init(&reader_context).ok());
+        std::vector<std::tuple<int64_t, int64_t>> rows;
+        Status st;
+        do {
+            Block block;
+            block_create(tablet_schema, &block);
+            st = reader->next_batch(&block);
+            auto columns = block.get_columns_with_type_and_name();
+            for (size_t i = 0; i < block.rows(); i++) {
+                rows.emplace_back(columns[0].column->get_int(i), columns[1].column->get_int(i));
+            }
+        } while (st.ok());
+        EXPECT_TRUE(st.is<END_OF_FILE>()) << st;
+        return rows;
+    };
+
+    RowsetReaderSharedPtr base;
+    ASSERT_TRUE(rowset->create_reader(&base).ok());
+    auto* fresh = static_cast<BetaRowsetReader*>(base.get());
+    // A reader nothing read yet has no statistics of its own, filters nothing, and still hands
+    // out statistics when asked.
+    EXPECT_EQ(fresh->_owned_stats, nullptr);
+    EXPECT_EQ(base->filtered_rows(), 0);
+
+    // A query's reader counts into its context's statistics.
+    auto with_context = base->clone();
+    OlapReaderStatistics scanner_stats;
+    auto query_rows = read_all(with_context, &scanner_stats);
+    auto* query_reader = static_cast<BetaRowsetReader*>(with_context.get());
+    EXPECT_EQ(query_reader->_owned_stats, nullptr);
+    EXPECT_EQ(query_reader->get_stats(), &scanner_stats);
+    EXPECT_EQ(scanner_stats.raw_rows_read, 2000);
+
+    // Readers without one count into their own, one each.
+    auto own_a = base->clone();
+    auto own_b = base->clone();
+    auto rows_a = read_all(own_a, nullptr);
+    auto rows_b = read_all(own_b, nullptr);
+    auto* reader_a = static_cast<BetaRowsetReader*>(own_a.get());
+    auto* reader_b = static_cast<BetaRowsetReader*>(own_b.get());
+    ASSERT_NE(reader_a->_owned_stats, nullptr);
+    ASSERT_NE(reader_b->_owned_stats, nullptr);
+    EXPECT_NE(reader_a->get_stats(), reader_b->get_stats());
+    EXPECT_EQ(reader_a->get_stats()->raw_rows_read, 2000);
+    EXPECT_EQ(reader_b->get_stats()->raw_rows_read, 2000);
+    EXPECT_EQ(scanner_stats.raw_rows_read, 2000);
+
+    EXPECT_EQ(query_rows.size(), 2000);
+    EXPECT_EQ(rows_a, query_rows);
+    EXPECT_EQ(rows_b, query_rows);
+    EXPECT_NE(fresh->get_stats(), nullptr);
 }
 
 TEST_F(VerticalCompactionTest, TestDupKeyVerticalMerge) {

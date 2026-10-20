@@ -344,6 +344,15 @@ TEST_F(IndexCompactionPreloadTest, pool_size_follows_config) {
     config::index_compaction_preload_threads = 64;
     preload_cached_files({cached(open_remote())}, PreloadCacheQueue::DISPOSABLE);
     EXPECT_EQ(preload_pool_max_threads_for_test(), 64);
+
+    // 0 sizes it from the compaction slots, with at least 64 threads.
+    const int32_t old_slots = config::compaction_task_num_per_fast_disk;
+    config::index_compaction_preload_threads = 0;
+    config::compaction_task_num_per_fast_disk = 80;
+    EXPECT_EQ(preload_pool_max_threads_for_test(), 160);
+    config::compaction_task_num_per_fast_disk = 8;
+    EXPECT_EQ(preload_pool_max_threads_for_test(), 64);
+    config::compaction_task_num_per_fast_disk = old_slots;
 }
 
 } // namespace doris::io

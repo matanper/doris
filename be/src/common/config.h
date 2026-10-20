@@ -1469,7 +1469,10 @@ DECLARE_mBool(enable_compaction_release_input_segments);
 DECLARE_mBool(enable_compaction_pin_input_segments);
 DECLARE_mBool(enable_compaction_data_preload);
 DECLARE_mInt64(index_compaction_preload_chunk_bytes);
+// 0 sizes the pool from the compaction slots: max(64, 2 * compaction_task_num_per_fast_disk), since
+// its threads mostly wait on remote reads.
 DECLARE_mInt32(index_compaction_preload_threads);
+DECLARE_mBool(enable_index_compaction_preload);
 // Start the compaction data preload without waiting for it: the merge reads blocks as they
 // arrive, and the chunks not started when the merge ends are skipped. Off by default: with many
 // compactions sharing the preload pool, the merges get ahead of it and fetch the blocks it has

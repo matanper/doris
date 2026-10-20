@@ -1432,9 +1432,12 @@ DEFINE_mBool(enable_compaction_data_preload, "true");
 // The compaction preload pool: files are read in chunks of index_compaction_preload_chunk_bytes on
 // at most index_compaction_preload_threads threads shared by all compactions.
 DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
-DEFINE_mInt32(index_compaction_preload_threads, "64");
+DEFINE_mInt32(index_compaction_preload_threads, "0");
 DEFINE_Validator(index_compaction_preload_threads,
-                 [](const int32_t config) -> bool { return config > 0; });
+                 [](const int32_t config) -> bool { return config >= 0; });
+// Before index compaction merges the input indexes, read each input segment's index file once
+// through the file cache on the compaction preload pool.
+DEFINE_mBool(enable_index_compaction_preload, "true");
 DEFINE_mBool(enable_compaction_async_data_preload, "false");
 DEFINE_mInt32(cumu_compaction_thread_nice, "0");
 DEFINE_Validator(cumu_compaction_thread_nice,
