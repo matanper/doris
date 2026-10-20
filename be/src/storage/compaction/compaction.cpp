@@ -1394,6 +1394,11 @@ static bool check_rowset_has_inverted_index(const RowsetSharedPtr& src_rs, int32
                      << "] skip inverted index compaction due to last failure";
         return false;
     }
+    // A rowset without segments has no index files to merge, and in cloud mode its meta may
+    // carry no resource to resolve; it does not stop the others' indexes from being merged.
+    if (rowset->num_segments() == 0) {
+        return true;
+    }
 
     auto fs = rowset->rowset_meta()->fs();
     DBUG_EXECUTE_IF("Compaction::construct_skip_inverted_index_get_fs_error", { fs = nullptr; })
