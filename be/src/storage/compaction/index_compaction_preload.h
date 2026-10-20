@@ -23,10 +23,14 @@
 #include <string>
 #include <vector>
 
+#include "io/cache/file_cache_common.h"
 #include "io/fs/file_reader_writer_fwd.h"
 #include "io/fs/file_system.h"
 
 namespace doris {
+namespace io {
+class MemoryPreloadedFile;
+} // namespace io
 
 // The file cache queue a preload fills, which must be the one the later reads use.
 enum class PreloadCacheQueue {
@@ -92,6 +96,41 @@ std::unique_ptr<PreloadTask> start_preload_index_files(
 // (file index, offset) pairs.
 std::vector<std::pair<size_t, size_t>> preload_chunk_order(const std::vector<size_t>& file_sizes,
                                                            size_t chunk_size);
+
+// Compaction input files held in memory while a merge reads them, so that the merge's reads
+// neither go to the file cache nor fill it (see io::MemoryPreloadedFile). Destroying it skips the
+// chunks no thread has started, waits for the ones being loaded and frees the memory.
+class MemoryPreloadTask {
+public:
+    struct State;
+    MemoryPreloadTask(std::vector<io::UInt128Wrapper> keys,
+                      std::vector<std::shared_ptr<io::MemoryPreloadedFile>> files,
+                      int64_t reserved_bytes, std::shared_ptr<State> state);
+    ~MemoryPreloadTask();
+    MemoryPreloadTask(const MemoryPreloadTask&) = delete;
+    MemoryPreloadTask& operator=(const MemoryPreloadTask&) = delete;
+
+private:
+    std::vector<io::UInt128Wrapper> _keys;
+    std::vector<std::shared_ptr<io::MemoryPreloadedFile>> _files;
+    int64_t _reserved_bytes;
+    std::shared_ptr<State> _state;
+};
+
+// Loads `readers` into memory on the preload pool, in the chunk order of
+// start_preload_cached_files(), and serves the compaction reads of them from memory while the
+// task lives. A file is taken while this task stays within
+// config::compaction_memory_preload_task_bytes, all tasks within
+// config::compaction_memory_preload_total_bytes, and the process below its soft memory limit.
+// The indexes of the files not taken, including those not read through the file cache, are put
+// in `not_taken`. Returns nullptr when no file is taken.
+std::unique_ptr<MemoryPreloadTask> start_memory_preload_files(
+        const std::vector<io::FileReaderSPtr>& readers, std::vector<size_t>* not_taken);
+
+// start_memory_preload_files() for files not yet open. The targets not taken are put in `rest`.
+std::unique_ptr<MemoryPreloadTask> start_memory_preload_index_files(
+        const std::vector<IndexFilePreloadTarget>& targets,
+        std::vector<IndexFilePreloadTarget>* rest);
 
 int preload_pool_max_threads_for_test();
 

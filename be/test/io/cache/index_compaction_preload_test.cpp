@@ -30,6 +30,9 @@
 #include "cloud/config.h"
 #include "common/config.h"
 #include "io/cache/cached_remote_file_reader.h"
+#include "io/cache/memory_preloaded_file.h"
+#include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/thread_context.h"
 #include "io/fs/local_file_system.h"
 
 namespace doris::io {
@@ -353,6 +356,154 @@ TEST_F(IndexCompactionPreloadTest, pool_size_follows_config) {
     config::compaction_task_num_per_fast_disk = 8;
     EXPECT_EQ(preload_pool_max_threads_for_test(), 64);
     config::compaction_task_num_per_fast_disk = old_slots;
+}
+
+namespace {
+
+std::vector<FileBlockSPtr> cached_blocks(const FileReader& reader) {
+    auto hash = BlockFileCache::hash(remote_file_cache_name(reader.path().native()));
+    std::vector<FileBlockSPtr> blocks;
+    for (auto& [_, block] : FileCacheFactory::instance()->get_by_path(hash)->get_blocks_by_key(hash)) {
+        blocks.push_back(block);
+    }
+    return blocks;
+}
+
+Status compaction_read(const FileReaderSPtr& reader, size_t offset, std::string* buffer) {
+    IOContext io_ctx;
+    io_ctx.reader_type = ReaderType::READER_CUMULATIVE_COMPACTION;
+    io_ctx.is_disposable = true;
+    size_t bytes_read = 0;
+    return reader->read_at(offset, Slice(buffer->data(), buffer->size()), &bytes_read, &io_ctx);
+}
+
+class MemoryPreloadConfig {
+public:
+    MemoryPreloadConfig(int64_t task_bytes, int64_t total_bytes)
+            : _task(config::compaction_memory_preload_task_bytes),
+              _total(config::compaction_memory_preload_total_bytes) {
+        config::compaction_memory_preload_task_bytes = task_bytes;
+        config::compaction_memory_preload_total_bytes = total_bytes;
+    }
+    ~MemoryPreloadConfig() {
+        config::compaction_memory_preload_task_bytes = _task;
+        config::compaction_memory_preload_total_bytes = _total;
+    }
+
+private:
+    int64_t _task;
+    int64_t _total;
+};
+
+} // namespace
+
+// A compaction's reads of a file loaded into memory are served from there: the file is fetched
+// once, in chunks, nothing is written to the file cache, and the memory is charged to the task's
+// tracker until the preload ends, after which the reads go through the file cache again.
+TEST_F(IndexCompactionPreloadTest, memory_preload_serves_compaction_reads_without_cache_writes) {
+    MemoryPreloadConfig budget(1LL << 30, 1LL << 30);
+    auto remote = open_remote();
+    auto reader = cached(remote);
+    const size_t file_size = reader->size();
+    auto tracker =
+            MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::COMPACTION, "MemoryPreload");
+    SCOPED_ATTACH_TASK(tracker);
+    const int64_t before = tracker->consumption();
+
+    std::vector<size_t> not_taken;
+    auto task = start_memory_preload_files({reader}, &not_taken);
+    ASSERT_NE(task, nullptr);
+    EXPECT_TRUE(not_taken.empty());
+    EXPECT_GE(tracker->consumption() - before, static_cast<int64_t>(file_size));
+
+    const int64_t served_before = exposed("cached_remote_reader_memory_preloaded_read_bytes");
+    std::string buffer(4096, '\0');
+    size_t bytes = 0;
+    for (size_t offset = 0; offset < file_size; offset += 300 * 1024) {
+        ASSERT_TRUE(compaction_read(reader, offset, &buffer).ok());
+        EXPECT_EQ(buffer[0], static_cast<char>('0' + offset / 1_mb));
+        bytes += std::min(buffer.size(), file_size - offset);
+    }
+    EXPECT_EQ(exposed("cached_remote_reader_memory_preloaded_read_bytes") - served_before,
+              static_cast<int64_t>(bytes));
+    EXPECT_EQ(remote->reads(), 3); // 4 MB + 4 MB + the rest, by the pool or by the reads
+    EXPECT_EQ(remote->bytes(), file_size);
+    EXPECT_TRUE(cached_blocks(*reader).empty());
+
+    task.reset();
+    EXPECT_LT(tracker->consumption() - before, static_cast<int64_t>(file_size));
+    EXPECT_EQ(io::find_memory_preloaded_file(
+                      BlockFileCache::hash(remote_file_cache_name(reader->path().native()))),
+              nullptr);
+    ASSERT_TRUE(compaction_read(reader, 0, &buffer).ok());
+    EXPECT_EQ(remote->reads(), 4);
+    EXPECT_FALSE(cached_blocks(*reader).empty());
+}
+
+// The chunks the file cache holds whole are copied from it, not fetched again.
+TEST_F(IndexCompactionPreloadTest, memory_preload_reads_cached_chunks_from_the_cache) {
+    MemoryPreloadConfig budget(1LL << 30, 1LL << 30);
+    auto remote = open_remote();
+    auto reader = cached(remote);
+    preload_cached_files({reader});
+    ASSERT_EQ(remote->reads(), 3);
+
+    std::vector<size_t> not_taken;
+    auto task = start_memory_preload_files({reader}, &not_taken);
+    ASSERT_NE(task, nullptr);
+    std::string buffer(4096, '\0');
+    for (size_t offset = 0; offset < 10_mb; offset += 1_mb) {
+        ASSERT_TRUE(compaction_read(reader, offset, &buffer).ok());
+        EXPECT_EQ(buffer[0], static_cast<char>('0' + offset / 1_mb));
+    }
+    EXPECT_EQ(remote->reads(), 3);
+}
+
+// A file that does not fit in the task's or the process's budget is not taken, and the budget a
+// preload holds is free again once it ends.
+TEST_F(IndexCompactionPreloadTest, memory_preload_keeps_within_its_budgets) {
+    auto remote = open_remote();
+    auto reader = cached(remote);
+    const auto file_size = static_cast<int64_t>(reader->size());
+    std::vector<size_t> not_taken;
+    {
+        MemoryPreloadConfig budget(file_size - 1, 1LL << 30);
+        EXPECT_EQ(start_memory_preload_files({reader}, &not_taken), nullptr);
+        EXPECT_EQ(not_taken, std::vector<size_t> {0});
+    }
+    MemoryPreloadConfig budget(1LL << 30, file_size + file_size / 2);
+    auto first = start_memory_preload_files({reader}, &not_taken);
+    ASSERT_NE(first, nullptr);
+    EXPECT_TRUE(not_taken.empty());
+    EXPECT_EQ(start_memory_preload_files({cached(open_remote())}, &not_taken), nullptr);
+    EXPECT_EQ(not_taken, std::vector<size_t> {0});
+    first.reset();
+    EXPECT_NE(start_memory_preload_files({cached(open_remote())}, &not_taken), nullptr);
+}
+
+// The merge loads the chunks it reaches before the pool does, and a chunk that fails to load
+// leaves its reads to the file cache.
+TEST_F(IndexCompactionPreloadTest, memory_preload_reads_load_unstarted_chunks_and_fall_back) {
+    MemoryPreloadConfig budget(1LL << 30, 1LL << 30);
+    config::index_compaction_preload_threads = 1;
+    auto remote = open_remote();
+    remote->set_delay_ms(300);
+    remote->fail_from(8_mb);
+    auto reader = cached(remote);
+    const int64_t self_loaded = exposed("memory_preloaded_file_loaded_by_reader_chunks");
+    const int64_t fallbacks = exposed("cached_remote_reader_memory_preloaded_fallback_reads");
+    std::vector<size_t> not_taken;
+    auto task = start_memory_preload_files({reader}, &not_taken);
+    ASSERT_NE(task, nullptr);
+    std::string buffer(4096, '\0');
+    // The single pool thread starts on the first chunk; the read of the second one loads it.
+    ASSERT_TRUE(compaction_read(reader, 5_mb, &buffer).ok());
+    EXPECT_EQ(buffer[0], '5');
+    EXPECT_GE(exposed("memory_preloaded_file_loaded_by_reader_chunks") - self_loaded, 1);
+    EXPECT_FALSE(compaction_read(reader, 9_mb, &buffer).ok());
+    EXPECT_EQ(exposed("cached_remote_reader_memory_preloaded_fallback_reads") - fallbacks, 1);
+    task.reset();
+    config::index_compaction_preload_threads = 64;
 }
 
 } // namespace doris::io

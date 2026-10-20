@@ -47,6 +47,7 @@
 namespace doris {
 
 class MemTrackerLimiter;
+class MemoryPreloadTask;
 class PreloadTask;
 class RowsetWriter;
 struct RowsetWriterContext;
@@ -73,7 +74,8 @@ public:
 
     // Reads every input segment data file once through the file cache.
     // Preloads the input segment files; with `async`, returns at once and keeps the preload in
-    // _input_preload until the merge ends.
+    // _input_preload until the merge ends. With config::enable_compaction_memory_preload, the
+    // files that fit are loaded into memory instead, held in _memory_preload until the merge ends.
     void preload_input_segment_files(bool async = false);
 
     const BaseTabletSPtr& tablet() const { return _tablet; }
@@ -180,6 +182,8 @@ protected:
     std::unique_ptr<RowIdConversion> _rowid_conversion = nullptr;
     // The data preload a merge does not wait for, while the merge runs.
     std::unique_ptr<PreloadTask> _input_preload;
+    // The input files the merge reads from memory, while it runs.
+    std::unique_ptr<MemoryPreloadTask> _memory_preload;
     TabletSchemaSPtr _cur_tablet_schema;
 
     std::unique_ptr<RuntimeProfile> _profile;
