@@ -495,32 +495,47 @@ bool VerticalSegmentWriter::_parallel_column_append_allowed() {
 
 Status VerticalSegmentWriter::_append_value_columns_in_parallel(uint32_t first_cid,
                                                                 bool skip_row_store_column) {
+    // A VARIANT writer adds the metas of its subcolumns to the segment footer while it is
+    // finished, after its own meta and before the next column's. To keep the footer, and the
+    // footer's order, as the serial path builds them, the writers are created in column order on
+    // this thread, a VARIANT column is appended and finished here before the next writer is
+    // created, and the other columns are appended and finished on the task group meanwhile.
     std::vector<uint32_t> cids;
-    for (uint32_t cid = first_cid; cid < _tablet_schema->num_columns(); ++cid) {
+    SegmentWriteTaskGroup group(config::segment_column_write_parallelism);
+    auto append_and_finish = [this](uint32_t cid) -> Status {
+        // Each column is converted by its own convertor of _olap_data_convertor; the writers
+        // keep their pages in memory until write_data().
+        for (auto& data : _batched_blocks) {
+            RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
+                    data.block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
+            auto [status, column] = _olap_data_convertor->convert_column_data(cid);
+            RETURN_IF_ERROR(status);
+            RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(), column->get_data(),
+                                                         data.num_rows));
+            _olap_data_convertor->clear_source_content(cid);
+        }
+        RETURN_IF_ERROR(_check_column_writer_disk_capacity(cid));
+        return _column_writers[cid]->finish();
+    };
+    Status status;
+    for (uint32_t cid = first_cid; cid < _tablet_schema->num_columns() && status.ok(); ++cid) {
         if (skip_row_store_column && _tablet_schema->column(cid).is_row_store_column()) {
             continue;
         }
-        // Created in column order, as the serial path does.
-        RETURN_IF_ERROR(_create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema));
+        status = _create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema);
+        if (!status.ok()) {
+            break;
+        }
         cids.push_back(cid);
+        if (_tablet_schema->column(cid).is_variant_type()) {
+            status = run_catching_exceptions([&]() { return append_and_finish(cid); });
+        } else {
+            group.add([&append_and_finish, cid]() { return append_and_finish(cid); });
+        }
     }
-    // Each column is converted by its own convertor of _olap_data_convertor, appended and
-    // finished on its own; the writers keep their pages in memory until write_data().
-    RETURN_IF_ERROR(run_segment_write_tasks(
-            cids.size(), config::segment_column_write_parallelism, [&](size_t i) -> Status {
-                const uint32_t cid = cids[i];
-                for (auto& data : _batched_blocks) {
-                    RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
-                            data.block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
-                    auto [status, column] = _olap_data_convertor->convert_column_data(cid);
-                    RETURN_IF_ERROR(status);
-                    RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(),
-                                                                 column->get_data(), data.num_rows));
-                    _olap_data_convertor->clear_source_content(cid);
-                }
-                RETURN_IF_ERROR(_check_column_writer_disk_capacity(cid));
-                return _column_writers[cid]->finish();
-            }));
+    Status tasks = group.wait();
+    RETURN_IF_ERROR(status);
+    RETURN_IF_ERROR(tasks);
     // The data is written to the segment file in column order.
     for (uint32_t cid : cids) {
         RETURN_IF_ERROR(_write_column_data_and_update_meta(cid));

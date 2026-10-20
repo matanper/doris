@@ -30,6 +30,7 @@
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
 #include "storage/index/index_writer.h"
+#include "storage/segment/segment_write_tasks.h"
 #include "util/countdown_latch.h"
 #include "util/threadpool.h"
 
@@ -81,7 +82,8 @@ struct FinishWork {
 
     void drain() {
         for (size_t i = next.fetch_add(1); i < writers.size(); i = next.fetch_add(1)) {
-            Status st = writers[i]->finish();
+            IndexColumnWriter* writer = writers[i];
+            Status st = run_catching_exceptions([writer]() { return writer->finish(); });
             if (!st.ok()) {
                 std::lock_guard lock(status_mutex);
                 if (status.ok()) {

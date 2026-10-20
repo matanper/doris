@@ -21,16 +21,19 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "common/config.h"
+#include "common/exception.h"
 #include "common/logging.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
 #include "util/block_compression.h"
+#include "util/defer_op.h"
 #include "util/threadpool.h"
 
 namespace doris::segment_v2 {
@@ -40,6 +43,7 @@ bvar::Adder<uint64_t> g_parallel_runs("segment_write_parallel_runs");
 bvar::Adder<uint64_t> g_parallel_tasks("segment_write_parallel_tasks");
 bvar::Adder<uint64_t> g_helper_tasks("segment_write_helper_tasks");
 bvar::Adder<uint64_t> g_pool_rejected("segment_write_pool_rejected");
+bvar::Adder<uint64_t> g_task_exceptions("segment_write_task_exceptions");
 
 int wanted_threads() {
     return config::segment_write_thread_num > 0
@@ -70,30 +74,63 @@ ThreadPool* write_pool() {
     return pool.get();
 }
 
-struct TaskRun {
-    TaskRun(size_t n_, const std::function<Status(size_t)>* task_) : n(n_), task(task_) {}
-    const size_t n;
-    const std::function<Status(size_t)>* const task;
-    std::atomic<size_t> next {0};
+} // namespace
+
+Status run_catching_exceptions(const std::function<Status()>& task) {
+    try {
+        doris::enable_thread_catch_bad_alloc++;
+        Defer defer {[&]() { doris::enable_thread_catch_bad_alloc--; }};
+        return task();
+    } catch (const doris::Exception& e) {
+        g_task_exceptions << 1;
+        if (e.code() == doris::ErrorCode::MEM_ALLOC_FAILED) {
+            return Status::MemoryLimitExceeded("segment write task: {}", e.to_string());
+        }
+        return Status::Error<false>(e.code(), e.to_string());
+    } catch (const std::exception& e) {
+        g_task_exceptions << 1;
+        return Status::InternalError<false>("segment write task threw: {}", e.what());
+    } catch (...) {
+        g_task_exceptions << 1;
+        return Status::InternalError<false>("segment write task threw an unknown exception");
+    }
+}
+
+struct SegmentWriteTaskGroup::State {
     std::mutex mutex;
     std::condition_variable idle;
+    std::condition_variable work;
+    std::deque<std::function<Status()>> queue;
     int active = 0;
     bool closed = false;
     Status status;
 
-    void drain() {
-        for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) {
-            Status st = (*task)(i);
-            if (!st.ok()) {
-                std::lock_guard lock(mutex);
-                if (status.ok()) {
-                    status = std::move(st);
-                }
+    void record(Status st) {
+        if (!st.ok()) {
+            std::lock_guard lock(mutex);
+            if (status.ok()) {
+                status = std::move(st);
             }
         }
     }
 
-    // A helper works only if the caller has not finished yet.
+    // Runs queued tasks until the queue is empty. The caller holds no lock.
+    void drain() {
+        for (;;) {
+            std::function<Status()> task;
+            {
+                std::lock_guard lock(mutex);
+                if (queue.empty()) {
+                    return;
+                }
+                task = std::move(queue.front());
+                queue.pop_front();
+            }
+            record(run_catching_exceptions(task));
+        }
+    }
+
+    // Runs tasks as they are queued until the group is closed and its queue is empty.
     void help() {
         {
             std::lock_guard lock(mutex);
@@ -102,7 +139,19 @@ struct TaskRun {
             }
             ++active;
         }
-        drain();
+        for (;;) {
+            std::function<Status()> task;
+            {
+                std::unique_lock lock(mutex);
+                work.wait(lock, [&] { return !queue.empty() || closed; });
+                if (queue.empty()) {
+                    break;
+                }
+                task = std::move(queue.front());
+                queue.pop_front();
+            }
+            record(run_catching_exceptions(task));
+        }
         std::lock_guard lock(mutex);
         if (--active == 0) {
             idle.notify_all();
@@ -110,51 +159,75 @@ struct TaskRun {
     }
 };
 
-} // namespace
+SegmentWriteTaskGroup::SegmentWriteTaskGroup(int parallelism)
+        : _state(std::make_shared<State>()), _parallelism(std::max(1, parallelism)) {}
+
+SegmentWriteTaskGroup::~SegmentWriteTaskGroup() {
+    if (!_waited) {
+        static_cast<void>(wait());
+    }
+}
+
+void SegmentWriteTaskGroup::add(std::function<Status()> task) {
+    {
+        std::lock_guard lock(_state->mutex);
+        _state->queue.push_back(std::move(task));
+    }
+    _state->work.notify_one();
+    g_parallel_tasks << 1;
+    if (_helpers + 1 >= _parallelism) {
+        return;
+    }
+    ThreadPool* pool = write_pool();
+    if (pool == nullptr) {
+        return;
+    }
+    std::shared_ptr<MemTrackerLimiter> tracker;
+    if (doris::pthread_context_ptr_init) {
+        tracker = thread_context()->thread_mem_tracker_mgr->limiter_mem_tracker_sptr();
+    }
+    const int zstd_level = current_zstd_compression_level();
+    auto st = pool->submit_func([state = _state, tracker, zstd_level]() {
+        ScopedZstdCompressionLevel level(zstd_level);
+        if (tracker != nullptr) {
+            SCOPED_ATTACH_TASK(tracker);
+            state->help();
+        } else {
+            state->help();
+        }
+    });
+    if (st.ok()) {
+        ++_helpers;
+        g_helper_tasks << 1;
+    } else {
+        g_pool_rejected << 1;
+    }
+}
+
+Status SegmentWriteTaskGroup::wait() {
+    _waited = true;
+    g_parallel_runs << 1;
+    _state->drain();
+    {
+        std::lock_guard lock(_state->mutex);
+        _state->closed = true;
+    }
+    _state->work.notify_all();
+    std::unique_lock lock(_state->mutex);
+    _state->idle.wait(lock, [&] { return _state->active == 0; });
+    return _state->status;
+}
 
 Status run_segment_write_tasks(size_t n, int parallelism,
                                const std::function<Status(size_t)>& task) {
     if (n == 0) {
         return Status::OK();
     }
-    const size_t helpers = std::min<size_t>(n, static_cast<size_t>(std::max(1, parallelism))) - 1;
-    ThreadPool* pool = helpers > 0 ? write_pool() : nullptr;
-    if (pool == nullptr) {
-        for (size_t i = 0; i < n; ++i) {
-            RETURN_IF_ERROR(task(i));
-        }
-        return Status::OK();
+    SegmentWriteTaskGroup group(std::min<int>(parallelism, static_cast<int>(n)));
+    for (size_t i = 0; i < n; ++i) {
+        group.add([&task, i]() { return task(i); });
     }
-    auto run = std::make_shared<TaskRun>(n, &task);
-    std::shared_ptr<MemTrackerLimiter> tracker;
-    if (doris::pthread_context_ptr_init) {
-        tracker = thread_context()->thread_mem_tracker_mgr->limiter_mem_tracker_sptr();
-    }
-    // Pages compress at the calling thread's ZSTD level.
-    const int zstd_level = current_zstd_compression_level();
-    for (size_t i = 0; i < helpers; ++i) {
-        auto st = pool->submit_func([run, tracker, zstd_level]() {
-            ScopedZstdCompressionLevel level(zstd_level);
-            if (tracker != nullptr) {
-                SCOPED_ATTACH_TASK(tracker);
-                run->help();
-            } else {
-                run->help();
-            }
-        });
-        if (!st.ok()) {
-            g_pool_rejected << 1;
-            break;
-        }
-        g_helper_tasks << 1;
-    }
-    g_parallel_runs << 1;
-    g_parallel_tasks << n;
-    run->drain();
-    std::unique_lock lock(run->mutex);
-    run->closed = true;
-    run->idle.wait(lock, [&] { return run->active == 0; });
-    return run->status;
+    return group.wait();
 }
 
 } // namespace doris::segment_v2

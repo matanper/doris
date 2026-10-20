@@ -748,18 +748,30 @@ Status SegmentWriter::append_block(const Block* block, size_t row_pos, size_t nu
     IOlapColumnDataAccessor* seq_column = nullptr;
     // A writer without keys, as for the value column groups of a vertical compaction, converts
     // and appends its columns in parallel: each column has its own convertor and writer, and the
-    // writers keep their pages in memory until write_data().
+    // writers keep their pages in memory until write_data(). VARIANT columns, whose writers may
+    // add subcolumn metas to the shared segment footer, are appended on this thread, in column
+    // order, as the serial path does.
     const bool parallel_append = !_has_key && config::segment_column_write_parallelism > 1 &&
                                  _column_writers.size() > 1;
     if (parallel_append) {
-        RETURN_IF_ERROR(run_segment_write_tasks(
-                _column_writers.size(), config::segment_column_write_parallelism,
-                [&](size_t id) -> Status {
-                    auto [status, column] = _olap_data_convertor->convert_column_data(id);
-                    RETURN_IF_ERROR(status);
-                    return _column_writers[id]->append(column->get_nullmap(), column->get_data(),
-                                                       num_rows);
-                }));
+        auto append = [&](size_t id) -> Status {
+            auto [status, column] = _olap_data_convertor->convert_column_data(id);
+            RETURN_IF_ERROR(status);
+            return _column_writers[id]->append(column->get_nullmap(), column->get_data(),
+                                               num_rows);
+        };
+        SegmentWriteTaskGroup group(config::segment_column_write_parallelism);
+        Status status;
+        for (size_t id = 0; id < _column_writers.size() && status.ok(); ++id) {
+            if (_tablet_schema->column(_column_ids[id]).is_variant_type()) {
+                status = run_catching_exceptions([&]() { return append(id); });
+            } else {
+                group.add([&append, id]() { return append(id); });
+            }
+        }
+        Status tasks = group.wait();
+        RETURN_IF_ERROR(status);
+        RETURN_IF_ERROR(tasks);
     }
     for (size_t id = 0; !parallel_append && id < _column_writers.size(); ++id) {
         // olap data convertor alway start from id = 0
