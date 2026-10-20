@@ -48,6 +48,7 @@
 #include "io/cache/block_file_cache_factory.h"
 #include "io/cache/block_file_cache_profile.h"
 #include "io/cache/file_block.h"
+#include "io/cache/memory_preloaded_file.h"
 #include "io/cache/peer_file_cache_reader.h"
 #include "io/cache/remote_scan_cache_write_limiter.h"
 #include "io/fs/file_reader.h"
@@ -95,6 +96,11 @@ bvar::Window<bvar::Adder<uint64_t>> g_read_cache_indirect_bytes_1min_window(
 bvar::Window<bvar::Adder<uint64_t>> g_read_cache_indirect_total_bytes_1min_window(
         "cached_remote_reader_indirect_total_bytes_1min_window", &g_read_cache_indirect_total_bytes,
         60);
+// Compaction reads served by a MemoryPreloadedFile, and those it could not serve.
+bvar::Adder<uint64_t> g_memory_preloaded_read_bytes("cached_remote_reader_memory_preloaded_read_bytes");
+bvar::Adder<uint64_t> g_memory_preloaded_reads("cached_remote_reader_memory_preloaded_reads");
+bvar::Adder<uint64_t> g_memory_preloaded_fallback_reads(
+        "cached_remote_reader_memory_preloaded_fallback_reads");
 bvar::Adder<uint64_t> g_failed_get_peer_addr_counter(
         "cached_remote_reader_failed_get_peer_addr_counter");
 
@@ -1221,6 +1227,18 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
     if (UNLIKELY(bytes_req == 0)) {
         *bytes_read = 0;
         return Status::OK();
+    }
+
+    if (!is_dryrun && reads_memory_preloaded_files(io_ctx->reader_type)) {
+        if (auto file = find_memory_preloaded_file(_cache_hash); file != nullptr) {
+            if (file->read(offset, result.data, bytes_req)) {
+                g_memory_preloaded_reads << 1;
+                g_memory_preloaded_read_bytes << bytes_req;
+                *bytes_read = bytes_req;
+                return Status::OK();
+            }
+            g_memory_preloaded_fallback_reads << 1;
+        }
     }
 
     ReadStatistics stats;

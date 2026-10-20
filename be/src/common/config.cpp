@@ -1441,6 +1441,9 @@ DEFINE_Validator(index_compaction_preload_threads,
 // through the file cache on the compaction preload pool.
 DEFINE_mBool(enable_index_compaction_preload, "true");
 DEFINE_mBool(enable_compaction_async_data_preload, "false");
+DEFINE_mBool(enable_compaction_memory_preload, "false");
+DEFINE_mInt64(compaction_memory_preload_task_bytes, "2147483648");
+DEFINE_mInt64(compaction_memory_preload_total_bytes, "17179869184");
 DEFINE_mInt32(cumu_compaction_thread_nice, "0");
 DEFINE_Validator(cumu_compaction_thread_nice,
                  [](const int32_t config) -> bool { return config >= 0 && config <= 19; });

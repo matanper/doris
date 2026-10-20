@@ -295,6 +295,14 @@ void Compaction::preload_input_segment_files(bool async) {
                                .tablet_id = _tablet->tablet_id()});
         }
     }
+    if (config::enable_compaction_memory_preload) {
+        std::vector<IndexFilePreloadTarget> rest;
+        _memory_preload = start_memory_preload_index_files(targets, &rest);
+        targets = std::move(rest);
+        if (targets.empty() || !config::enable_compaction_data_preload) {
+            return;
+        }
+    }
     if (async) {
         _input_preload = start_preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
     } else {
@@ -304,8 +312,11 @@ void Compaction::preload_input_segment_files(bool async) {
 
 Status Compaction::merge_input_rowsets() {
     // The preload is only of use to the merge; what it has not started by then is skipped.
-    Defer cancel_preload {[this]() { _input_preload.reset(); }};
-    if (config::enable_compaction_data_preload) {
+    Defer cancel_preload {[this]() {
+        _input_preload.reset();
+        _memory_preload.reset();
+    }};
+    if (config::enable_compaction_data_preload || config::enable_compaction_memory_preload) {
         // Vertical compaction reads every input segment once per column group, starting each
         // pass with small reads of each segment one after another; reading each segment file
         // once up front turns their cache misses into a few large remote reads. Started without

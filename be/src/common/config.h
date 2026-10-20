@@ -1479,6 +1479,16 @@ DECLARE_mInt64(index_compaction_preload_chunk_bytes);
 // its threads mostly wait on remote reads.
 DECLARE_mInt32(index_compaction_preload_threads);
 DECLARE_mBool(enable_index_compaction_preload);
+// Before merging, load each input segment data file whole into memory, charged to the
+// compaction's memory tracker, and serve the merge's reads of it from there. The loads run on the
+// compaction preload pool and read the file cache only for the chunks it holds whole; nothing is
+// written to it, so compaction inputs no longer pass through its disposable queue. The merge
+// starts at once and loads any chunk it reaches before the pool has. The files beyond
+// compaction_memory_preload_task_bytes per compaction, or compaction_memory_preload_total_bytes
+// for all of them, are preloaded and read through the file cache as before.
+DECLARE_mBool(enable_compaction_memory_preload);
+DECLARE_mInt64(compaction_memory_preload_task_bytes);
+DECLARE_mInt64(compaction_memory_preload_total_bytes);
 // Start the compaction data preload without waiting for it: the merge reads blocks as they
 // arrive, and the chunks not started when the merge ends are skipped. Off by default: with many
 // compactions sharing the preload pool, the merges get ahead of it and fetch the blocks it has
