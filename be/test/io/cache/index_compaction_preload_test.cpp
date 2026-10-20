@@ -21,8 +21,10 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "block_file_cache_test_common.h"
 #include "cloud/config.h"
@@ -46,10 +48,20 @@ public:
 
     size_t reads() const { return _reads; }
     size_t bytes() const { return _bytes; }
+    // Reads at or past `offset` fail.
+    void fail_from(size_t offset) { _fail_from = offset; }
+    // Each read first sleeps this long.
+    void set_delay_ms(int ms) { _delay_ms = ms; }
 
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override {
+        if (_delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(_delay_ms.load()));
+        }
+        if (offset >= _fail_from) {
+            return Status::IOError("injected read failure at {}", offset);
+        }
         ++_reads;
         _bytes += result.size;
         return _delegate->read_at(offset, result, bytes_read, io_ctx);
@@ -59,6 +71,8 @@ private:
     FileReaderSPtr _delegate;
     std::atomic<size_t> _reads {0};
     std::atomic<size_t> _bytes {0};
+    std::atomic<size_t> _fail_from {SIZE_MAX};
+    std::atomic<int> _delay_ms {0};
 };
 
 class IndexCompactionPreloadTest : public BlockFileCacheTest {
@@ -70,6 +84,7 @@ protected:
         _old_block_size = config::file_cache_each_block_size;
         _old_chunk = config::index_compaction_preload_chunk_bytes;
         _old_enable_cache = config::enable_file_cache;
+        _old_threads = config::index_compaction_preload_threads;
         config::enable_async_file_cache_write = false;
         config::enable_read_cache_file_directly = false;
         config::enable_cache_read_from_peer = false;
@@ -111,6 +126,7 @@ protected:
         config::file_cache_each_block_size = _old_block_size;
         config::index_compaction_preload_chunk_bytes = _old_chunk;
         config::enable_file_cache = _old_enable_cache;
+        config::index_compaction_preload_threads = _old_threads;
     }
 
     static void reset_factory() {
@@ -145,6 +161,7 @@ private:
     int64_t _old_block_size = 0;
     int64_t _old_chunk = 0;
     bool _old_enable_cache = false;
+    int32_t _old_threads = 64;
 };
 
 } // namespace
@@ -234,6 +251,99 @@ TEST_F(IndexCompactionPreloadTest, preload_skips_uncached_readers) {
     auto reader = cached(remote);
     preload_cached_files({reader});
     EXPECT_EQ(remote->reads(), 0);
+}
+
+// The chunks of all files are queued by their position relative to their file's size.
+TEST_F(IndexCompactionPreloadTest, chunks_are_interleaved_by_relative_offset) {
+    const auto order = preload_chunk_order({10_mb, 5_mb}, 4_mb);
+    const std::vector<std::pair<size_t, size_t>> expected = {
+            {0, 0}, {1, 0}, {0, 4_mb}, {0, 8_mb}, {1, 4_mb}};
+    EXPECT_EQ(order, expected);
+    EXPECT_TRUE(preload_chunk_order({0, 0}, 4_mb).empty());
+}
+
+// Reads made while the preload is still downloading return the file's bytes, and every block is
+// fetched once.
+TEST_F(IndexCompactionPreloadTest, reads_during_async_preload_see_the_file) {
+    auto remote = open_remote();
+    remote->set_delay_ms(20);
+    auto reader = cached(remote);
+    const size_t file_size = reader->size();
+    auto task = start_preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+    ASSERT_NE(task, nullptr);
+
+    IOContext io_ctx;
+    io_ctx.is_disposable = true;
+    std::string buffer(4096, '\0');
+    for (size_t offset = 0; offset < file_size; offset += 300 * 1024) {
+        size_t bytes_read = 0;
+        ASSERT_TRUE(
+                reader->read_at(offset, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx)
+                        .ok());
+        EXPECT_EQ(buffer[0], static_cast<char>('0' + offset / 1_mb));
+    }
+    task->wait();
+    EXPECT_EQ(remote->bytes(), file_size);
+}
+
+// A cancelled preload skips the chunks no thread has started.
+TEST_F(IndexCompactionPreloadTest, cancelled_preload_skips_unstarted_chunks) {
+    config::index_compaction_preload_threads = 1;
+    ASSERT_EQ(preload_pool_max_threads_for_test(), 1);
+    // Idle threads above the pool's one minimum thread leave after its idle timeout.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    auto remote = open_remote();
+    remote->set_delay_ms(200);
+    auto reader = cached(remote);
+    const int64_t skipped_before = exposed("index_compaction_preload_skipped_chunks");
+    {
+        auto task = start_preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+        ASSERT_NE(task, nullptr);
+        task->cancel();
+        task->wait();
+    }
+    EXPECT_GE(exposed("index_compaction_preload_skipped_chunks") - skipped_before, 2);
+    EXPECT_LT(remote->bytes(), reader->size());
+    // Dropping a task cancels it as well.
+    auto other = cached(open_remote());
+    {
+        auto dropped = start_preload_cached_files({other}, PreloadCacheQueue::DISPOSABLE);
+    }
+    config::index_compaction_preload_threads = 64;
+}
+
+// A chunk that fails leaves its blocks to later reads; the rest of the preload still lands.
+TEST_F(IndexCompactionPreloadTest, failed_chunk_leaves_the_rest_cached) {
+    auto remote = open_remote();
+    remote->fail_from(8_mb);
+    auto reader = cached(remote);
+    const int64_t failed_before = exposed("index_compaction_preload_failed_chunks");
+    auto task = start_preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+    ASSERT_NE(task, nullptr);
+    task->wait();
+    EXPECT_EQ(exposed("index_compaction_preload_failed_chunks") - failed_before, 1);
+    const size_t fetched = remote->reads();
+    IOContext io_ctx;
+    io_ctx.is_disposable = true;
+    std::string buffer(64 * 1024, '\0');
+    for (size_t offset = 0; offset < 8_mb; offset += 1_mb) {
+        size_t bytes_read = 0;
+        ASSERT_TRUE(
+                reader->read_at(offset, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx)
+                        .ok());
+    }
+    EXPECT_EQ(remote->reads(), fetched) << "the first 8 MB were cached";
+}
+
+// The pool follows index_compaction_preload_threads at runtime.
+TEST_F(IndexCompactionPreloadTest, pool_size_follows_config) {
+    config::index_compaction_preload_threads = 3;
+    auto reader = cached(open_remote());
+    preload_cached_files({reader}, PreloadCacheQueue::DISPOSABLE);
+    EXPECT_EQ(preload_pool_max_threads_for_test(), 3);
+    config::index_compaction_preload_threads = 64;
+    preload_cached_files({cached(open_remote())}, PreloadCacheQueue::DISPOSABLE);
+    EXPECT_EQ(preload_pool_max_threads_for_test(), 64);
 }
 
 } // namespace doris::io

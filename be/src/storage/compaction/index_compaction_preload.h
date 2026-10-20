@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -55,5 +57,42 @@ void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
 // are skipped.
 void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers,
                           PreloadCacheQueue queue = PreloadCacheQueue::INDEX);
+
+// A preload its caller does not wait for. Destroying it, or cancel(), skips the chunks no thread
+// has started; a chunk being read finishes on its own.
+class PreloadTask {
+public:
+    struct State;
+    explicit PreloadTask(std::shared_ptr<State> state) : _state(std::move(state)) {}
+    ~PreloadTask() { cancel(); }
+    PreloadTask(const PreloadTask&) = delete;
+    PreloadTask& operator=(const PreloadTask&) = delete;
+
+    void cancel();
+    // Returns when every chunk was read or skipped.
+    void wait();
+
+private:
+    std::shared_ptr<State> _state;
+};
+
+// preload_cached_files() without waiting. The chunks of all files are queued by their relative
+// position in their file, so the start of every file comes first, as the first column groups of a
+// vertical compaction need. Returns nullptr when there is nothing to preload.
+std::unique_ptr<PreloadTask> start_preload_cached_files(
+        const std::vector<io::FileReaderSPtr>& readers,
+        PreloadCacheQueue queue = PreloadCacheQueue::INDEX);
+
+// preload_index_files() without waiting.
+std::unique_ptr<PreloadTask> start_preload_index_files(
+        const std::vector<IndexFilePreloadTarget>& targets,
+        PreloadCacheQueue queue = PreloadCacheQueue::INDEX);
+
+// The order start_preload_cached_files() queues the chunks of files of `file_sizes` bytes in, as
+// (file index, offset) pairs.
+std::vector<std::pair<size_t, size_t>> preload_chunk_order(const std::vector<size_t>& file_sizes,
+                                                           size_t chunk_size);
+
+int preload_pool_max_threads_for_test();
 
 } // namespace doris

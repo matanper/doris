@@ -1465,7 +1465,10 @@ DECLARE_mBool(enable_compaction_release_input_segments);
 DECLARE_mBool(enable_compaction_pin_input_segments);
 DECLARE_mBool(enable_compaction_data_preload);
 DECLARE_mInt64(index_compaction_preload_chunk_bytes);
-DECLARE_Int32(index_compaction_preload_threads);
+DECLARE_mInt32(index_compaction_preload_threads);
+// Start the compaction data preload without waiting for it: the merge reads blocks as they
+// arrive, and the chunks not started when the merge ends are skipped.
+DECLARE_mBool(enable_compaction_async_data_preload);
 // Only for debug, do not use in production
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory

@@ -94,8 +94,21 @@ ThreadPool* preload_pool() {
             pool.reset();
         }
     });
+    if (pool != nullptr) {
+        // The size follows the config, which can change at runtime.
+        const int wanted = std::max(1, config::index_compaction_preload_threads);
+        if (pool->max_threads() != wanted) {
+            static std::mutex resize_mutex;
+            std::lock_guard lock(resize_mutex);
+            if (pool->max_threads() != wanted && !pool->set_max_threads(wanted).ok()) {
+                LOG(WARNING) << "failed to resize the index compaction preload pool to " << wanted;
+            }
+        }
+    }
     return pool.get();
 }
+
+bvar::Adder<uint64_t> g_preload_skipped_chunks("index_compaction_preload_skipped_chunks");
 
 struct PreloadChunk {
     io::FileReaderSPtr reader;
@@ -105,16 +118,65 @@ struct PreloadChunk {
 
 } // namespace
 
-void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, PreloadCacheQueue queue) {
+struct PreloadTask::State {
+    explicit State(int chunks) : latch(chunks) { watch.start(); }
+    std::atomic<bool> cancelled {false};
+    CountDownLatch latch;
+    std::atomic<int64_t> remaining {0};
+    MonotonicStopWatch watch;
+
+    void chunk_done() {
+        latch.count_down();
+        if (remaining.fetch_sub(1) == 1) {
+            g_preload_latency_us << watch.elapsed_time() / 1000;
+        }
+    }
+};
+
+int preload_pool_max_threads_for_test() {
+    ThreadPool* pool = preload_pool();
+    return pool == nullptr ? 0 : pool->max_threads();
+}
+
+void PreloadTask::cancel() {
+    if (_state != nullptr) {
+        _state->cancelled = true;
+    }
+}
+
+void PreloadTask::wait() {
+    if (_state != nullptr) {
+        _state->latch.wait();
+    }
+}
+
+std::vector<std::pair<size_t, size_t>> preload_chunk_order(const std::vector<size_t>& file_sizes,
+                                                           size_t chunk_size) {
+    std::vector<std::pair<size_t, size_t>> order;
+    for (size_t f = 0; f < file_sizes.size(); ++f) {
+        for (size_t offset = 0; offset < file_sizes[f]; offset += chunk_size) {
+            order.emplace_back(f, offset);
+        }
+    }
+    // By position relative to the file's size, then by file.
+    std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) {
+        const auto pa = static_cast<unsigned __int128>(a.second) * file_sizes[b.first];
+        const auto pb = static_cast<unsigned __int128>(b.second) * file_sizes[a.first];
+        return pa != pb ? pa < pb : a.first < b.first;
+    });
+    return order;
+}
+
+std::unique_ptr<PreloadTask> start_preload_cached_files(
+        const std::vector<io::FileReaderSPtr>& readers, PreloadCacheQueue queue) {
     ThreadPool* pool = config::enable_file_cache ? preload_pool() : nullptr;
     if (pool == nullptr || readers.empty()) {
-        return;
+        return nullptr;
     }
-    MonotonicStopWatch watch;
-    watch.start();
     const auto chunk_size = static_cast<size_t>(
             std::max<int64_t>(config::index_compaction_preload_chunk_bytes, 1 << 20));
-    std::vector<PreloadChunk> chunks;
+    std::vector<io::FileReaderSPtr> cached;
+    std::vector<size_t> sizes;
     for (const auto& reader : readers) {
         if (dynamic_cast<io::CachedRemoteFileReader*>(reader.get()) == nullptr) {
             continue;
@@ -124,13 +186,23 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, Preloa
             g_data_preload_bytes << reader->size();
         }
         count_cached_bytes(*reader);
-        for (size_t offset = 0; offset < reader->size(); offset += chunk_size) {
-            chunks.push_back({reader, offset, std::min(chunk_size, reader->size() - offset)});
-        }
+        cached.push_back(reader);
+        sizes.push_back(reader->size());
     }
-    CountDownLatch latch(static_cast<int>(chunks.size()));
-    for (const auto& chunk : chunks) {
-        auto st = pool->submit_func([chunk, &latch, queue]() {
+    auto order = preload_chunk_order(sizes, chunk_size);
+    if (order.empty()) {
+        return nullptr;
+    }
+    auto state = std::make_shared<PreloadTask::State>(static_cast<int>(order.size()));
+    state->remaining = static_cast<int64_t>(order.size());
+    for (const auto& [f, offset] : order) {
+        PreloadChunk chunk {cached[f], offset, std::min(chunk_size, sizes[f] - offset)};
+        auto st = pool->submit_func([chunk, state, queue]() {
+            if (state->cancelled) {
+                g_preload_skipped_chunks << 1;
+                state->chunk_done();
+                return;
+            }
             io::IOContext io_ctx;
             io_ctx.is_dryrun = true;
             // The later reads use the same flags, so missed blocks land in the same cache queue
@@ -146,22 +218,25 @@ void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, Preloa
                          .ok()) {
                 g_preload_failed_chunks << 1;
             }
-            latch.count_down();
+            state->chunk_done();
         });
         if (!st.ok()) {
             g_preload_failed_chunks << 1;
-            latch.count_down();
+            state->chunk_done();
         }
     }
-    latch.wait();
-    g_preload_latency_us << watch.elapsed_time() / 1000;
+    return std::make_unique<PreloadTask>(std::move(state));
 }
 
-void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
-                         PreloadCacheQueue queue) {
-    if (!config::enable_file_cache || targets.empty()) {
-        return;
+void preload_cached_files(const std::vector<io::FileReaderSPtr>& readers, PreloadCacheQueue queue) {
+    auto task = start_preload_cached_files(readers, queue);
+    if (task != nullptr) {
+        task->wait();
     }
+}
+
+namespace {
+std::vector<io::FileReaderSPtr> open_targets(const std::vector<IndexFilePreloadTarget>& targets) {
     std::vector<io::FileReaderSPtr> readers;
     for (const auto& target : targets) {
         io::FileReaderOptions opts;
@@ -174,7 +249,24 @@ void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
             readers.push_back(std::move(reader));
         }
     }
-    preload_cached_files(readers, queue);
+    return readers;
+}
+} // namespace
+
+std::unique_ptr<PreloadTask> start_preload_index_files(
+        const std::vector<IndexFilePreloadTarget>& targets, PreloadCacheQueue queue) {
+    if (!config::enable_file_cache || targets.empty()) {
+        return nullptr;
+    }
+    return start_preload_cached_files(open_targets(targets), queue);
+}
+
+void preload_index_files(const std::vector<IndexFilePreloadTarget>& targets,
+                         PreloadCacheQueue queue) {
+    auto task = start_preload_index_files(targets, queue);
+    if (task != nullptr) {
+        task->wait();
+    }
 }
 
 } // namespace doris
