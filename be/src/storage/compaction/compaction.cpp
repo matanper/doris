@@ -40,6 +40,7 @@
 #include <ostream>
 #include <set>
 #include <shared_mutex>
+#include <unordered_set>
 #include <utility>
 
 #include "cloud/cloud_meta_mgr.h"
@@ -807,6 +808,25 @@ bvar::Adder<uint64_t> g_variant_index_scan_aborted("compaction_variant_index_sca
 // index files cannot be read as the merge reads them.
 bvar::Adder<uint64_t> g_variant_index_rebuild_props_format_mismatch(
         "compaction_variant_index_rebuild_props_format_mismatch");
+// Input index properties a merge accepted although they differ from the output's: the raw
+// properties of the defined entry, or the entry the first-by-id lookup returns, a per-subcolumn
+// copy. One count per input rowset and index; each distinct difference is logged once.
+bvar::Adder<uint64_t> g_variant_index_props_equal_after_normalize(
+        "compaction_variant_index_props_equal_after_normalize");
+bvar::Adder<uint64_t> g_variant_index_props_normalize_logged(
+        "compaction_variant_index_props_normalize_logged");
+
+// The distinct differences already logged, process-wide. Full, it logs nothing more.
+static bool first_normalized_difference(const std::string& key) {
+    static constexpr size_t kMaxEntries = 10000;
+    static std::mutex mutex;
+    static std::unordered_set<std::string> seen;
+    std::lock_guard lock(mutex);
+    if (seen.size() >= kMaxEntries) {
+        return false;
+    }
+    return seen.insert(key).second;
+}
 
 // The VARIANT subcolumn of `schema` whose full path is `path`, or nullptr.
 static const TabletColumn* find_extracted_column(const TabletSchema& schema,
@@ -874,6 +894,83 @@ static std::string first_property_difference(const std::map<std::string, std::st
         }
     }
     return "none";
+}
+
+// Keys that index_content_settings reads.
+static bool is_content_key(const std::string& key) {
+    static const std::set<std::string> keys {INVERTED_INDEX_PARSER_KEY,
+                                             INVERTED_INDEX_PARSER_MODE_KEY,
+                                             INVERTED_INDEX_PARSER_PHRASE_SUPPORT_KEY,
+                                             INVERTED_INDEX_PARSER_LOWERCASE_KEY,
+                                             INVERTED_INDEX_PARSER_CHAR_FILTER_TYPE,
+                                             INVERTED_INDEX_PARSER_CHAR_FILTER_PATTERN,
+                                             INVERTED_INDEX_PARSER_CHAR_FILTER_REPLACEMENT,
+                                             INVERTED_INDEX_PARSER_IGNORE_ABOVE_KEY,
+                                             INVERTED_INDEX_PARSER_STOPWORDS_KEY,
+                                             INVERTED_INDEX_PARSER_DICT_COMPRESSION_KEY,
+                                             INVERTED_INDEX_ANALYZER_NAME_KEY,
+                                             INVERTED_INDEX_NORMALIZER_NAME_KEY,
+                                             INVERTED_INDEX_PARSER_FIELD_PATTERN_KEY};
+    return keys.contains(key);
+}
+
+struct PropertyDifference {
+    std::string key;
+    std::string expected;
+    std::string actual;
+    // "none": the entries hold the same properties; "default": one side lacks the key;
+    // "spelling": both have it and the values differ only in ASCII case or surrounding spaces;
+    // "value": the values differ otherwise.
+    const char* how;
+};
+
+// Every key whose raw value differs between the two property maps.
+static std::vector<PropertyDifference> property_differences(
+        const std::map<std::string, std::string>& expected,
+        const std::map<std::string, std::string>& actual) {
+    const auto canonical = [](std::string value) {
+        const auto first = value.find_first_not_of(" \t");
+        const auto last = value.find_last_not_of(" \t");
+        value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return value;
+    };
+    std::set<std::string> keys;
+    for (const auto& [key, value] : expected) {
+        keys.insert(key);
+    }
+    for (const auto& [key, value] : actual) {
+        keys.insert(key);
+    }
+    std::vector<PropertyDifference> differences;
+    for (const auto& key : keys) {
+        auto e = expected.find(key);
+        auto a = actual.find(key);
+        if (e != expected.end() && a != actual.end() && e->second == a->second) {
+            continue;
+        }
+        const char* how = "default";
+        if (e != expected.end() && a != actual.end()) {
+            how = canonical(e->second) == canonical(a->second) ? "spelling" : "value";
+        }
+        differences.push_back({.key = key,
+                               .expected = e == expected.end() ? "<missing>" : e->second,
+                               .actual = a == actual.end() ? "<missing>" : a->second,
+                               .how = how});
+    }
+    return differences;
+}
+
+// The first entry with `index_id`, which the lookup by id alone returns: the defined index or a
+// per-subcolumn copy of it.
+static const TabletIndex* first_index_with_id(const TabletSchema& schema, int64_t index_id) {
+    for (const auto* index : schema.inverted_indexes()) {
+        if (index->index_id() == index_id) {
+            return index;
+        }
+    }
+    return nullptr;
 }
 
 static std::optional<std::map<std::string, std::string>> index_properties(
@@ -1580,13 +1677,42 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                     reject(candidate, Reject::FORMAT_MISMATCH);
                     continue;
                 }
+                // Differences of indexes whose content settings are equal, recorded once the
+                // path's every index passed for this rowset.
+                struct Accepted {
+                    int64_t index_id;
+                    const char* kind;
+                    std::vector<PropertyDifference> differences;
+                };
+                std::vector<Accepted> accepted;
+                bool props_rejected = false;
                 for (const auto* index : candidate.indexes) {
                     const auto expected =
                             defined_index_properties(*_cur_tablet_schema, index->index_id());
                     const auto actual =
                             defined_index_properties(*rowset->tablet_schema(), index->index_id());
+                    if (expected.has_value() && actual.has_value() &&
+                        index_content_settings(*expected) == index_content_settings(*actual)) {
+                        const auto* first_expected =
+                                first_index_with_id(*_cur_tablet_schema, index->index_id());
+                        const auto* first_actual =
+                                first_index_with_id(*rowset->tablet_schema(), index->index_id());
+                        if (!first_expected->get_index_suffix().empty() ||
+                            !first_actual->get_index_suffix().empty()) {
+                            accepted.push_back(
+                                    {index->index_id(), "matched_copy",
+                                     property_differences(first_expected->properties(),
+                                                          first_actual->properties())});
+                        }
+                        if (auto differences = property_differences(*expected, *actual);
+                            !differences.empty()) {
+                            accepted.push_back(
+                                    {index->index_id(), "raw_diff", std::move(differences)});
+                        }
+                    }
                     if (!expected.has_value() || !actual.has_value() ||
                         index_content_settings(*expected) != index_content_settings(*actual)) {
+                        props_rejected = true;
                         const auto raw_expected =
                                 index_properties(*_cur_tablet_schema, index->index_id());
                         const auto raw_actual =
@@ -1604,6 +1730,39 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                                             : std::string("index missing"));
                         reject(candidate, Reject::PROPS_MISMATCH);
                         break;
+                    }
+                }
+                if (!props_rejected) {
+                    std::set<int64_t> counted;
+                    for (const auto& record : accepted) {
+                        if (counted.insert(record.index_id).second) {
+                            g_variant_index_props_equal_after_normalize << 1;
+                        }
+                        const std::string& path = candidate.column->path_info_ptr()->get_path();
+                        std::vector<PropertyDifference> differences = record.differences;
+                        if (differences.empty()) {
+                            differences.push_back({.key = "<none>",
+                                                   .expected = "",
+                                                   .actual = "",
+                                                   .how = "none"});
+                        }
+                        for (const auto& d : differences) {
+                            if (!first_normalized_difference(
+                                        fmt::format("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+                                                    record.index_id, path, record.kind, d.key,
+                                                    d.expected, d.actual))) {
+                                continue;
+                            }
+                            g_variant_index_props_normalize_logged << 1;
+                            LOG(INFO) << "VARIANT index properties equal after normalizing: kind="
+                                      << record.kind << " index_id=" << record.index_id
+                                      << " path=" << path << " key=" << d.key
+                                      << " expected=" << d.expected << " actual=" << d.actual
+                                      << " differs_by=" << d.how
+                                      << " content_key=" << is_content_key(d.key)
+                                      << " tablet_id=" << _tablet->tablet_id()
+                                      << " rowset_id=" << rowset->rowset_id();
+                        }
                     }
                 }
             }

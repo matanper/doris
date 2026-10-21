@@ -632,6 +632,87 @@ TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
     }
 }
 
+// An input whose index properties differ from the output's only in ways the normalized
+// comparison ignores still merges, and is counted once per compaction. Each distinct difference
+// is logged once per process: a second compaction with the same difference logs nothing more.
+TEST_F(VariantTypedPathIndexMergeTest, PropertiesEqualAfterNormalizeAreCountedAndLoggedOnce) {
+    struct Case {
+        const char* name;
+        std::function<void(TabletSchemaPB&)> patch;
+        int64_t logged_first;
+    };
+    const std::vector<Case> cases {
+            // The defined entry of idx_host carries a key no content setting reads: raw_diff.
+            {"extra key",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20002 && index.index_suffix_name().empty()) {
+                         (*index.mutable_properties())["probe_note"] = "raw";
+                     }
+                 }
+             },
+             1},
+            // A copy of idx_code with an extra key is listed first: the lookup by id alone would
+            // compare the copy, matched_copy.
+            {"copy listed first",
+             [](TabletSchemaPB& pb) {
+                 std::vector<TabletIndexPB> indexes(pb.index().begin(), pb.index().end());
+                 for (const auto& index : std::vector<TabletIndexPB>(indexes)) {
+                     if (index.index_id() == 20003 && index.index_suffix_name().empty()) {
+                         TabletIndexPB copy = index;
+                         copy.set_index_suffix_name("v%2Eprobe");
+                         (*copy.mutable_properties())["probe_key"] = "probe_value";
+                         indexes.insert(indexes.begin(), copy);
+                     }
+                 }
+                 pb.clear_index();
+                 for (auto& index : indexes) {
+                     *pb.add_index() = index;
+                 }
+             },
+             1},
+    };
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    Defer restore {[&]() { config::enable_variant_typed_path_index_compaction = old_flag; }};
+    int64_t tablet_id = 130200;
+    for (const auto& c : cases) {
+        for (int run = 0; run < 2; ++run) {
+            ASSERT_TRUE(create_tablet(options(++tablet_id)).ok());
+            std::vector<RowsetSharedPtr> rowsets;
+            for (int64_t version = 0; version < 3; ++version) {
+                auto written = write_rowset(rowset(version));
+                ASSERT_TRUE(written.has_value()) << written.error();
+                rowsets.push_back(written.value());
+            }
+            TabletSchemaPB pb;
+            rowsets[2]->tablet_schema()->to_schema_pb(&pb);
+            c.patch(pb);
+            auto patched = std::make_shared<TabletSchema>();
+            patched->init_from_pb(pb);
+            rowsets[2]->rowset_meta()->set_tablet_schema(patched);
+            rowsets[2]->_schema = patched;
+
+            const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+            const int64_t equal_before =
+                    exposed("compaction_variant_index_props_equal_after_normalize");
+            const int64_t logged_before =
+                    exposed("compaction_variant_index_props_normalize_logged");
+            auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+            ASSERT_TRUE(compacted.has_value()) << c.name << ": " << compacted.error();
+            EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3)
+                    << c.name << " run " << run;
+            EXPECT_EQ(
+                    exposed("compaction_variant_index_props_equal_after_normalize") - equal_before,
+                    1)
+                    << c.name << " run " << run;
+            EXPECT_EQ(exposed("compaction_variant_index_props_normalize_logged") - logged_before,
+                      run == 0 ? c.logged_first : 0)
+                    << c.name << " run " << run;
+        }
+    }
+}
+
 // Typed paths shaped like melian.logs fields, one index per run.
 struct BenchKind {
     std::string name;
