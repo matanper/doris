@@ -19,6 +19,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "io/io_common.h"
 #include "storage/segment/external_col_meta_util.h"
@@ -42,7 +44,21 @@ public:
     virtual Status traverse_metas(const SegmentFooterPB& footer,
                                   const std::function<void(const ColumnMetaPB&)>& visitor,
                                   OlapReaderStatistics* stats,
-                                  const io::IOContext* source_io_ctx) const = 0;
+                                  const io::IOContext* source_io_ctx)
+            const = 0; // Traverse the ColumnMetaPBs of top-level columns (unique_id != -1) only.
+    virtual Status traverse_top_level_metas(const SegmentFooterPB& footer,
+                                            const std::function<void(const ColumnMetaPB&)>& visitor,
+                                            OlapReaderStatistics* stats,
+                                            const io::IOContext* source_io_ctx) const {
+        return traverse_metas(
+                footer,
+                [&](const ColumnMetaPB& meta) {
+                    if (meta.unique_id() != -1) {
+                        visitor(meta);
+                    }
+                },
+                stats, source_io_ctx);
+    }
 };
 
 // V2: inline layout using only footer.columns().
@@ -177,6 +193,70 @@ public:
         return Status::OK();
     }
 
+    // The footer's column_meta_entries give each meta's unique id and length in region order, so
+    // the top-level metas are located without reading the region. Adjacent top-level metas are
+    // read together; the VARIANT subcolumn metas between them are never read.
+    Status traverse_top_level_metas(const SegmentFooterPB& footer,
+                                    const std::function<void(const ColumnMetaPB&)>& visitor,
+                                    OlapReaderStatistics* stats,
+                                    const io::IOContext* source_io_ctx) const override {
+        if (footer.column_meta_entries_size() != _ptrs.num_columns) {
+            return Status::Corruption("column_meta_entries size mismatch");
+        }
+        struct Span {
+            uint64_t begin;
+            uint64_t end;
+            // Offset and length of each meta in the span.
+            std::vector<std::pair<uint64_t, uint64_t>> metas;
+        };
+        std::vector<Span> spans;
+        uint64_t offset = _ptrs.region_start;
+        for (uint32_t i = 0; i < _ptrs.num_columns; ++i) {
+            const auto& entry = footer.column_meta_entries(static_cast<int>(i));
+            const auto sz = static_cast<uint64_t>(entry.length());
+            const uint64_t pos = offset;
+            offset += sz;
+            if (entry.unique_id() == -1) {
+                continue;
+            }
+            if (!ExternalColMetaUtil::is_valid_meta_slice(pos, sz, _ptrs)) {
+                return Status::Corruption("external meta entry out of region bounds");
+            }
+            if (spans.empty() || spans.back().end != pos) {
+                spans.push_back({.begin = pos, .end = pos, .metas = {}});
+            }
+            spans.back().end = pos + sz;
+            spans.back().metas.emplace_back(pos, sz);
+        }
+
+        io::IOContext io_ctx;
+        if (source_io_ctx != nullptr) {
+            io_ctx = *source_io_ctx;
+        }
+        io_ctx.is_index_data = true;
+        io_ctx.is_inverted_index = false;
+        if (stats != nullptr) {
+            io_ctx.file_cache_stats = &stats->file_cache_stats;
+        }
+        std::string buf;
+        for (const auto& span : spans) {
+            buf.resize(static_cast<size_t>(span.end - span.begin));
+            size_t br = 0;
+            RETURN_IF_ERROR(_file_reader->read_at(span.begin, Slice(buf), &br, &io_ctx));
+            if (br != buf.size()) {
+                return Status::Corruption("short read on meta region");
+            }
+            for (const auto& [pos, sz] : span.metas) {
+                ColumnMetaPB meta;
+                if (!meta.ParseFromArray(buf.data() + (pos - span.begin), static_cast<int>(sz))) {
+                    return Status::Corruption("failed parse ColumnMetaPB from region");
+                }
+                visitor(meta);
+            }
+        }
+        return Status::OK();
+    }
+
 private:
     io::FileReaderSPtr _file_reader;
     ExternalColMetaUtil::ExternalMetaPointers _ptrs;
@@ -230,6 +310,12 @@ Status ColumnMetaAccessor::traverse_metas(const SegmentFooterPB& footer,
                                           OlapReaderStatistics* stats,
                                           const io::IOContext* source_io_ctx) const {
     return _impl->traverse_metas(footer, visitor, stats, source_io_ctx);
+}
+
+Status ColumnMetaAccessor::traverse_top_level_metas(
+        const SegmentFooterPB& footer, const std::function<void(const ColumnMetaPB&)>& visitor,
+        OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) const {
+    return _impl->traverse_top_level_metas(footer, visitor, stats, source_io_ctx);
 }
 
 } // namespace doris::segment_v2
