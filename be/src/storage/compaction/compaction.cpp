@@ -1661,14 +1661,19 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
     };
     auto abort_scan = [this](const char* why) {
         g_variant_index_scan_aborted << 1;
-        LOG_EVERY_N(INFO, 100) << "tablet " << _tablet->tablet_id()
-                               << " rebuilds every VARIANT path index of this compaction: " << why;
+        LOG(INFO) << "tablet " << _tablet->tablet_id()
+                  << " rebuilds every VARIANT path index of this compaction: " << why;
     };
 
     // Returns false when the scan stopped on an error: then no path of this compaction is merged.
     auto scan_inputs = [&]() -> bool {
         for (const auto& input : _input_rowsets) {
             auto* rowset = static_cast<BetaRowset*>(input.get());
+            // A rowset without segments, such as a version hole, contributes no rows, and in
+            // cloud mode its meta may carry no storage resource.
+            if (rowset->num_segments() == 0) {
+                continue;
+            }
             for (auto& candidate : candidates) {
                 if (!candidate.eligible) {
                     continue;
@@ -1772,6 +1777,8 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                 }
             }
             auto fs = rowset->rowset_meta()->fs();
+            TEST_SYNC_POINT_CALLBACK("Compaction::construct_variant_index_compaction_paths:fs",
+                                     rowset, &fs);
             if (!fs) {
                 abort_scan("no file system");
                 return false;
