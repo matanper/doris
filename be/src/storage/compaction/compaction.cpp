@@ -899,6 +899,7 @@ static std::string first_property_difference(const std::map<std::string, std::st
 // Keys that index_content_settings reads.
 static bool is_content_key(const std::string& key) {
     static const std::set<std::string> keys {INVERTED_INDEX_PARSER_KEY,
+                                             INVERTED_INDEX_PARSER_KEY_ALIAS,
                                              INVERTED_INDEX_PARSER_MODE_KEY,
                                              INVERTED_INDEX_PARSER_PHRASE_SUPPORT_KEY,
                                              INVERTED_INDEX_PARSER_LOWERCASE_KEY,
