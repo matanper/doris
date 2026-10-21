@@ -582,6 +582,27 @@ TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
                  }
              },
              2, 1, 0},
+            // idx_code has no parser: its lower_case changes neither the terms it writes nor
+            // the terms its reader looks up.
+            {"lower_case false without a parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20003) {
+                         (*index.mutable_properties())["lower_case"] = "false";
+                     }
+                 }
+             },
+             3, 0, 0},
+            // idx_msg has the english parser: lower_case decides its terms.
+            {"lower_case false with a parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["lower_case"] = "false";
+                     }
+                 }
+             },
+             2, 1, 0},
             {"only copies",
              [&](TabletSchemaPB& pb) {
                  reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {

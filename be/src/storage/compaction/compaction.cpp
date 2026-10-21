@@ -17,6 +17,7 @@
 
 #include "storage/compaction/compaction.h"
 #include "storage/index/index_writer.h"
+#include "storage/index/inverted/analyzer/analyzer.h"
 #include "storage/index/inverted/inverted_index_parser.h"
 
 #include <bvar/bvar.h>
@@ -855,18 +856,21 @@ static std::optional<std::map<std::string, std::string>> defined_index_propertie
 }
 
 // What of an index's properties decides the terms, positions and files it writes; defaults
-// stand for missing keys, so a missing key equals its default spelled out.
+// stand for missing keys, so a missing key equals its default spelled out. lower_case acts only
+// through an analyzer: an index without a parser or analyzer writes each value as one term, as
+// is, and its reader looks the query value up as is, so its lower_case is left out.
 static auto index_content_settings(const std::map<std::string, std::string>& properties) {
     const auto find = [&](const char* key) {
         auto it = properties.find(key);
         return it == properties.end() ? std::string() : it->second;
     };
+    const bool analyzed = inverted_index::InvertedIndexAnalyzer::should_analyzer(properties);
     return std::make_tuple(
             static_cast<int>(get_inverted_index_parser_type_from_string(
                     get_parser_string_from_properties(properties))),
             get_parser_mode_string_from_properties(properties),
             get_parser_phrase_support_string_from_properties(properties),
-            get_parser_lowercase_from_properties<true>(properties),
+            analyzed ? get_parser_lowercase_from_properties<true>(properties) : std::string(),
             get_parser_char_filter_map_from_properties(properties),
             get_parser_ignore_above_value_from_properties(properties),
             get_parser_stopwords_from_properties(properties),
