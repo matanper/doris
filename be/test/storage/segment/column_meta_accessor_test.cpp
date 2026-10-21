@@ -1003,6 +1003,22 @@ TEST(ColumnMetaAccessorTest, V3_LoadedMetaRegionServesEveryMetaFromOneRead) {
     EXPECT_EQ(exposed("segment_column_meta_region_bytes"), bytes_before);
     EXPECT_EQ(exposed("segment_column_meta_regions"), regions_before);
 
+    // Released, the region is freed and lookups read the file again, with the same metas.
+    {
+        auto counting = std::make_shared<CountingFileReader>(fr);
+        ColumnMetaAccessor accessor;
+        ASSERT_TRUE(accessor.init(loaded, counting).ok());
+        ASSERT_TRUE(accessor.load_meta_region(loaded, 1 << 30).ok());
+        ASSERT_EQ(exposed("segment_column_meta_regions") - regions_before, 1);
+        accessor.release_meta_region();
+        EXPECT_EQ(accessor.meta_region(), nullptr);
+        EXPECT_EQ(exposed("segment_column_meta_regions"), regions_before);
+        EXPECT_EQ(exposed("segment_column_meta_region_bytes"), bytes_before);
+        const size_t reads_before = counting->reads.size();
+        EXPECT_EQ(all_metas(accessor), expected_metas);
+        EXPECT_EQ(counting->reads.size() - reads_before, metas.size());
+    }
+
     auto counting = std::make_shared<CountingFileReader>(fr);
     ColumnMetaAccessor limited;
     ASSERT_TRUE(limited.init(loaded, counting).ok());

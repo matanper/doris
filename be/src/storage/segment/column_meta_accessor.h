@@ -31,6 +31,7 @@
 namespace doris::segment_v2 {
 
 struct ColumnMetaRegion;
+class ColumnMetaRegionHolder;
 
 // Centralized accessor for column metadata layout of a Segment.
 // It selects V2 (inline footer.columns) or V3 (external Column Meta Region)
@@ -111,6 +112,14 @@ public:
 
     // The region load_meta_region kept, or nullptr.
     std::shared_ptr<const ColumnMetaRegion> meta_region() const;
+
+    // What holds that region, for readers that read metas after the accessor; nullptr for the
+    // inline (V2) layout.
+    std::shared_ptr<ColumnMetaRegionHolder> meta_region_holder() const;
+
+    // Let the region go: later lookups read each meta from the file. Safe while other threads
+    // look metas up.
+    void release_meta_region();
 
 private:
     std::unique_ptr<Impl> _impl;
