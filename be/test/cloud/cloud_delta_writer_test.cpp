@@ -197,6 +197,24 @@ TEST_F(CloudDeltaWriterTest, UntouchedTabletCommitsWithoutRowsetWriter) {
     EXPECT_GT(tablet->last_load_time_ms, 0);
 }
 
+// With implicit version gaps an untouched tablet's version becomes part of a gap, so its version
+// count stays put: loads that write other tablets of the partition never push it to the limit.
+TEST_F(CloudDeltaWriterTest, UntouchedTabletWithImplicitGapsKeepsItsVersionCount) {
+    const bool saved_gaps = config::enable_implicit_version_gaps;
+    config::enable_implicit_version_gaps = true;
+    auto tablet = cache_tablet(20010);
+    {
+        auto writer = make_writer(20010);
+        ASSERT_TRUE(close_untouched_writer(writer.get()).ok());
+        EXPECT_TRUE(writer->committed_without_rowset_writer());
+    }
+    config::enable_implicit_version_gaps = saved_gaps;
+    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 0);
+    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_rowsets(0), 0);
+    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_deltas(0), 0);
+    EXPECT_EQ(tablet->write_count.load(), 1);
+}
+
 TEST_F(CloudDeltaWriterTest, UntouchedTabletWithoutMakeVisibleLeavesNoMarker) {
     config::enable_cloud_make_rs_visible_on_be = false;
     auto tablet = cache_tablet(20002);

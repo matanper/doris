@@ -139,6 +139,12 @@ CloudRowsetBuilder* CloudDeltaWriter::rowset_builder() {
 
 void CloudDeltaWriter::update_tablet_stats() {
     if (_empty_rowset_tablet != nullptr) {
+        if (_empty_rowset_tablet->can_use_implicit_version_gaps()) {
+            // The version becomes part of an implicit gap, not a rowset: it must not count toward
+            // the tablet's version limit or make it look due for compaction.
+            _empty_rowset_tablet->write_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         CloudRowsetBuilder::add_rowset_to_tablet_stats(_empty_rowset_tablet.get(), nullptr);
         return;
     }
@@ -165,8 +171,7 @@ Status CloudDeltaWriter::commit_rowset() {
 }
 
 Status CloudDeltaWriter::_commit_empty_rowset() {
-    if (config::skip_writing_empty_rowset_metadata &&
-        config::skip_rowset_writer_for_empty_tablet) {
+    if (config::skip_writing_empty_rowset_metadata && config::skip_rowset_writer_for_empty_tablet) {
         // With skip_writing_empty_rowset_metadata, an empty rowset leaves no trace in the meta
         // service: commit_txn bumps the partition version and the tablet's missing version is
         // filled with an empty rowset when the tablet syncs (or is made visible) on a BE. A rowset
