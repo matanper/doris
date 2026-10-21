@@ -74,6 +74,12 @@ public:
     Status index_file_exist(const TabletIndex* index_meta, bool* res) const;
     Status has_null(const TabletIndex* index_meta, bool* res) const;
     Result<InvertedIndexDirectoryMap> get_all_directories();
+    // Reads [offset, offset + length) of the index file of `index_meta` from its storage, not
+    // through the file cache.
+    Status read_range_from_storage(const TabletIndex* index_meta, int64_t offset, int64_t length,
+                                   std::string* out) const;
+    // Drops the file cache blocks of the index file of `index_meta`.
+    void evict_cached_index_file(const TabletIndex* index_meta) const;
     // open file v2, init _stream
     int64_t get_inverted_file_size() const { return _stream == nullptr ? 0 : _stream->length(); }
     const std::string& get_index_path_prefix() const { return _index_path_prefix; }
