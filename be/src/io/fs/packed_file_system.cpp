@@ -110,6 +110,20 @@ Status PackedFileSystem::create_file_impl(const Path& file, FileWriterPtr* write
     return Status::OK();
 }
 
+bool PackedFileSystem::find_slice_location(const Path& file, PackedSliceLocation* location,
+                                           const char** source) const {
+    if (auto it = _index_map.find(file.native()); it != _index_map.end()) {
+        *location = it->second;
+        *source = "rowset_meta";
+        return true;
+    }
+    if (PackedFileManager::instance()->get_packed_slice_location(file.native(), location).ok()) {
+        *source = "packed_file_manager";
+        return true;
+    }
+    return false;
+}
+
 Status PackedFileSystem::open_file_impl(const Path& file, FileReaderSPtr* reader,
                                         const FileReaderOptions* opts) {
     // Check if this file is in a packed file

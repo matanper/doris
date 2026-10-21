@@ -181,17 +181,23 @@ TEST_F(PackedFileReaderTest, ReadBeyondFileBoundary) {
     Slice result(buffer, sizeof(buffer));
     size_t bytes_read = 0;
 
-    // Try to read from beyond file size (offset 25, file_size is 20)
-    // When offset >= file_size, _file_size - offset becomes negative
-    // When cast to size_t, it becomes a very large number
-    // So max_read = min(result.get_size(), large_number) = result.get_size()
-    // actual_offset = merge_offset + offset = 10 + 25 = 35
-    // Content has 36 chars (indices 0-35), so inner reader can read 1 byte at offset 35
-    // The behavior is that it reads 1 byte from the merge file, even though it's beyond the small file size
+    // Offset 25 is past the end of the 20-byte slice; the bytes there belong to whatever follows
+    // the slice in the packed file.
     Status st = reader.read_at(25, result, &bytes_read, nullptr);
-    EXPECT_TRUE(st.ok());
-    // Should read at most the buffer size (implementation may read from merge file)
-    EXPECT_LE(bytes_read, result.get_size());
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_EQ(bytes_read, 0);
+    EXPECT_NE(st.to_string().find("past the end of packed slice"), std::string::npos) << st;
+}
+
+// Reading exactly at the end of the slice reads nothing, and is not an error.
+TEST_F(PackedFileReaderTest, ReadExactlyAtTheEndReadsNothing) {
+    Path file_path("test_file");
+    PackedFileReader reader(_inner_reader, file_path, _packed_file_offset, _file_size);
+    char buffer[10];
+    size_t bytes_read = 1;
+    Status st = reader.read_at(_file_size, Slice(buffer, sizeof(buffer)), &bytes_read, nullptr);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_EQ(bytes_read, 0);
 }
 
 TEST_F(PackedFileReaderTest, Close) {

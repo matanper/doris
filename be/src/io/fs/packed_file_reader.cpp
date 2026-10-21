@@ -47,11 +47,20 @@ Status PackedFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes
         return Status::InternalError("FileReader is already closed");
     }
 
+    // An offset past the end of the slice would otherwise read the bytes that follow it in the
+    // packed file, which belong to another file.
+    if (_file_size < 0 || offset > static_cast<size_t>(_file_size)) {
+        return Status::Corruption(
+                "read at offset {} past the end of packed slice {} (size {}, at offset {} of {})",
+                offset, _path.native(), _file_size, _packed_file_offset,
+                _inner_reader->path().native());
+    }
+
     // Calculate the actual offset in packed file
     size_t actual_offset = _packed_file_offset + offset;
 
     // Calculate the maximum bytes we can read
-    size_t max_read = std::min(result.get_size(), static_cast<size_t>(_file_size - offset));
+    size_t max_read = std::min(result.get_size(), static_cast<size_t>(_file_size) - offset);
 
     // Adjust result slice to the actual size we can read
     Slice adjusted_result(result.get_data(), max_read);

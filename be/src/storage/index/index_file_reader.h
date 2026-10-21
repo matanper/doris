@@ -33,6 +33,7 @@
 #include "common/be_mock_util.h"
 #include "common/config.h"
 #include "io/fs/file_system.h"
+#include "io/fs/packed_file_manager.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 
@@ -76,6 +77,18 @@ public:
     Result<InvertedIndexDirectoryMap> get_all_directories();
     // Reads [offset, offset + length) of the index file of `index_meta` from its storage, not
     // through the file cache.
+    // For an index file inside a packed file: the slice location reads use and where it came
+    // from, and the slice the packed file's own trailer records for this file (recorded_found is
+    // false when the trailer has no entry). NotFound when the index file is not packed.
+    Status packed_slice_locations(const TabletIndex* index_meta, io::PackedSliceLocation* used,
+                                  std::string* used_source, io::PackedSliceLocation* recorded,
+                                  bool* recorded_found) const;
+
+    // Read [offset, offset + length) of the index file from the packed file slice at `slice`,
+    // bypassing the file cache.
+    Status read_range_at_slice(const io::PackedSliceLocation& slice, int64_t offset, int64_t length,
+                               std::string* out) const;
+
     Status read_range_from_storage(const TabletIndex* index_meta, int64_t offset, int64_t length,
                                    std::string* out) const;
     // Drops the file cache blocks of the index file of `index_meta`.

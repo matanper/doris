@@ -243,6 +243,7 @@ Status InvertedIndexReader::read_null_bitmap(const IndexQueryContextPtr& context
 namespace {
 // Null bitmaps that did not parse, and the bytes read for them that differ from the storage's.
 bvar::Adder<uint64_t> g_index_null_bitmap_corrupt("index_null_bitmap_corrupt");
+bvar::Adder<uint64_t> g_index_packed_slice_mismatch("index_packed_slice_mismatch");
 bvar::Adder<uint64_t> g_index_bytes_cache_mismatch("index_bytes_cache_mismatch");
 } // namespace
 
@@ -281,10 +282,52 @@ Status InvertedIndexReader::_recover_corrupt_null_bitmap(lucene::store::Director
             return Status::OK();
         }
     }
+    // The storage read resolves the file through the same slice location as the failed read, so
+    // a wrong location reads the same wrong bytes. Check it against the slice the packed file's
+    // own trailer records for this file.
+    std::string slice_desc;
+    if (located) {
+        io::PackedSliceLocation used;
+        io::PackedSliceLocation recorded;
+        std::string used_source;
+        bool recorded_found = false;
+        Status slice_st = _index_file_reader->packed_slice_locations(
+                &_index_meta, &used, &used_source, &recorded, &recorded_found);
+        if (slice_st.ok()) {
+            const bool location_differs = recorded_found && (recorded.offset != used.offset ||
+                                                             recorded.size != used.size);
+            slice_desc = fmt::format(
+                    " packed_file={} used_slice=[{}, +{}) from {} trailer_slice={}",
+                    used.packed_file_path, used.offset, used.size, used_source,
+                    recorded_found ? fmt::format("[{}, +{})", recorded.offset, recorded.size)
+                                   : std::string("absent"));
+            if (location_differs) {
+                g_index_packed_slice_mismatch << 1;
+                std::string at_recorded;
+                if (_index_file_reader->read_range_at_slice(recorded, offset, length, &at_recorded)
+                            .ok()) {
+                    *parsed = read_native_roaring(at_recorded.data(), at_recorded.size());
+                    if (parsed->has_value()) {
+                        LOG(WARNING) << "inverted index null bitmap read from the wrong packed "
+                                        "slice, read it from the trailer's: index_id="
+                                     << _index_meta.index_id() << " file=" << path << slice_desc;
+                        _index_file_reader->evict_cached_index_file(&_index_meta);
+                        return Status::OK();
+                    }
+                }
+            }
+        } else if (!slice_st.is<ErrorCode::NOT_FOUND>()) {
+            slice_desc = " packed_slice_check=" + slice_st.to_string();
+        }
+        if (!slice_desc.empty()) {
+            LOG(WARNING) << "inverted index null bitmap packed slice: index_id="
+                         << _index_meta.index_id() << " file=" << path << slice_desc;
+        }
+    }
     return Status::Corruption(
             "inverted index null bitmap unreadable: index_id={} file={} offset={} length={} "
-            "first_bytes={}",
-            _index_meta.index_id(), path, offset, length, hex_prefix(bytes));
+            "first_bytes={}{}",
+            _index_meta.index_id(), path, offset, length, hex_prefix(bytes), slice_desc);
 }
 
 bool InvertedIndexReader::handle_query_cache(const IndexQueryContextPtr& context,
