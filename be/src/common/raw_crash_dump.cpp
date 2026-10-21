@@ -166,6 +166,16 @@ private:
     size_t _len = 0;
 };
 
+// A return address saved in a frame record, or in lr, can carry a pointer authentication code in
+// its top bits on aarch64; user addresses fit in 48 bits.
+uint64_t strip_pac(uint64_t address) {
+#if defined(__aarch64__)
+    return address & ((1ULL << 48) - 1);
+#else
+    return address;
+#endif
+}
+
 // Reads n bytes at addr without faulting on an unmapped address.
 bool read_memory(uintptr_t addr, void* out, size_t n) {
     struct iovec local {out, n};
@@ -189,7 +199,7 @@ Registers registers_of(const void* ucontext) {
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
 #if defined(__aarch64__)
     r.pc = uc->uc_mcontext.pc;
-    r.lr = uc->uc_mcontext.regs[30];
+    r.lr = strip_pac(uc->uc_mcontext.regs[30]);
     r.fp = uc->uc_mcontext.regs[29];
     r.sp = uc->uc_mcontext.sp;
 #elif defined(__x86_64__)
@@ -301,7 +311,7 @@ void dump_raw_crash_context(int fd, int signal_number, const siginfo_t* info,
             break;
         }
         Line line(fd);
-        line.str("  raw #").dec(static_cast<uint64_t>(depth) + 2).str(" ").addr(record[1]);
+        line.str("  raw #").dec(static_cast<uint64_t>(depth) + 2).str(" ").addr(strip_pac(record[1]));
         line.str(" (fp ").hex(fp).str(")\n");
         line.flush();
         if (record[0] <= fp) {
