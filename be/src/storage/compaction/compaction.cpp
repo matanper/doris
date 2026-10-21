@@ -17,6 +17,7 @@
 
 #include "storage/compaction/compaction.h"
 #include "storage/index/index_writer.h"
+#include "storage/index/inverted/inverted_index_parser.h"
 
 #include <bvar/bvar.h>
 #include <fmt/format.h>
@@ -802,6 +803,10 @@ bvar::Adder<uint64_t> g_variant_index_rebuild_missing_in_segment(
 bvar::Adder<uint64_t> g_variant_index_rebuild_incomplete_dir(
         "compaction_variant_index_rebuild_incomplete_dir");
 bvar::Adder<uint64_t> g_variant_index_scan_aborted("compaction_variant_index_scan_aborted");
+// An input rowset whose inverted index storage format differs from the output's: its segments'
+// index files cannot be read as the merge reads them.
+bvar::Adder<uint64_t> g_variant_index_rebuild_props_format_mismatch(
+        "compaction_variant_index_rebuild_props_format_mismatch");
 
 // The VARIANT subcolumn of `schema` whose full path is `path`, or nullptr.
 static const TabletColumn* find_extracted_column(const TabletSchema& schema,
@@ -816,6 +821,61 @@ static const TabletColumn* find_extracted_column(const TabletSchema& schema,
 }
 
 // Properties of the index `index_id` in `schema`, if it has one.
+// Properties of the index `index_id` as the schema defines it: the entry without an index suffix.
+// Schemas with VARIANT subcolumns also hold per-subcolumn copies of the parent's indexes under the
+// same id, some of them stripped of their parser, which do not describe the index.
+static std::optional<std::map<std::string, std::string>> defined_index_properties(
+        const TabletSchema& schema, int64_t index_id) {
+    for (const auto* index : schema.inverted_indexes()) {
+        if (index->index_id() == index_id && index->get_index_suffix().empty()) {
+            return index->properties();
+        }
+    }
+    return std::nullopt;
+}
+
+// What of an index's properties decides the terms, positions and files it writes; defaults
+// stand for missing keys, so a missing key equals its default spelled out.
+static auto index_content_settings(const std::map<std::string, std::string>& properties) {
+    const auto find = [&](const char* key) {
+        auto it = properties.find(key);
+        return it == properties.end() ? std::string() : it->second;
+    };
+    return std::make_tuple(
+            static_cast<int>(get_inverted_index_parser_type_from_string(
+                    get_parser_string_from_properties(properties))),
+            get_parser_mode_string_from_properties(properties),
+            get_parser_phrase_support_string_from_properties(properties),
+            get_parser_lowercase_from_properties<true>(properties),
+            get_parser_char_filter_map_from_properties(properties),
+            get_parser_ignore_above_value_from_properties(properties),
+            get_parser_stopwords_from_properties(properties),
+            get_parser_dict_compression_from_properties(properties),
+            get_analyzer_name_from_properties(properties), find("field_pattern"));
+}
+
+// The first key whose raw value differs, for the log of a rejected path.
+static std::string first_property_difference(const std::map<std::string, std::string>& expected,
+                                             const std::map<std::string, std::string>& actual) {
+    std::set<std::string> keys;
+    for (const auto& [key, value] : expected) {
+        keys.insert(key);
+    }
+    for (const auto& [key, value] : actual) {
+        keys.insert(key);
+    }
+    for (const auto& key : keys) {
+        auto e = expected.find(key);
+        auto a = actual.find(key);
+        const std::string ev = e == expected.end() ? "<missing>" : e->second;
+        const std::string av = a == actual.end() ? "<missing>" : a->second;
+        if (ev != av) {
+            return fmt::format("{}: expected={} actual={}", key, ev, av);
+        }
+    }
+    return "none";
+}
+
 static std::optional<std::map<std::string, std::string>> index_properties(
         const TabletSchema& schema, int64_t index_id) {
     for (const auto* index : schema.inverted_indexes()) {
@@ -1432,7 +1492,14 @@ static bool check_rowset_has_inverted_index(const RowsetSharedPtr& src_rs, int32
 // Typed paths are materialized in every segment while variant_enable_typed_paths_to_sparse is
 // off, so their index files exist wherever the column was written with these indexes.
 void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& ctx) {
-    enum class Reject { NONE, SKIP_MARKED, PROPS_MISMATCH, MISSING_IN_SEGMENT, INCOMPLETE_DIR };
+    enum class Reject {
+        NONE,
+        SKIP_MARKED,
+        PROPS_MISMATCH,
+        MISSING_IN_SEGMENT,
+        INCOMPLETE_DIR,
+        FORMAT_MISMATCH
+    };
     struct Candidate {
         const TabletColumn* column;
         std::vector<const TabletIndex*> indexes;
@@ -1462,8 +1529,9 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
     auto reject = [this](Candidate& candidate, Reject reason) {
         candidate.eligible = false;
         candidate.reject = reason;
-        static constexpr const char* kNames[] = {"none", "skip_marked", "props_mismatch",
-                                                 "missing_in_segment", "incomplete_dir"};
+        static constexpr const char* kNames[] = {"none",           "skip_marked",
+                                                 "props_mismatch", "missing_in_segment",
+                                                 "incomplete_dir", "props_format_mismatch"};
         LOG_EVERY_N(INFO, 1000) << "tablet " << _tablet->tablet_id() << " rebuilds VARIANT path "
                                 << candidate.column->path_info_ptr()->get_path()
                                 << " index: " << kNames[static_cast<int>(reason)];
@@ -1507,10 +1575,33 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                     reject(candidate, Reject::SKIP_MARKED);
                     continue;
                 }
+                if (rowset->tablet_schema()->get_inverted_index_storage_format() !=
+                    _cur_tablet_schema->get_inverted_index_storage_format()) {
+                    reject(candidate, Reject::FORMAT_MISMATCH);
+                    continue;
+                }
                 for (const auto* index : candidate.indexes) {
-                    const auto expected = index_properties(*_cur_tablet_schema, index->index_id());
-                    const auto actual = index_properties(*rowset->tablet_schema(), index->index_id());
-                    if (!actual.has_value() || actual != expected) {
+                    const auto expected =
+                            defined_index_properties(*_cur_tablet_schema, index->index_id());
+                    const auto actual =
+                            defined_index_properties(*rowset->tablet_schema(), index->index_id());
+                    if (!expected.has_value() || !actual.has_value() ||
+                        index_content_settings(*expected) != index_content_settings(*actual)) {
+                        const auto raw_expected =
+                                index_properties(*_cur_tablet_schema, index->index_id());
+                        const auto raw_actual =
+                                index_properties(*rowset->tablet_schema(), index->index_id());
+                        LOG_EVERY_N(INFO, 100)
+                                << "tablet " << _tablet->tablet_id() << " VARIANT path "
+                                << candidate.column->path_info_ptr()->get_path() << " index "
+                                << index->index_id() << " differs in rowset "
+                                << rowset->rowset_id() << ": defined expected="
+                                << expected.has_value() << " actual=" << actual.has_value()
+                                << ", first raw difference "
+                                << (raw_expected && raw_actual
+                                            ? first_property_difference(*raw_expected,
+                                                                        *raw_actual)
+                                            : std::string("index missing"));
                         reject(candidate, Reject::PROPS_MISMATCH);
                         break;
                     }
@@ -1612,6 +1703,9 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                 break;
             case Reject::INCOMPLETE_DIR:
                 g_variant_index_rebuild_incomplete_dir << 1;
+                break;
+            case Reject::FORMAT_MISMATCH:
+                g_variant_index_rebuild_props_format_mismatch << 1;
                 break;
             case Reject::NONE:
                 break;

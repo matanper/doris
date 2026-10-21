@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <random>
 #include <set>
@@ -401,6 +402,114 @@ TEST_F(VariantTypedPathIndexMergeTest, MergeHandlesAbsentAllNullAndSparseV2Paths
         }
     }
     EXPECT_GE(compared, 6);
+}
+
+// Index properties are compared as the schema defines the index, by what decides its content:
+// per-subcolumn copies of an index are ignored, defaults equal missing keys, and a real
+// difference or an index known only through copies rebuilds. (A rowset in another index storage
+// format cannot be read by a compaction at all, so its rejection is not exercised here.)
+TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
+    struct Case {
+        const char* name;
+        std::function<void(TabletSchemaPB&)> patch;
+        int64_t merged;
+        int64_t props_mismatch;
+        int64_t format_mismatch;
+    };
+    auto reorder = [](TabletSchemaPB& pb, const std::function<void(std::vector<TabletIndexPB>&)>& fn) {
+        std::vector<TabletIndexPB> indexes(pb.index().begin(), pb.index().end());
+        fn(indexes);
+        pb.clear_index();
+        for (auto& index : indexes) {
+            *pb.add_index() = index;
+        }
+    };
+    auto stripped_copy = [](const TabletIndexPB& index) {
+        TabletIndexPB copy = index;
+        copy.set_index_suffix_name("v%2Eother");
+        copy.mutable_properties()->erase("parser");
+        copy.mutable_properties()->erase("support_phrase");
+        return copy;
+    };
+    const std::vector<Case> cases {
+            {"stripped copy listed first",
+             [&](TabletSchemaPB& pb) {
+                 reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {
+                     for (const auto& index : std::vector<TabletIndexPB>(indexes)) {
+                         if (index.index_id() == 20001) {
+                             indexes.insert(indexes.begin(), stripped_copy(index));
+                         }
+                     }
+                 });
+             },
+             3, 0, 0},
+            {"explicit default",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["lower_case"] = "true";
+                     }
+                 }
+             },
+             3, 0, 0},
+            {"different parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["parser"] = "unicode";
+                     }
+                 }
+             },
+             2, 1, 0},
+            {"only copies",
+             [&](TabletSchemaPB& pb) {
+                 reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {
+                     for (auto& index : indexes) {
+                         if (index.index_id() == 20001) {
+                             index.set_index_suffix_name("v%2Eother");
+                         }
+                     }
+                 });
+             },
+             2, 1, 0},
+    };
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    Defer restore {[&]() { config::enable_variant_typed_path_index_compaction = old_flag; }};
+    int64_t tablet_id = 130100;
+    for (const auto& c : cases) {
+        ASSERT_TRUE(create_tablet(options(++tablet_id)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            auto written = write_rowset(rowset(version));
+            ASSERT_TRUE(written.has_value()) << written.error();
+            rowsets.push_back(written.value());
+        }
+        // The last input carries the patched schema; the output follows the first one.
+        TabletSchemaPB pb;
+        rowsets[2]->tablet_schema()->to_schema_pb(&pb);
+        c.patch(pb);
+        auto patched = std::make_shared<TabletSchema>();
+        patched->init_from_pb(pb);
+        rowsets[2]->rowset_meta()->set_tablet_schema(patched);
+        rowsets[2]->_schema = patched;
+
+        const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+        const int64_t props_before = exposed("compaction_variant_index_rebuild_props_mismatch");
+        const int64_t format_before =
+                exposed("compaction_variant_index_rebuild_props_format_mismatch");
+        auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+        ASSERT_TRUE(compacted.has_value()) << c.name << ": " << compacted.error();
+        EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, c.merged)
+                << c.name;
+        EXPECT_EQ(exposed("compaction_variant_index_rebuild_props_mismatch") - props_before,
+                  c.props_mismatch)
+                << c.name;
+        EXPECT_EQ(exposed("compaction_variant_index_rebuild_props_format_mismatch") -
+                          format_before,
+                  c.format_mismatch)
+                << c.name;
+    }
 }
 
 // Typed paths shaped like melian.logs fields, one index per run.
