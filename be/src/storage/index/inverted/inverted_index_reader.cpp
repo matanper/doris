@@ -243,6 +243,7 @@ Status InvertedIndexReader::read_null_bitmap(const IndexQueryContextPtr& context
 namespace {
 // Null bitmaps that did not parse, and the bytes read for them that differ from the storage's.
 bvar::Adder<uint64_t> g_index_null_bitmap_corrupt("index_null_bitmap_corrupt");
+bvar::Adder<uint64_t> g_index_bytes_peer_mismatch("index_bytes_peer_mismatch");
 bvar::Adder<uint64_t> g_index_packed_slice_mismatch("index_packed_slice_mismatch");
 bvar::Adder<uint64_t> g_index_bytes_cache_mismatch("index_bytes_cache_mismatch");
 } // namespace
@@ -262,12 +263,20 @@ Status InvertedIndexReader::_recover_corrupt_null_bitmap(lucene::store::Director
                                                                               length, &from_storage)
                                 : Status::NotSupported("entry not located in the index file");
     const bool differs = storage_st.ok() && from_storage != bytes;
+    bool any_peer = false;
+    const std::string cache_blocks = located ? _index_file_reader->describe_cached_blocks(
+                                                       &_index_meta, offset, length, &any_peer)
+                                             : std::string("entry not located");
     if (differs) {
         g_index_bytes_cache_mismatch << 1;
+        if (any_peer) {
+            g_index_bytes_peer_mismatch << 1;
+        }
     }
     LOG(WARNING) << "inverted index null bitmap unreadable: index_id=" << _index_meta.index_id()
                  << " file=" << path << " offset=" << offset << " length=" << length
                  << " read_bytes=" << bytes.size() << " first_bytes=" << hex_prefix(bytes)
+                 << " cache_blocks={" << cache_blocks << "}"
                  << " storage_read=" << storage_st.to_string()
                  << (storage_st.ok()
                              ? (differs ? " storage_bytes_differ=true first_storage_bytes=" +

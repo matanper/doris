@@ -89,6 +89,11 @@ public:
     Status read_range_at_slice(const io::PackedSliceLocation& slice, int64_t offset, int64_t length,
                                std::string* out) const;
 
+    // The file cache blocks holding [offset, offset + length) of the index file, with their
+    // states and where each one's bytes came from. any_peer is set when one came from a peer.
+    std::string describe_cached_blocks(const TabletIndex* index_meta, int64_t offset,
+                                       int64_t length, bool* any_peer) const;
+
     Status read_range_from_storage(const TabletIndex* index_meta, int64_t offset, int64_t length,
                                    std::string* out) const;
     // Drops the file cache blocks of the index file of `index_meta`.
