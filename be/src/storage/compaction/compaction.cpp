@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <roaring/roaring.hh>
 #include <list>
 #include <map>
 #include <optional>
@@ -825,6 +826,49 @@ static std::optional<std::map<std::string, std::string>> index_properties(
     return std::nullopt;
 }
 
+// Marks as null, in every destination index, the documents that come from source segments
+// without the index. A typed VARIANT path that never appeared in a segment is NULL for all of
+// its rows in the output, as a rebuild of the index would record them.
+static void add_absent_source_nulls(
+        const std::vector<lucene::store::Directory*>& dest_dirs,
+        const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& trans_vec,
+        const std::vector<size_t>& absent_sources) {
+    std::vector<roaring::Roaring> nulls(dest_dirs.size());
+    for (size_t src : absent_sources) {
+        for (const auto& [dest, doc] : trans_vec[src]) {
+            if (dest != UINT32_MAX && doc != UINT32_MAX && dest < nulls.size()) {
+                nulls[dest].add(doc);
+            }
+        }
+    }
+    const char* name = lucene::index::IndexWriter::NULL_BITMAP_FILE_NAME;
+    for (size_t dest = 0; dest < dest_dirs.size(); ++dest) {
+        if (nulls[dest].isEmpty()) {
+            continue;
+        }
+        auto* dir = dest_dirs[dest];
+        if (dir->fileExists(name)) {
+            std::unique_ptr<lucene::store::IndexInput> in(dir->openInput(name));
+            std::string buf(static_cast<size_t>(in->length()), '\0');
+            if (!buf.empty()) {
+                in->readBytes(reinterpret_cast<uint8_t*>(buf.data()),
+                              static_cast<int32_t>(buf.size()));
+                nulls[dest] |= roaring::Roaring::read(buf.data(), false);
+            }
+            in->close();
+            in.reset();
+            dir->deleteFile(name);
+        }
+        nulls[dest].runOptimize();
+        std::string buf(nulls[dest].getSizeInBytes(false), '\0');
+        nulls[dest].write(buf.data(), false);
+        std::unique_ptr<lucene::store::IndexOutput> out(dir->createOutput(name));
+        out->writeBytes(reinterpret_cast<const uint8_t*>(buf.data()),
+                        static_cast<int32_t>(buf.size()));
+        out->close();
+    }
+}
+
 Status Compaction::do_inverted_index_compaction() {
     const auto& ctx = _output_rs_writer->context();
     if (!_enable_inverted_index_compaction || _input_row_num <= 0 ||
@@ -1079,17 +1123,27 @@ Status Compaction::do_inverted_index_compaction() {
 
     // Merges one index of every source segment into the destination segments. On failure the
     // column is marked to skip index compaction next time and this compaction fails.
-    auto compact_index = [&](const TabletIndex* index_meta, int64_t column_uniq_id) -> Status {
+    // `allow_absent_sources`: a source segment without the index contributes no postings and
+    // makes its rows null, rather than failing the merge (typed VARIANT paths only, after
+    // construct_variant_index_compaction_paths checked such segments never had the path).
+    auto compact_index = [&](const TabletIndex* index_meta, int64_t column_uniq_id,
+                             bool allow_absent_sources = false) -> Status {
         std::vector<lucene::store::Directory*> dest_index_dirs(dest_segment_num);
         try {
             std::vector<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>> src_idx_dirs(
                     src_segment_num);
+            std::vector<size_t> absent_sources;
             for (int src_segment_id = 0; src_segment_id < src_segment_num; src_segment_id++) {
                 auto res = index_file_readers[src_segment_id]->open(index_meta);
                 DBUG_EXECUTE_IF("Compaction::open_inverted_index_file_reader", {
                     res = ResultError(Status::Error<ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(
                             "debug point: Compaction::open_index_file_reader error"));
                 })
+                if (!res.has_value() && allow_absent_sources &&
+                    res.error().is<ErrorCode::INVERTED_INDEX_FILE_NOT_FOUND>()) {
+                    absent_sources.push_back(src_segment_id);
+                    continue;
+                }
                 if (!res.has_value()) {
                     LOG(WARNING) << "failed to do index compaction, open inverted index file "
                                     "reader failed"
@@ -1118,8 +1172,31 @@ Status Compaction::do_inverted_index_compaction() {
                 // but their lifecycle must be managed by inverted_index_file_writers.
                 dest_index_dirs[dest_segment_id] = res.value().get();
             }
-            auto st = compact_column(index_meta->index_id(), src_idx_dirs, dest_index_dirs,
-                                     index_tmp_path.native(), trans_vec, dest_segment_num_rows);
+            Status st;
+            if (absent_sources.empty()) {
+                st = compact_column(index_meta->index_id(), src_idx_dirs, dest_index_dirs,
+                                    index_tmp_path.native(), trans_vec, dest_segment_num_rows);
+            } else {
+                if (absent_sources.size() == src_idx_dirs.size()) {
+                    throw Exception(ErrorCode::INVERTED_INDEX_COMPACTION_ERROR,
+                                    "no source segment has the index");
+                }
+                // Merge the segments that have the index, each with its own row mapping.
+                std::vector<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>> present_dirs;
+                std::vector<std::vector<std::pair<uint32_t, uint32_t>>> present_trans_vec;
+                for (size_t src = 0; src < src_idx_dirs.size(); ++src) {
+                    if (src_idx_dirs[src] != nullptr) {
+                        present_dirs.push_back(std::move(src_idx_dirs[src]));
+                        present_trans_vec.push_back(trans_vec[src]);
+                    }
+                }
+                st = compact_column(index_meta->index_id(), present_dirs, dest_index_dirs,
+                                    index_tmp_path.native(), present_trans_vec,
+                                    dest_segment_num_rows);
+                if (st.ok()) {
+                    add_absent_source_nulls(dest_index_dirs, trans_vec, absent_sources);
+                }
+            }
             if (!st.ok()) {
                 error_handler(index_meta->index_id(), column_uniq_id);
                 return Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(st.msg());
@@ -1172,7 +1249,7 @@ Status Compaction::do_inverted_index_compaction() {
             break;
         }
         for (const auto& index_meta : _cur_tablet_schema->inverted_indexs(*column)) {
-            if (auto st = compact_index(index_meta, column->parent_unique_id()); !st.ok()) {
+            if (auto st = compact_index(index_meta, column->parent_unique_id(), true); !st.ok()) {
                 status = st;
             }
         }
@@ -1353,6 +1430,8 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
         std::vector<const TabletIndex*> indexes;
         bool eligible = true;
         Reject reject = Reject::NONE;
+        // Input segments that have the path's indexes.
+        size_t present_segments = 0;
     };
     std::vector<Candidate> candidates;
     for (const auto& column : _cur_tablet_schema->columns()) {
@@ -1380,6 +1459,27 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
         LOG_EVERY_N(INFO, 1000) << "tablet " << _tablet->tablet_id() << " rebuilds VARIANT path "
                                 << candidate.column->path_info_ptr()->get_path()
                                 << " index: " << kNames[static_cast<int>(reason)];
+    };
+    // An input segment without a typed path's index never saw the path only when its VARIANT
+    // writes every typed path present in a segment as a typed subcolumn: not in doc mode, which
+    // keeps paths of small segments in doc buckets, and not with typed paths sent to sparse
+    // columns; and when the input's schema has the path typed, so the output's shredding of the
+    // same rows does not move them into the typed column either.
+    auto path_never_written_in_absent_segments = [](BetaRowset& rowset,
+                                                    const Candidate& candidate) {
+        const auto& schema = *rowset.tablet_schema();
+        const int32_t parent_uid = candidate.column->parent_unique_id();
+        if (schema.field_index(parent_uid) < 0) {
+            return false;
+        }
+        const auto& parent = schema.column_by_uid(parent_uid);
+        if (parent.variant_enable_doc_mode() || parent.variant_enable_typed_paths_to_sparse()) {
+            return false;
+        }
+        TabletSchema::SubColumnInfo info;
+        const std::string relative = candidate.column->path_info_ptr()->copy_pop_front().get_path();
+        return variant_util::generate_sub_column_info(schema, parent_uid, relative, &info) &&
+               info.column.type() == candidate.column->type();
     };
     auto abort_scan = [this](const char* why) {
         g_variant_index_scan_aborted << 1;
@@ -1439,9 +1539,17 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                         if (!candidate.eligible) {
                             continue;
                         }
+                        bool absent = false;
                         for (const auto* index : candidate.indexes) {
                             auto dir = reader.open(index);
-                            if (!dir.has_value()) {
+                            if (!dir.has_value() &&
+                                dir.error().is<ErrorCode::INVERTED_INDEX_FILE_NOT_FOUND>() &&
+                                path_never_written_in_absent_segments(*rowset, candidate)) {
+                                // The segment never had the path: it contributes null rows only.
+                                absent = true;
+                                continue;
+                            }
+                            if (!dir.has_value() || absent) {
                                 reject(candidate, Reject::MISSING_IN_SEGMENT);
                                 break;
                             }
@@ -1453,6 +1561,9 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
                                 reject(candidate, Reject::INCOMPLETE_DIR);
                                 break;
                             }
+                        }
+                        if (candidate.eligible && !absent) {
+                            ++candidate.present_segments;
                         }
                     }
                 } catch (CLuceneError& err) {
@@ -1468,6 +1579,11 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
     };
     if (!scan_inputs()) {
         return;
+    }
+    for (auto& candidate : candidates) {
+        if (candidate.eligible && candidate.present_segments == 0) {
+            reject(candidate, Reject::MISSING_IN_SEGMENT);
+        }
     }
     for (const auto& candidate : candidates) {
         if (candidate.eligible) {
