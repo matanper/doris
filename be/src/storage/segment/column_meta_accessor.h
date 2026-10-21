@@ -30,6 +30,8 @@
 
 namespace doris::segment_v2 {
 
+struct ColumnMetaRegion;
+
 // Centralized accessor for column metadata layout of a Segment.
 // It selects V2 (inline footer.columns) or V3 (external Column Meta Region)
 // implementation internally and exposes a unified API to callers, hiding
@@ -98,6 +100,17 @@ public:
                                     const std::function<void(const ColumnMetaPB&)>& visitor,
                                     OlapReaderStatistics* stats = nullptr,
                                     const io::IOContext* source_io_ctx = nullptr) const;
+
+    // Read the whole external Column Meta Region (V3) with one read and keep it, so that the
+    // later meta lookups of this accessor, and of the VARIANT readers given meta_region(), parse
+    // from memory instead of reading the file. Does nothing for the inline (V2) layout, or when
+    // the region is larger than max_bytes. Not thread-safe: call it before the accessor is shared.
+    Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
+                            OlapReaderStatistics* stats = nullptr,
+                            const io::IOContext* source_io_ctx = nullptr);
+
+    // The region load_meta_region kept, or nullptr.
+    std::shared_ptr<const ColumnMetaRegion> meta_region() const;
 
 private:
     std::unique_ptr<Impl> _impl;

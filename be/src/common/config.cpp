@@ -449,6 +449,7 @@ DEFINE_mBool(enable_low_cardinality_optimize, "true");
 DEFINE_Bool(enable_low_cardinality_cache_code, "true");
 
 DEFINE_mBool(enable_adaptive_batch_size, "true");
+DEFINE_mInt64(segment_column_meta_region_buffer_max_bytes, "2097152");
 
 // be policy
 // whether check compaction checksum
