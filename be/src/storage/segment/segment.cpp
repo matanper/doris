@@ -75,6 +75,7 @@
 #include "storage/segment/column_reader.h"
 #include "storage/segment/column_reader_cache.h"
 #include "storage/segment/empty_segment_iterator.h"
+#include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/page_io.h"
 #include "storage/segment/page_pointer.h"
 #include "storage/segment/segment_iterator.h"
@@ -822,7 +823,13 @@ Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
         // counts here.
         const int64_t allocated_before = thread_net_allocated_bytes();
         Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-        _column_meta_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
+        // The allocation delta misses what a thread without heap accounting allocates, so the
+        // column meta region, the bulk of it, is charged by its own size at least.
+        const auto region =
+                _column_meta_accessor != nullptr ? _column_meta_accessor->meta_region() : nullptr;
+        const int64_t region_bytes = region != nullptr ? region->charged_bytes : 0;
+        _column_meta_bytes = std::max<int64_t>(
+                {0, thread_net_allocated_bytes() - allocated_before, region_bytes});
         return st;
     });
 }
