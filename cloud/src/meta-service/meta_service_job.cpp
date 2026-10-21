@@ -1297,18 +1297,20 @@ void process_compaction_job(MetaServiceCode& code, std::string& msg, std::string
                                << " key=" << hex(recycle_key);
         }
     };
+    // The rowset metas in the input range are read before any of them is handled, so that a range
+    // holding a rowset the job did not declare is rejected before anything is written.
+    std::vector<doris::RowsetMetaCloudPB> range_rowset_metas;
     if (!is_versioned_read) {
-        std::tie(code, msg) =
-                scan_compaction_input_rowsets(txn.get(), instance_id, tablet_id, rs_start, rs_end,
-                                              num_rowsets, handle_compaction_input_rowset_meta);
+        std::tie(code, msg) = scan_compaction_input_rowsets(
+                txn.get(), instance_id, tablet_id, rs_start, rs_end, num_rowsets,
+                [&](doris::RowsetMetaCloudPB rs) { range_rowset_metas.push_back(std::move(rs)); });
         if (code != MetaServiceCode::OK) {
             LOG(WARNING) << msg;
             return;
         }
     } else {
-        std::vector<RowsetMetaCloudPB> rowset_metas;
         TxnErrorCode err =
-                meta_reader.get_rowset_metas(txn.get(), tablet_id, start, end, &rowset_metas);
+                meta_reader.get_rowset_metas(txn.get(), tablet_id, start, end, &range_rowset_metas);
         if (err != TxnErrorCode::TXN_OK) {
             code = cast_as<ErrCategory::READ>(err);
             msg = fmt::format("failed to get rowset metas, tablet_id={}, start={}, end={}, err={}",
@@ -1316,10 +1318,26 @@ void process_compaction_job(MetaServiceCode& code, std::string& msg, std::string
             LOG(WARNING) << msg;
             return;
         }
-        num_rowsets = rowset_metas.size();
-        for (auto&& rowset_meta : rowset_metas) {
-            handle_compaction_input_rowset_meta(std::move(rowset_meta));
-        }
+        num_rowsets = range_rowset_metas.size();
+    }
+
+    // The job declares its inputs without hole rowsets, which have no meta key; the range holds
+    // only formal rowset meta keys of the tablet. More keys than inputs means a rowset the
+    // compaction never read, which removing the range would delete.
+    if (config::enable_compaction_commit_range_check &&
+        num_rowsets > compaction.num_input_rowsets()) {
+        g_bvar_compaction_commit_range_mismatch << 1;
+        SS << "compaction input range holds more rowsets than the job declares, tablet_id="
+           << tablet_id << " range=[" << start << "-" << end
+           << "] declared_input_rowsets=" << compaction.num_input_rowsets()
+           << " found_rowset_keys=" << num_rowsets << " job_id=" << compaction.id();
+        code = MetaServiceCode::UNDEFINED_ERR;
+        msg = ss.str();
+        LOG(WARNING) << msg;
+        return;
+    }
+    for (auto&& rowset_meta : range_rowset_metas) {
+        handle_compaction_input_rowset_meta(std::move(rowset_meta));
     }
 
     txn->remove(rs_start, rs_end);

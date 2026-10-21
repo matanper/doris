@@ -731,6 +731,8 @@ extern bvar::Adder<int64_t> g_bvar_delete_bitmap_lock_txn_remove_conflict_by_fai
 extern bvar::Adder<int64_t> g_bvar_delete_bitmap_lock_txn_remove_conflict_by_load_counter;
 extern bvar::Adder<int64_t>
         g_bvar_delete_bitmap_lock_txn_remove_conflict_by_compaction_commit_counter;
+// Compaction commits rejected because their input range holds undeclared rowsets.
+extern bvar::Adder<int64_t> g_bvar_compaction_commit_range_mismatch;
 extern bvar::Adder<int64_t>
         g_bvar_delete_bitmap_lock_txn_remove_conflict_by_compaction_lease_counter;
 extern bvar::Adder<int64_t>
