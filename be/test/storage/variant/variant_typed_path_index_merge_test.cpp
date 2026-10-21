@@ -33,6 +33,7 @@
 #include "runtime/exec_env.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_reader.h"
+#include "storage/rowset/beta_rowset.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/variant/index_storage_variant_test_base.h"
 
@@ -253,10 +254,14 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnes) {
 
     config::enable_variant_typed_path_index_compaction = true;
     const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    const int64_t aborted_before = exposed("compaction_variant_index_scan_aborted");
     auto merged = write_and_compact(130002);
     config::enable_variant_typed_path_index_compaction = old_flag;
     ASSERT_NE(merged, nullptr);
     EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 0);
+    EXPECT_EQ(exposed("compaction_variant_index_scan_aborted") - aborted_before, 0);
     EXPECT_EQ(merged->num_rows(), rebuilt->num_rows());
 
     std::shared_ptr<IndexFileReader> rebuilt_reader;
@@ -388,6 +393,30 @@ protected:
         return compacted.has_value() ? compacted.value() : nullptr;
     }
 };
+
+// An input rowset marked to skip index compaction of the VARIANT makes every typed path rebuild,
+// counted under its reason.
+TEST_F(VariantTypedPathIndexMergeTest, RejectedPathsAreCountedByReason) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    ASSERT_TRUE(create_tablet(options(130003)).ok());
+    std::vector<RowsetSharedPtr> rowsets;
+    for (int64_t version = 0; version < 3; ++version) {
+        auto written = write_rowset(rowset(version));
+        ASSERT_TRUE(written.has_value()) << written.error();
+        rowsets.push_back(written.value());
+    }
+    static_cast<BetaRowset*>(rowsets[1].get())->set_skip_index_compaction(kVariantUid);
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    const int64_t skip_before = exposed("compaction_variant_index_rebuild_skip_marked");
+    auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+    config::enable_variant_typed_path_index_compaction = old_flag;
+    ASSERT_TRUE(compacted.has_value()) << compacted.error();
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 0);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_skip_marked") - skip_before, 3);
+}
 
 // Compaction CPU with each index kind merged and rebuilt. Runs only when
 // VARIANT_INDEX_MERGE_BENCH_ROWS gives the rows per input rowset.

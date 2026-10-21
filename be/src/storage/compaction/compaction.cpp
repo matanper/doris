@@ -788,6 +788,19 @@ Status CompactionMixin::execute_compact_impl(int64_t permits) {
 // input lacked them, with enable_variant_typed_path_index_compaction.
 bvar::Adder<uint64_t> g_variant_index_merge_paths("compaction_variant_index_merge_paths");
 bvar::Adder<uint64_t> g_variant_index_rebuild_paths("compaction_variant_index_rebuild_paths");
+// Why a typed subcolumn was rebuilt rather than merged: an input rowset marked to skip index
+// compaction of the VARIANT, an input schema whose index differs or is missing, an input
+// segment without the index, an index without its base files; and scans of the inputs that
+// stopped on an error, which leave every candidate of that compaction to be rebuilt.
+bvar::Adder<uint64_t> g_variant_index_rebuild_skip_marked(
+        "compaction_variant_index_rebuild_skip_marked");
+bvar::Adder<uint64_t> g_variant_index_rebuild_props_mismatch(
+        "compaction_variant_index_rebuild_props_mismatch");
+bvar::Adder<uint64_t> g_variant_index_rebuild_missing_in_segment(
+        "compaction_variant_index_rebuild_missing_in_segment");
+bvar::Adder<uint64_t> g_variant_index_rebuild_incomplete_dir(
+        "compaction_variant_index_rebuild_incomplete_dir");
+bvar::Adder<uint64_t> g_variant_index_scan_aborted("compaction_variant_index_scan_aborted");
 
 // The VARIANT subcolumn of `schema` whose full path is `path`, or nullptr.
 static const TabletColumn* find_extracted_column(const TabletSchema& schema,
@@ -1334,10 +1347,12 @@ static bool check_rowset_has_inverted_index(const RowsetSharedPtr& src_rs, int32
 // Typed paths are materialized in every segment while variant_enable_typed_paths_to_sparse is
 // off, so their index files exist wherever the column was written with these indexes.
 void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& ctx) {
+    enum class Reject { NONE, SKIP_MARKED, PROPS_MISMATCH, MISSING_IN_SEGMENT, INCOMPLETE_DIR };
     struct Candidate {
         const TabletColumn* column;
         std::vector<const TabletIndex*> indexes;
         bool eligible = true;
+        Reject reject = Reject::NONE;
     };
     std::vector<Candidate> candidates;
     for (const auto& column : _cur_tablet_schema->columns()) {
@@ -1357,77 +1372,102 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
     if (candidates.empty()) {
         return;
     }
+    auto reject = [this](Candidate& candidate, Reject reason) {
+        candidate.eligible = false;
+        candidate.reject = reason;
+        static constexpr const char* kNames[] = {"none", "skip_marked", "props_mismatch",
+                                                 "missing_in_segment", "incomplete_dir"};
+        LOG_EVERY_N(INFO, 1000) << "tablet " << _tablet->tablet_id() << " rebuilds VARIANT path "
+                                << candidate.column->path_info_ptr()->get_path()
+                                << " index: " << kNames[static_cast<int>(reason)];
+    };
+    auto abort_scan = [this](const char* why) {
+        g_variant_index_scan_aborted << 1;
+        LOG_EVERY_N(INFO, 100) << "tablet " << _tablet->tablet_id()
+                               << " rebuilds every VARIANT path index of this compaction: " << why;
+    };
 
-    for (const auto& input : _input_rowsets) {
-        auto* rowset = static_cast<BetaRowset*>(input.get());
-        for (auto& candidate : candidates) {
-            if (!candidate.eligible) {
-                continue;
-            }
-            if (rowset->is_skip_index_compaction(candidate.column->parent_unique_id())) {
-                candidate.eligible = false;
-                continue;
-            }
-            for (const auto* index : candidate.indexes) {
-                const auto expected = index_properties(*_cur_tablet_schema, index->index_id());
-                const auto actual = index_properties(*rowset->tablet_schema(), index->index_id());
-                if (!actual.has_value() || actual != expected) {
-                    candidate.eligible = false;
-                    break;
+    // Returns false when the scan stopped on an error: then no path of this compaction is merged.
+    auto scan_inputs = [&]() -> bool {
+        for (const auto& input : _input_rowsets) {
+            auto* rowset = static_cast<BetaRowset*>(input.get());
+            for (auto& candidate : candidates) {
+                if (!candidate.eligible) {
+                    continue;
                 }
-            }
-        }
-        auto fs = rowset->rowset_meta()->fs();
-        if (!fs) {
-            return;
-        }
-        for (int i = 0; i < rowset->num_segments(); ++i) {
-            if (std::none_of(candidates.begin(), candidates.end(),
-                             [](const Candidate& c) { return c.eligible; })) {
-                return;
-            }
-            auto seg_path = rowset->segment_path(i);
-            if (!seg_path) {
-                return;
-            }
-            try {
-                IndexFileReader reader(
-                        fs,
-                        std::string {
-                                InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value())},
-                        _cur_tablet_schema->get_inverted_index_storage_format(),
-                        rowset->rowset_meta()->inverted_index_file_info(i),
-                        _tablet->tablet_id());
-                if (!reader.init(config::inverted_index_read_buffer_size).ok()) {
-                    return;
+                if (rowset->is_skip_index_compaction(candidate.column->parent_unique_id())) {
+                    reject(candidate, Reject::SKIP_MARKED);
+                    continue;
                 }
-                for (auto& candidate : candidates) {
-                    if (!candidate.eligible) {
-                        continue;
-                    }
-                    for (const auto* index : candidate.indexes) {
-                        auto dir = reader.open(index);
-                        if (!dir.has_value()) {
-                            candidate.eligible = false;
-                            break;
-                        }
-                        std::vector<std::string> files;
-                        dir.value()->list(&files);
-                        dir.value()->close();
-                        // null_bitmap, segments_N and segments.gen at least
-                        if (files.size() < 3) {
-                            candidate.eligible = false;
-                            break;
-                        }
+                for (const auto* index : candidate.indexes) {
+                    const auto expected = index_properties(*_cur_tablet_schema, index->index_id());
+                    const auto actual = index_properties(*rowset->tablet_schema(), index->index_id());
+                    if (!actual.has_value() || actual != expected) {
+                        reject(candidate, Reject::PROPS_MISMATCH);
+                        break;
                     }
                 }
-            } catch (CLuceneError& err) {
-                LOG(WARNING) << "tablet[" << _tablet->tablet_id() << "] rowset["
-                             << rowset->rowset_id() << "] skips VARIANT subcolumn index compaction: "
-                             << err.what();
-                return;
+            }
+            auto fs = rowset->rowset_meta()->fs();
+            if (!fs) {
+                abort_scan("no file system");
+                return false;
+            }
+            for (int i = 0; i < rowset->num_segments(); ++i) {
+                if (std::none_of(candidates.begin(), candidates.end(),
+                                 [](const Candidate& c) { return c.eligible; })) {
+                    return true;
+                }
+                auto seg_path = rowset->segment_path(i);
+                if (!seg_path) {
+                    abort_scan("no segment path");
+                    return false;
+                }
+                try {
+                    IndexFileReader reader(
+                            fs,
+                            std::string {
+                                    InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value())},
+                            _cur_tablet_schema->get_inverted_index_storage_format(),
+                            rowset->rowset_meta()->inverted_index_file_info(i),
+                            _tablet->tablet_id());
+                    if (!reader.init(config::inverted_index_read_buffer_size).ok()) {
+                        abort_scan("index file reader init failed");
+                        return false;
+                    }
+                    for (auto& candidate : candidates) {
+                        if (!candidate.eligible) {
+                            continue;
+                        }
+                        for (const auto* index : candidate.indexes) {
+                            auto dir = reader.open(index);
+                            if (!dir.has_value()) {
+                                reject(candidate, Reject::MISSING_IN_SEGMENT);
+                                break;
+                            }
+                            std::vector<std::string> files;
+                            dir.value()->list(&files);
+                            dir.value()->close();
+                            // null_bitmap, segments_N and segments.gen at least
+                            if (files.size() < 3) {
+                                reject(candidate, Reject::INCOMPLETE_DIR);
+                                break;
+                            }
+                        }
+                    }
+                } catch (CLuceneError& err) {
+                    LOG(WARNING) << "tablet[" << _tablet->tablet_id() << "] rowset["
+                                 << rowset->rowset_id() << "] skips VARIANT subcolumn index compaction: "
+                                 << err.what();
+                    abort_scan("CLucene error");
+                    return false;
+                }
             }
         }
+        return true;
+    };
+    if (!scan_inputs()) {
+        return;
     }
     for (const auto& candidate : candidates) {
         if (candidate.eligible) {
@@ -1436,6 +1476,22 @@ void Compaction::construct_variant_index_compaction_paths(RowsetWriterContext& c
             g_variant_index_merge_paths << 1;
         } else {
             g_variant_index_rebuild_paths << 1;
+            switch (candidate.reject) {
+            case Reject::SKIP_MARKED:
+                g_variant_index_rebuild_skip_marked << 1;
+                break;
+            case Reject::PROPS_MISMATCH:
+                g_variant_index_rebuild_props_mismatch << 1;
+                break;
+            case Reject::MISSING_IN_SEGMENT:
+                g_variant_index_rebuild_missing_in_segment << 1;
+                break;
+            case Reject::INCOMPLETE_DIR:
+                g_variant_index_rebuild_incomplete_dir << 1;
+                break;
+            case Reject::NONE:
+                break;
+            }
         }
     }
 }
