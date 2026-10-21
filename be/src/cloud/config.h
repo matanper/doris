@@ -178,6 +178,12 @@ DECLARE_mInt64(hole_rowset_eager_prefix_versions);
 // Drop a tablet's trailing hole rowset when a longer one replaces it, instead of keeping it on
 // the stale path. Its versions stay readable through the new range and on-demand prefixes.
 DECLARE_mBool(hole_rowset_drop_extended_tail);
+// Keep a run of versions that a tablet using hole rowset version ranges has no rowset for, and
+// that a get_rowset response confirms empty (no lazy-commit txn pending), as a version graph
+// edge only, with no hole rowset or rowset meta. Readers and compaction get a transient empty
+// rowset for it. Turning it off replaces the remaining gaps with hole rowsets on each tablet's
+// next sync.
+DECLARE_mBool(enable_implicit_version_gaps);
 
 // When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
 // no rows in a load without building a rowset writer for it, as long as the tablet is cached on

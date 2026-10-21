@@ -19,7 +19,9 @@
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
+#include <random>
 #include <set>
 #include <thread>
 #include <vector>
@@ -298,8 +300,7 @@ TEST_F(CloudHoleRowsetRangeTest, HoleRangeIsCappedByMaxVersions) {
         add_empty_pending(_tablet.get(), v);
         _tablet->apply_visible_pending_rowsets();
     }
-    EXPECT_EQ(live_versions(*_tablet),
-              (VersionSet {{0, 1}, {2, 5}, {6, 9}, {10, 13}, {14, 14}}));
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 5}, {6, 9}, {10, 13}, {14, 14}}));
     expect_all_versions_capturable(*_tablet);
 }
 
@@ -327,8 +328,7 @@ TEST_F(CloudHoleRowsetRangeTest, DisabledKeepsOneHolePerVersion) {
     EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 2}, {3, 3}, {4, 4}}));
     add_empty_pending(_tablet.get(), 5);
     _tablet->apply_visible_pending_rowsets();
-    EXPECT_EQ(live_versions(*_tablet),
-              (VersionSet {{0, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}}));
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}}));
 }
 
 TEST_F(CloudHoleRowsetRangeTest, MergeOnWriteKeepsOneHolePerVersion) {
@@ -361,8 +361,7 @@ TEST_F(CloudHoleRowsetRangeTest, MetaServiceRowsetSplitsHoleRange) {
 
     // Starting at the hole's first version and ending past it.
     ASSERT_TRUE(fill_version_holes(_tablet.get(), 15).ok());
-    ASSERT_EQ(live_versions(*_tablet),
-              (VersionSet {{0, 1}, {2, 4}, {5, 7}, {8, 15}}));
+    ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 4}, {5, 7}, {8, 15}}));
     add_rowsets(_tablet.get(), {create_rowset(Version(2, 9), 0)}, true);
     EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 9}, {10, 15}}));
     expect_all_versions_capturable(*_tablet);
@@ -560,8 +559,7 @@ TEST_F(CloudHolePrefixTest, IncrementalReadStartingAtRange) {
 
 TEST_F(CloudHolePrefixTest, CompactionOverHoleRangesKeepsVersionsReadable) {
     config::hole_rowset_eager_prefix_versions = 0;
-    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(5, 5))},
-                false);
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(5, 5))}, false);
     ASSERT_TRUE(fill_version_holes(_tablet.get(), 12).ok());
     ASSERT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 4}, {5, 5}, {6, 12}}));
     {
@@ -597,6 +595,279 @@ TEST_F(CloudHolePrefixTest, DisabledRangesNeedNoPrefixes) {
         EXPECT_EQ(_tablet->on_demand_rowset_unlocked(Version(2, v)), nullptr) << v;
     }
     expect_all_versions_capturable(*_tablet);
+}
+
+} // namespace doris
+
+namespace doris {
+
+// Implicit version gaps: version holes the meta-service confirmed empty are kept as version graph
+// edges only, with no hole rowset.
+class CloudImplicitGapTest : public CloudHoleRowsetRangeTest {
+public:
+    void SetUp() override {
+        CloudHoleRowsetRangeTest::SetUp();
+        _saved_gaps = config::enable_implicit_version_gaps;
+        config::enable_implicit_version_gaps = true;
+        config::hole_rowset_eager_prefix_versions = 0;
+    }
+    void TearDown() override {
+        config::enable_implicit_version_gaps = _saved_gaps;
+        CloudHoleRowsetRangeTest::TearDown();
+    }
+
+    Status sync_fill(CloudTablet* tablet, int64_t max_version, bool resolved = true) {
+        std::unique_lock wlock(tablet->get_header_lock());
+        return _engine.meta_mgr().fill_version_holes(tablet, max_version, wlock, resolved);
+    }
+
+    static std::map<int64_t, int64_t> gaps(const CloudTablet& tablet) {
+        return tablet._gap_versions;
+    }
+
+    static int64_t exposed(const std::string& name) {
+        return std::stoll(bvar::Variable::describe_exposed(name));
+    }
+
+    // Compaction candidates as a picker sees them: rowsets and gaps, in version order.
+    std::vector<RowsetSharedPtr> candidates(CloudTablet* tablet, int64_t from, int64_t to) {
+        std::vector<RowsetSharedPtr> out;
+        std::shared_lock rlock(tablet->get_header_lock());
+        tablet->traverse_rowsets_and_gaps_unlocked([&](const RowsetSharedPtr& rs) {
+            if (rs->start_version() >= from && rs->end_version() <= to) {
+                out.push_back(rs);
+            }
+        });
+        std::sort(out.begin(), out.end(), Rowset::comparator);
+        return out;
+    }
+
+    // What a compaction commits locally once the meta-service accepted it.
+    void commit_compaction(CloudTablet* tablet, const std::vector<RowsetSharedPtr>& inputs) {
+        std::unique_lock wlock(tablet->get_header_lock());
+        tablet->delete_rowsets(inputs, wlock);
+        tablet->add_rowsets({create_rowset(Version(inputs.front()->start_version(),
+                                                   inputs.back()->end_version()))},
+                            false, wlock, false);
+    }
+
+    // Data rowsets a read of [0, version] returns.
+    std::vector<RowsetId> data_read(CloudTablet* tablet, int64_t version) {
+        std::vector<RowsetId> ids;
+        std::shared_lock rlock(tablet->get_header_lock());
+        auto captured = tablet->capture_consistent_rowsets_unlocked(Version(0, version), {});
+        EXPECT_TRUE(captured.has_value()) << "version " << version;
+        if (captured.has_value()) {
+            for (const auto& rs : captured.value().rowsets) {
+                if (!rs->is_hole_rowset()) {
+                    ids.push_back(rs->rowset_id());
+                }
+            }
+        }
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    }
+
+protected:
+    bool _saved_gaps = false;
+};
+
+TEST_F(CloudImplicitGapTest, ConfirmedHolesBecomeGapsWithoutRowsets) {
+    const int64_t filled_before = exposed("implicit_gap_filled_count");
+    add_rowsets(_tablet.get(),
+                {create_rowset(Version(0, 1)), create_rowset(Version(5, 5)),
+                 create_rowset(Version(9, 12))},
+                false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 20).ok());
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {5, 5}, {9, 12}}));
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{2, 4}, {6, 8}, {13, 20}}));
+    EXPECT_EQ(_tablet->tablet_meta()->all_rs_metas().size(), 3);
+    EXPECT_TRUE(_tablet->_stale_rs_version_map.empty());
+    EXPECT_EQ(_tablet->max_version_unlocked(), 20);
+    EXPECT_EQ(exposed("implicit_gap_filled_count") - filled_before, 3 + 3 + 8);
+    expect_all_versions_capturable(*_tablet);
+
+    // A newer partition version extends the trailing gap; nothing is refilled.
+    ASSERT_TRUE(sync_fill(_tablet.get(), 25).ok());
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{2, 4}, {6, 8}, {13, 25}}));
+    EXPECT_EQ(exposed("implicit_gap_filled_count") - filled_before, 3 + 3 + 8 + 5);
+    expect_all_versions_capturable(*_tablet);
+
+    // A read inside a gap gets an empty transient rowset; the tablet keeps none.
+    std::shared_lock rlock(_tablet->get_header_lock());
+    auto captured = _tablet->capture_consistent_rowsets_unlocked(Version(0, 17), {});
+    ASSERT_TRUE(captured.has_value()) << captured.error();
+    ASSERT_EQ(captured.value().rowsets.back()->version(), Version(13, 17));
+    EXPECT_TRUE(captured.value().rowsets.back()->is_hole_rowset());
+    EXPECT_EQ(captured.value().rowsets.back()->num_segments(), 0);
+    EXPECT_TRUE(_tablet->_stale_rs_version_map.empty());
+}
+
+TEST_F(CloudImplicitGapTest, UnconfirmedHolesKeepHoleRowsets) {
+    const int64_t unsafe_before = exposed("implicit_gap_disabled_unsafe_ms");
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(5, 5))}, false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 10, /*resolved=*/false).ok());
+    EXPECT_TRUE(gaps(*_tablet).empty());
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 4}, {5, 5}, {6, 10}}));
+    EXPECT_EQ(exposed("implicit_gap_disabled_unsafe_ms") - unsafe_before, 1);
+    expect_all_versions_capturable(*_tablet);
+}
+
+TEST_F(CloudImplicitGapTest, MergeOnWriteAndDisabledKeepHoleRowsets) {
+    auto mow = make_tablet(true);
+    add_rowsets(mow.get(), {create_rowset(Version(0, 1))}, false);
+    ASSERT_TRUE(sync_fill(mow.get(), 4).ok());
+    EXPECT_TRUE(gaps(*mow).empty());
+    EXPECT_EQ(live_versions(*mow), (VersionSet {{0, 1}, {2, 2}, {3, 3}, {4, 4}}));
+
+    config::enable_implicit_version_gaps = false;
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1))}, false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 4).ok());
+    EXPECT_TRUE(gaps(*_tablet).empty());
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 4}}));
+}
+
+TEST_F(CloudImplicitGapTest, CompactionCrossesGapsAndKeepsVersionsReadable) {
+    add_rowsets(_tablet.get(),
+                {create_rowset(Version(0, 1)), create_rowset(Version(5, 5)),
+                 create_rowset(Version(9, 12))},
+                false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 20).ok());
+    auto inputs = candidates(_tablet.get(), 2, 12);
+    std::vector<Version> versions;
+    for (const auto& rs : inputs) {
+        versions.push_back(rs->version());
+    }
+    ASSERT_EQ(versions,
+              (std::vector<Version> {Version(2, 4), Version(5, 5), Version(6, 8), Version(9, 12)}));
+    EXPECT_TRUE(inputs[0]->is_hole_rowset());
+    EXPECT_TRUE(inputs[2]->is_hole_rowset());
+    ASSERT_TRUE(_tablet->check_gap_inputs(inputs).ok());
+
+    commit_compaction(_tablet.get(), inputs);
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 12}}));
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{13, 20}}));
+    expect_all_versions_capturable(*_tablet);
+    // Versions inside the output stay readable through the stale inputs while those last.
+    for (int64_t v : {4, 5, 8}) {
+        std::shared_lock rlock(_tablet->get_header_lock());
+        auto captured = _tablet->capture_consistent_rowsets_unlocked(Version(0, v), {});
+        ASSERT_TRUE(captured.has_value()) << v;
+        EXPECT_EQ(captured.value().rowsets.back()->version().second, v) << v;
+    }
+
+    // Expiring the stale path and rebuilding the version graph keeps the remaining gap.
+    const auto saved_sweep = config::tablet_rowset_stale_sweep_time_sec;
+    const auto saved_ratio = config::tablet_version_graph_orphan_vertex_ratio;
+    config::tablet_rowset_stale_sweep_time_sec = -1000;
+    config::tablet_version_graph_orphan_vertex_ratio = 0;
+    EXPECT_GT(_tablet->delete_expired_stale_rowsets(), 0);
+    config::tablet_rowset_stale_sweep_time_sec = saved_sweep;
+    config::tablet_version_graph_orphan_vertex_ratio = saved_ratio;
+    EXPECT_TRUE(_tablet->_stale_rs_version_map.empty());
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{13, 20}}));
+    expect_all_versions_capturable(*_tablet);
+}
+
+TEST_F(CloudImplicitGapTest, CompactionHoldingAnExtendedGapStillCommits) {
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(2, 2))}, false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 10).ok());
+    auto inputs = candidates(_tablet.get(), 2, 10);
+    ASSERT_EQ(inputs.size(), 2);
+    ASSERT_EQ(inputs[1]->version(), Version(3, 10));
+    // A sync extends the gap while the compaction runs.
+    ASSERT_TRUE(sync_fill(_tablet.get(), 15).ok());
+    ASSERT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{3, 15}}));
+    ASSERT_TRUE(_tablet->check_gap_inputs(inputs).ok());
+    commit_compaction(_tablet.get(), inputs);
+    EXPECT_EQ(live_versions(*_tablet), (VersionSet {{0, 1}, {2, 10}}));
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{11, 15}}));
+    expect_all_versions_capturable(*_tablet);
+}
+
+TEST_F(CloudImplicitGapTest, LoadInsideAGapRefusesTheCompaction) {
+    const int64_t refused_before = exposed("compaction_implicit_gap_refused");
+    const int64_t overlap_before = exposed("implicit_gap_load_overlap");
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(2, 2))}, false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 10).ok());
+    auto inputs = candidates(_tablet.get(), 2, 10);
+    ASSERT_EQ(inputs.size(), 2);
+    // A rowset at version 6 arrives, inside the gap the compaction picked.
+    auto loaded = create_rowset(Version(6, 6));
+    add_rowsets(_tablet.get(), {loaded}, true);
+    EXPECT_EQ(exposed("implicit_gap_load_overlap") - overlap_before, 1);
+    EXPECT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{3, 5}, {7, 10}}));
+    auto st = _tablet->check_gap_inputs(inputs);
+    EXPECT_TRUE(st.is<ErrorCode::INPUT_GAP_UNSAFE>()) << st;
+    EXPECT_EQ(exposed("compaction_implicit_gap_refused") - refused_before, 1);
+    // The data is intact and every version readable.
+    EXPECT_TRUE(live_versions(*_tablet).contains({6, 6}));
+    expect_all_versions_capturable(*_tablet);
+    const auto read = data_read(_tablet.get(), 10);
+    EXPECT_TRUE(std::find(read.begin(), read.end(), loaded->rowset_id()) != read.end());
+}
+
+TEST_F(CloudImplicitGapTest, TurningGapsOffMaterializesThem) {
+    add_rowsets(_tablet.get(), {create_rowset(Version(0, 1)), create_rowset(Version(5, 5))}, false);
+    ASSERT_TRUE(sync_fill(_tablet.get(), 12).ok());
+    ASSERT_EQ(gaps(*_tablet), (std::map<int64_t, int64_t> {{2, 4}, {6, 12}}));
+    config::enable_implicit_version_gaps = false;
+    ASSERT_TRUE(sync_fill(_tablet.get(), 14).ok());
+    EXPECT_TRUE(gaps(*_tablet).empty());
+    // The sync's new versions [13, 14] extend the materialized trailing hole rowset.
+    for (const auto& v : {Version(2, 4), Version(6, 14)}) {
+        ASSERT_TRUE(_tablet->rowset_map().contains(v)) << v.to_string();
+        EXPECT_TRUE(_tablet->rowset_map().at(v)->is_hole_rowset());
+    }
+    expect_all_versions_capturable(*_tablet);
+}
+
+// Loads at random versions and syncs, on one tablet with gaps and one with hole rowsets: every
+// version reads the same data rowsets on both, and compacting the gap tablet keeps every version
+// readable.
+TEST_F(CloudImplicitGapTest, RandomLoadsReadTheSameAsHoleRowsets) {
+    std::mt19937 rng(20261021);
+    for (int round = 0; round < 20; ++round) {
+        auto with_gaps = make_tablet(false);
+        auto with_holes = make_tablet(false);
+        auto base = create_rowset(Version(0, 1));
+        add_rowsets(with_gaps.get(), {base}, false);
+        add_rowsets(with_holes.get(), {base}, false);
+        int64_t partition_version = 1;
+        for (int step = 0; step < 30; ++step) {
+            partition_version += 1 + static_cast<int64_t>(rng() % 6);
+            if (rng() % 2 == 0) {
+                // This tablet got the newest load; every version before it went to other tablets.
+                auto rs = create_rowset(Version(partition_version, partition_version));
+                for (auto* tablet : {with_gaps.get(), with_holes.get()}) {
+                    std::shared_lock rlock(tablet->get_header_lock());
+                    const bool overlap = tablet->max_version_unlocked() >= partition_version;
+                    rlock.unlock();
+                    add_rowsets(tablet, {rs}, overlap);
+                }
+            }
+            ASSERT_TRUE(sync_fill(with_gaps.get(), partition_version).ok());
+            config::enable_implicit_version_gaps = false;
+            ASSERT_TRUE(sync_fill(with_holes.get(), partition_version).ok());
+            config::enable_implicit_version_gaps = true;
+        }
+        ASSERT_TRUE(with_holes->_gap_versions.empty());
+        for (int64_t v = 1; v <= partition_version; ++v) {
+            ASSERT_EQ(data_read(with_gaps.get(), v), data_read(with_holes.get(), v))
+                    << "round " << round << " version " << v;
+        }
+        expect_all_versions_capturable(*with_gaps);
+        // A compaction over a random run of candidates.
+        auto all = candidates(with_gaps.get(), 2, partition_version);
+        if (all.size() >= 2) {
+            size_t first = rng() % (all.size() - 1);
+            size_t last = first + 1 + rng() % (all.size() - first - 1);
+            std::vector<RowsetSharedPtr> inputs(all.begin() + first, all.begin() + last + 1);
+            ASSERT_TRUE(with_gaps->check_gap_inputs(inputs).ok());
+            commit_compaction(with_gaps.get(), inputs);
+            expect_all_versions_capturable(*with_gaps);
+        }
+    }
 }
 
 } // namespace doris

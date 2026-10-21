@@ -916,6 +916,16 @@ TEST(MetaServiceVersionedReadTest, GetRowsetMetas) {
         EXPECT_EQ(resp.partition_max_version(), -1); // The first version is special
     }
 
+    // Without advancing lazy-commit txns during reads, a response cannot vouch for empty versions.
+    {
+        const bool saved = config::advance_txn_lazy_commit_during_reads;
+        config::advance_txn_lazy_commit_during_reads = false;
+        auto resp = get_rowsets(1, 10);
+        config::advance_txn_lazy_commit_during_reads = saved;
+        ASSERT_EQ(resp.status().code(), MetaServiceCode::OK) << resp.status().DebugString();
+        EXPECT_FALSE(resp.has_lazy_commit_resolved());
+    }
+
     // Step 1: Insert loading rowsets with versions 2, 3, 4, 5, 6, 7, 8, 9, 10
     LOG(INFO) << "Inserting loading rowsets for versions 2-10";
     for (int64_t version = 2; version <= 10; ++version) {
@@ -930,6 +940,8 @@ TEST(MetaServiceVersionedReadTest, GetRowsetMetas) {
         ASSERT_EQ(resp.rowset_meta_size(), 10);
         EXPECT_TRUE(resp.has_partition_max_version());
         EXPECT_EQ(resp.partition_max_version(), 10);
+        // No lazy-commit txn was pending, so the response vouches for its empty versions.
+        EXPECT_TRUE(resp.has_lazy_commit_resolved() && resp.lazy_commit_resolved());
 
         // Verify rowsets are sorted by version
         for (int i = 0; i < resp.rowset_meta_size(); ++i) {

@@ -143,6 +143,7 @@ DEFINE_mInt64(hole_rowset_eager_prefix_versions, "0");
 DEFINE_Validator(hole_rowset_eager_prefix_versions,
                  [](const int64_t config) -> bool { return config >= 0; });
 DEFINE_mBool(hole_rowset_drop_extended_tail, "true");
+DEFINE_mBool(enable_implicit_version_gaps, "false");
 
 DEFINE_mBool(skip_rowset_writer_for_empty_tablet, "true");
 

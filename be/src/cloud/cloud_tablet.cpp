@@ -89,6 +89,13 @@ bvar::Adder<int64_t> g_capture_with_freshness_tolerance_fallback_count(
         "capture_with_freshness_tolerance_fallback_count");
 bvar::Adder<int64_t> g_rowset_warmup_state_missing_count("rowset_warmup_state_missing_count");
 bvar::Adder<int64_t> g_hole_rowset_range_created_count("hole_rowset_range_created_count");
+bvar::Adder<int64_t> g_implicit_gap_edges("implicit_gap_edges");
+bvar::Adder<int64_t> g_implicit_gap_versions("implicit_gap_versions");
+bvar::Adder<int64_t> g_implicit_gap_extended("implicit_gap_extended");
+bvar::Adder<int64_t> g_implicit_gap_transient_rowsets("implicit_gap_transient_rowsets");
+bvar::Adder<int64_t> g_implicit_gap_materialized("implicit_gap_materialized");
+bvar::Adder<int64_t> g_implicit_gap_load_overlap("implicit_gap_load_overlap");
+bvar::Adder<int64_t> g_compaction_implicit_gap_refused("compaction_implicit_gap_refused");
 bvar::Adder<int64_t> g_hole_rowset_range_extended_count("hole_rowset_range_extended_count");
 // Trailing hole rowsets dropped when a longer range replaced them, rather than staled.
 bvar::Adder<int64_t> g_hole_rowset_tail_dropped_count("hole_rowset_tail_dropped_count");
@@ -250,6 +257,10 @@ Result<std::vector<Version>> CloudTablet::capture_versions_prefer_cache(
 bool CloudTablet::rowset_is_warmed_up_unlocked(int64_t start_version, int64_t end_version) const {
     if (start_version > end_version) {
         return false;
+    }
+    if (auto gap = _gap_containing_unlocked(start_version);
+        gap.has_value() && gap->first == start_version && end_version <= gap->second) {
+        return true; // nothing to warm up
     }
     Version version {start_version, end_version};
     auto it = _rs_version_map.find(version);
@@ -449,6 +460,10 @@ Status CloudTablet::sync_if_not_running(SyncRowsetStats* stats) {
         _visible_rowset_deltas.clear();
         _visible_rowset_deltas_sum = 0;
         _max_version = -1;
+        while (!_gap_versions.empty()) {
+            _erase_gap_unlocked(_gap_versions.begin());
+        }
+        _gap_watermark = -1;
     }
 
     st = _engine.meta_mgr().sync_tablet_rowsets_unlocked(this, lock, {}, stats);
@@ -519,6 +534,7 @@ void CloudTablet::add_rowsets(std::vector<RowsetSharedPtr> to_add, bool version_
     to_add.erase(remove_it, to_add.end());
 
     _split_hole_rowsets_overlapped_by(to_add, meta_lock);
+    _consume_gaps_overlapped_by(to_add, meta_lock);
 
     // delete rowsets with overlapped version
     std::vector<RowsetSharedPtr> to_add_directly;
@@ -553,8 +569,13 @@ void CloudTablet::delete_rowsets(const std::vector<RowsetSharedPtr>& to_delete,
     }
     std::vector<RowsetSharedPtr> to_stale;
     std::vector<RowsetSharedPtr> dropped;
+    // Versions of transient gap rowsets going to the stale path without a version graph edge.
+    std::vector<Version> stale_gap_edges;
     to_stale.reserve(to_delete.size());
     for (auto&& rs : to_delete) {
+        const bool transient_gap = _is_transient_gap_rowset_unlocked(rs);
+        const bool gap_edge_exists = transient_gap && _release_gap_input_unlocked(rs->version());
+        const bool needs_gap_edge = transient_gap && !gap_edge_exists;
         // With hole rowset version ranges, a live rowset can have the version of a hole rowset
         // that is still on the stale path, e.g. a prefix [s, v] of a hole range and a rowset
         // [s, v] from meta-service. A hole rowset only covers versions that hold no data, so the
@@ -572,12 +593,23 @@ void CloudTablet::delete_rowsets(const std::vector<RowsetSharedPtr>& to_delete,
                     dropped.push_back(rs);
                 }
             }
+            if (gap_edge_exists) {
+                // The stale hole rowset keeps the version readable; an edge without a rowset
+                // or a gap behind it must not stay in the version graph.
+                _timestamped_version_tracker.delete_version(rs->version());
+            }
             continue;
+        }
+        if (needs_gap_edge) {
+            stale_gap_edges.push_back(rs->version());
         }
         to_stale.push_back(rs);
     }
     if (!dropped.empty()) {
         add_unused_rowsets(dropped);
+    }
+    for (const auto& version : stale_gap_edges) {
+        _timestamped_version_tracker.add_version(version);
     }
     if (to_stale.empty()) {
         return;
@@ -617,8 +649,15 @@ std::optional<Version> CloudTablet::_hole_range_needing_prefix_unlocked(int64_t 
     if (enable_unique_key_merge_on_write()) {
         return std::nullopt;
     }
+    if (auto gap = _gap_containing_unlocked(version); gap.has_value() && version < gap->second) {
+        if (_stale_rs_version_map.contains(Version(gap->first, version))) {
+            return std::nullopt;
+        }
+        return gap;
+    }
     std::optional<Version> range;
-    for (const auto& live : _visible_version_index.versions_overlapping(Version(version, version))) {
+    for (const auto& live :
+         _visible_version_index.versions_overlapping(Version(version, version))) {
         if (live.first > version || version >= live.second) {
             continue;
         }
@@ -651,6 +690,10 @@ std::optional<Version> CloudTablet::_hole_range_needing_prefix_unlocked(int64_t 
 RowsetSharedPtr CloudTablet::on_demand_rowset_unlocked(const Version& version) const {
     if (version.first > version.second) {
         return nullptr;
+    }
+    if (auto gap = _gap_containing_unlocked(version.first);
+        gap.has_value() && gap->first == version.first && version.second <= gap->second) {
+        return _transient_gap_rowset_unlocked(version);
     }
     auto range = _hole_range_needing_prefix_unlocked(version.second);
     if (!range.has_value() || range->first != version.first) {
@@ -689,6 +732,228 @@ RowsetSharedPtr CloudTablet::on_demand_rowset_unlocked(const Version& version) c
     _on_demand_prefixes[key] = prefix;
     g_hole_rowset_prefix_on_demand_count << 1;
     return prefix;
+}
+
+bool CloudTablet::can_use_implicit_version_gaps() const {
+    return config::enable_implicit_version_gaps && can_use_hole_rowset_version_range();
+}
+
+std::optional<Version> CloudTablet::_gap_containing_unlocked(int64_t version) const {
+    auto it = _gap_versions.upper_bound(version);
+    if (it == _gap_versions.begin()) {
+        return std::nullopt;
+    }
+    --it;
+    if (it->second < version) {
+        return std::nullopt;
+    }
+    return Version(it->first, it->second);
+}
+
+RowsetSharedPtr CloudTablet::_transient_gap_rowset_unlocked(const Version& version) const {
+    if (_gap_template == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard lock(_on_demand_prefix_lock);
+    auto key = std::make_pair(version.first, version.second);
+    if (auto it = _on_demand_prefixes.find(key); it != _on_demand_prefixes.end()) {
+        if (auto rowset = it->second.lock()) {
+            return rowset;
+        }
+    }
+    std::erase_if(_on_demand_prefixes, [](const auto& entry) { return entry.second.expired(); });
+    RowsetSharedPtr rowset;
+    RowsetId rowset_id = _engine.next_rowset_id();
+    if (auto st = _engine.meta_mgr().create_empty_rowset_for_hole(this, version, _gap_template,
+                                                                  &rowset, &rowset_id);
+        !st.ok()) {
+        LOG_WARNING("failed to create transient gap rowset")
+                .tag("tablet_id", tablet_id())
+                .tag("version", version.to_string())
+                .error(st);
+        return nullptr;
+    }
+    _on_demand_prefixes[key] = rowset;
+    g_implicit_gap_transient_rowsets << 1;
+    return rowset;
+}
+
+bool CloudTablet::_is_transient_gap_rowset_unlocked(const RowsetSharedPtr& rs) const {
+    if (rs == nullptr || !rs->is_hole_rowset()) {
+        return false;
+    }
+    std::lock_guard lock(_on_demand_prefix_lock);
+    auto it = _on_demand_prefixes.find(std::make_pair(rs->start_version(), rs->end_version()));
+    return it != _on_demand_prefixes.end() && it->second.lock() == rs;
+}
+
+void CloudTablet::_add_gap_edge_unlocked(const Version& gap) {
+    _gap_versions[gap.first] = gap.second;
+    _timestamped_version_tracker.add_version(gap);
+    _max_version = std::max(_max_version, gap.second);
+    g_implicit_gap_edges << 1;
+    g_implicit_gap_versions << (gap.second - gap.first + 1);
+}
+
+void CloudTablet::_erase_gap_unlocked(std::map<int64_t, int64_t>::iterator it) {
+    g_implicit_gap_edges << -1;
+    g_implicit_gap_versions << -(it->second - it->first + 1);
+    _gap_versions.erase(it);
+}
+
+void CloudTablet::add_implicit_gaps(const Version& versions,
+                                    const RowsetMetaSharedPtr& template_meta, int64_t watermark) {
+    if (versions.first > versions.second) {
+        return;
+    }
+    DCHECK_LE(versions.second, watermark);
+    _gap_template = template_meta;
+    _gap_watermark = std::max(_gap_watermark, watermark);
+    Version gap = versions;
+    if (auto it = _gap_versions.lower_bound(versions.first); it != _gap_versions.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second + 1 == versions.first) {
+            // One edge per run keeps the version graph small. A compaction holding the old edge
+            // still commits: its gap is the start of this one (see `_release_gap_input_unlocked`).
+            gap.first = prev->first;
+            _timestamped_version_tracker.delete_version(Version(prev->first, prev->second));
+            _erase_gap_unlocked(prev);
+            g_implicit_gap_extended << 1;
+        }
+    }
+    _add_gap_edge_unlocked(gap);
+}
+
+std::vector<Version> CloudTablet::versions_not_in_gaps_unlocked(const Version& range) const {
+    std::vector<Version> out;
+    int64_t next = range.first;
+    auto it = _gap_versions.upper_bound(range.first);
+    if (it != _gap_versions.begin()) {
+        if (auto prev = std::prev(it); prev->second >= next) {
+            next = prev->second + 1;
+        }
+    }
+    for (; it != _gap_versions.end() && it->first <= range.second; ++it) {
+        if (it->first > next) {
+            out.emplace_back(next, it->first - 1);
+        }
+        next = std::max(next, it->second + 1);
+    }
+    if (next <= range.second) {
+        out.emplace_back(next, range.second);
+    }
+    return out;
+}
+
+Status CloudTablet::materialize_implicit_gaps(std::unique_lock<BthreadSharedMutex>& meta_lock) {
+    if (_gap_versions.empty()) {
+        return Status::OK();
+    }
+    std::vector<Version> gaps;
+    for (const auto& [first, last] : _gap_versions) {
+        gaps.emplace_back(first, last);
+    }
+    auto template_meta = _gap_template;
+    for (const auto& gap : gaps) {
+        _erase_gap_unlocked(_gap_versions.find(gap.first));
+        _timestamped_version_tracker.delete_version(gap);
+        // A failure leaves the rest of the gap as a version hole, which the next sync fills.
+        RETURN_IF_ERROR(add_hole_rowsets(gap, template_meta, meta_lock, _max_version));
+        g_implicit_gap_materialized << 1;
+    }
+    return Status::OK();
+}
+
+void CloudTablet::traverse_gap_rowsets_unlocked(
+        const std::function<void(const RowsetSharedPtr&)>& visitor) const {
+    for (const auto& [first, last] : _gap_versions) {
+        if (auto rowset = _transient_gap_rowset_unlocked(Version(first, last))) {
+            visitor(rowset);
+        }
+    }
+}
+
+Status CloudTablet::check_gap_inputs(const std::vector<RowsetSharedPtr>& inputs) const {
+    std::shared_lock rlock(_meta_lock);
+    for (const auto& rs : inputs) {
+        if (!_is_transient_gap_rowset_unlocked(rs)) {
+            continue;
+        }
+        const auto& version = rs->version();
+        auto it = _gap_versions.find(version.first);
+        const bool still_gap = it != _gap_versions.end() && it->second >= version.second &&
+                               version.second <= _gap_watermark;
+        if (!still_gap || !_visible_version_index.versions_overlapping(version).empty()) {
+            g_compaction_implicit_gap_refused << 1;
+            return Status::Error<ErrorCode::INPUT_GAP_UNSAFE>(
+                    "compaction input gap {} of tablet {} is no longer known to be empty",
+                    version.to_string(), tablet_id());
+        }
+    }
+    return Status::OK();
+}
+
+bool CloudTablet::_release_gap_input_unlocked(const Version& version) {
+    auto it = _gap_versions.find(version.first);
+    if (it == _gap_versions.end() || it->second < version.second) {
+        return false; // the gap was replaced since the compaction picked it
+    }
+    const int64_t last = it->second;
+    _erase_gap_unlocked(it);
+    if (last == version.second) {
+        return true;
+    }
+    _timestamped_version_tracker.delete_version(Version(version.first, last));
+    _add_gap_edge_unlocked(Version(version.second + 1, last));
+    return false;
+}
+
+void CloudTablet::_consume_gaps_overlapped_by(const std::vector<RowsetSharedPtr>& to_add,
+                                              std::unique_lock<BthreadSharedMutex>& meta_lock) {
+    for (const auto& rs : to_add) {
+        if (_gap_versions.empty()) {
+            return;
+        }
+        const Version covered = rs->version();
+        std::vector<Version> overlapping;
+        for (auto it = _gap_versions.upper_bound(covered.second); it != _gap_versions.begin();) {
+            --it;
+            if (it->second < covered.first) {
+                break;
+            }
+            overlapping.emplace_back(it->first, it->second);
+        }
+        for (const auto& gap : overlapping) {
+            if (covered.first == covered.second && !rs->is_hole_rowset()) {
+                // A load's rowset in versions the meta-service reported empty.
+                g_implicit_gap_load_overlap << 1;
+                LOG_WARNING("rowset inside an implicit version gap")
+                        .tag("tablet_id", tablet_id())
+                        .tag("gap", gap.to_string())
+                        .tag("rowset", rs->rowset_id().to_string())
+                        .tag("version", covered.to_string());
+            }
+            auto transient = gap.first >= covered.first && gap.second <= covered.second
+                                     ? _transient_gap_rowset_unlocked(gap)
+                                     : nullptr;
+            if (transient != nullptr) {
+                // Nested in the rowset, so on the stale path it reads no differently: the stale
+                // path keeps older versions inside the gap readable, as for compaction inputs.
+                delete_rowsets({transient}, meta_lock);
+            } else {
+                // Partly covered: a stale edge would span versions outside the rowset that may
+                // get data, and the greedy path capture could read through it past that data.
+                _erase_gap_unlocked(_gap_versions.find(gap.first));
+                _timestamped_version_tracker.delete_version(gap);
+            }
+            if (gap.first < covered.first) {
+                _add_gap_edge_unlocked(Version(gap.first, covered.first - 1));
+            }
+            if (covered.second < gap.second) {
+                _add_gap_edge_unlocked(Version(covered.second + 1, gap.second));
+            }
+        }
+    }
 }
 
 RowsetSharedPtr CloudTablet::_extendable_tail_hole_rowset() const {
@@ -940,8 +1205,8 @@ void CloudTablet::_split_hole_rowsets_overlapped_by(
                             this, Version(start, v), hole->rowset_meta(), &rs, &rs_id);
                     !st.ok()) {
                     // Older versions in this range are no longer readable on this BE.
-                    LOG(WARNING) << "failed to create stale hole rowset, tablet_id="
-                                 << tablet_id() << ", st=" << st;
+                    LOG(WARNING) << "failed to create stale hole rowset, tablet_id=" << tablet_id()
+                                 << ", st=" << st;
                     break;
                 }
                 nested.push_back(std::move(rs));
@@ -1066,7 +1331,12 @@ uint64_t CloudTablet::delete_expired_stale_rowsets() {
                 deleted_stale_rowsets.emplace_back(version, std::move(stale_rowsets));
             }
         }
-        _reconstruct_version_tracker_if_necessary();
+        if (_reconstruct_version_tracker_if_necessary()) {
+            // The version graph is rebuilt from rowset metas, which gaps have none of.
+            for (const auto& [first, last] : _gap_versions) {
+                _timestamped_version_tracker.add_version(Version(first, last));
+            }
+        }
     }
 
     // if the rowset is not used by any query, we can recycle its cached data early.
@@ -1125,10 +1395,10 @@ void CloudTablet::_log_stuck_unused_rowset(const Rowset& rowset, long use_count,
     const int64_t now_ms = now * 1000;
     auto since_ms = [now_ms](int64_t ms) { return ms > 0 ? (now_ms - ms) / 1000 : -1; };
     LOG(WARNING) << "stuck unused rowset: tablet_id=" << tablet_id()
-                 << " rowset_id=" << rowset.rowset_id() << " version=" << rowset.version().to_string()
-                 << " use_count=" << use_count << " refs_by_reader=" << rowset.refs_by_reader()
-                 << " age_s=" << age_s << " bytes=" << rowset.total_disk_size()
-                 << " segments=" << rowset.num_segments()
+                 << " rowset_id=" << rowset.rowset_id()
+                 << " version=" << rowset.version().to_string() << " use_count=" << use_count
+                 << " refs_by_reader=" << rowset.refs_by_reader() << " age_s=" << age_s
+                 << " bytes=" << rowset.total_disk_size() << " segments=" << rowset.num_segments()
                  << " cumu_compaction_submitted=" << _engine.has_cumu_compaction(tablet_id())
                  << " base_compaction_submitted=" << _engine.has_base_compaction(tablet_id())
                  << " full_compaction_submitted=" << _engine.has_full_compaction(tablet_id())
@@ -1688,24 +1958,25 @@ Result<RowsetSharedPtr> CloudTablet::pick_a_rowset_for_index_change(int schema_v
 
 std::vector<RowsetSharedPtr> CloudTablet::pick_candidate_rowsets_to_base_compaction_unlocked() {
     std::vector<RowsetSharedPtr> candidate_rowsets;
-    for (const auto& [version, rs] : _rs_version_map) {
+    traverse_rowsets_and_gaps_unlocked([&](const RowsetSharedPtr& rs) {
+        const auto& version = rs->version();
         if (version.first != 0 && version.first < _cumulative_point &&
             (_alter_version == -1 || version.second <= _alter_version)) {
             candidate_rowsets.push_back(rs);
         }
-    }
+    });
     std::sort(candidate_rowsets.begin(), candidate_rowsets.end(), Rowset::comparator);
     return candidate_rowsets;
 }
 
 std::vector<RowsetSharedPtr> CloudTablet::pick_candidate_rowsets_to_full_compaction_unlocked() {
     std::vector<RowsetSharedPtr> candidate_rowsets;
-    for (auto& [v, rs] : _rs_version_map) {
+    traverse_rowsets_and_gaps_unlocked([&](const RowsetSharedPtr& rs) {
         // MUST NOT compact rowset [0-1] for some historical reasons (see cloud_schema_change)
-        if (v.first != 0) {
+        if (rs->start_version() != 0) {
             candidate_rowsets.push_back(rs);
         }
-    }
+    });
     std::sort(candidate_rowsets.begin(), candidate_rowsets.end(), Rowset::comparator);
     return candidate_rowsets;
 }
@@ -2684,9 +2955,9 @@ void CloudTablet::apply_visible_pending_rowsets() {
                 empty_run_template = std::move(prev_rs_meta);
             }
         } else if (pending_rs.is_empty_rowset) {
-            RowsetMetaSharedPtr prev_rs_meta = to_add.empty()
-                                                       ? rowset_meta_with_max_start_version_unlocked()
-                                                       : to_add.back()->rowset_meta();
+            RowsetMetaSharedPtr prev_rs_meta =
+                    to_add.empty() ? rowset_meta_with_max_start_version_unlocked()
+                                   : to_add.back()->rowset_meta();
             if (prev_rs_meta == nullptr) {
                 break;
             }
