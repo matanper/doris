@@ -139,9 +139,10 @@ CloudRowsetBuilder* CloudDeltaWriter::rowset_builder() {
 
 void CloudDeltaWriter::update_tablet_stats() {
     if (_empty_rowset_tablet != nullptr) {
-        if (_empty_rowset_tablet->can_use_implicit_version_gaps()) {
-            // The version becomes part of an implicit gap, not a rowset: it must not count toward
-            // the tablet's version limit or make it look due for compaction.
+        if (CloudRowsetBuilder::empty_commit_adds_no_rowset(*_empty_rowset_tablet)) {
+            // The version becomes part of a hole rowset range or an implicit gap, not a rowset of
+            // its own: it must not count toward the version limit or make the tablet look due for
+            // compaction.
             _empty_rowset_tablet->write_count.fetch_add(1, std::memory_order_relaxed);
             return;
         }
