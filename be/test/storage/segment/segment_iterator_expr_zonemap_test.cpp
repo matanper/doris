@@ -36,6 +36,7 @@
 #include "storage/olap_common.h"
 #include "storage/row_cursor.h"
 #include "storage/segment/column_meta_accessor.h"
+#include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/row_ranges.h"
 #include "storage/segment/segment.h"
 #include "storage/segment/segment_iterator.h"
@@ -101,6 +102,41 @@ TabletSchemaSPtr make_tablet_schema(
     tablet_schema->set_storage_page_size(4096);
     tablet_schema->set_storage_format(format);
     return tablet_schema;
+}
+
+// Answers whether a range is in the local file cache with a fixed value, and records the reads.
+class LocalCacheProbeReader final : public io::FileReader {
+public:
+    LocalCacheProbeReader(io::FileReaderSPtr inner, bool in_local_cache)
+            : _inner(std::move(inner)), _in_local_cache(in_local_cache) {}
+
+    Status close() override { return _inner->close(); }
+    const io::Path& path() const override { return _inner->path(); }
+    size_t size() const override { return _inner->size(); }
+    bool closed() const override { return _inner->closed(); }
+    int64_t mtime() const override { return _inner->mtime(); }
+    bool is_range_in_local_cache(size_t, size_t) override { return _in_local_cache; }
+
+    size_t reads = 0;
+    size_t bytes = 0;
+    size_t largest_read = 0;
+
+protected:
+    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                        const io::IOContext* io_ctx) override {
+        ++reads;
+        bytes += result.size;
+        largest_read = std::max(largest_read, result.size);
+        return _inner->read_at(offset, result, bytes_read, io_ctx);
+    }
+
+private:
+    io::FileReaderSPtr _inner;
+    bool _in_local_cache;
+};
+
+int64_t exposed_counter(const std::string& name) {
+    return std::stoll(bvar::Variable::describe_exposed(name));
 }
 
 int64_t live_meta_regions() {
@@ -376,6 +412,80 @@ TEST_F(SegmentMetaRegionReleaseTest, AUseAfterTheFirstDoesNotReleaseAnotherCalle
     EXPECT_TRUE(region_kept(segment));
     segment->release_column_meta_region();
     EXPECT_FALSE(region_kept(segment));
+}
+
+// A segment re-opened after it left the segment cache, with its region already in the local file
+// cache, reads only the metas it needs, exactly as without the region buffer; a segment whose region
+// is not local yet reads the region in one read.
+class SegmentMetaRegionLocalCacheTest : public SegmentMetaRegionReleaseTest {
+protected:
+    std::shared_ptr<Segment> reopen(bool in_local_cache, std::shared_ptr<LocalCacheProbeReader>* probe) {
+        std::shared_ptr<Segment> segment;
+        auto st = Segment::open(io::global_local_filesystem(),
+                                std::string(kTestDir) + "/expr_zonemap_segment.dat", 100, 0,
+                                kRowsetId, _tablet_schema, io::FileReaderOptions {}, &segment);
+        EXPECT_TRUE(st.ok()) << st;
+        *probe = std::make_shared<LocalCacheProbeReader>(segment->_file_reader, in_local_cache);
+        segment->_file_reader = *probe;
+        return segment;
+    }
+
+    Status read_once(const std::shared_ptr<Segment>& segment, OlapReaderStatistics* stats) {
+        StorageReadOptions read_options;
+        read_options.stats = stats;
+        read_options.runtime_state = &_runtime_state;
+        read_options.tablet_schema = _tablet_schema;
+        std::unique_ptr<RowwiseIterator> iter;
+        return segment->new_iterator(make_read_schema(_tablet_schema), read_options, &iter);
+    }
+};
+
+TEST_F(SegmentMetaRegionLocalCacheTest, WarmReopenReadsWhatTheUnbufferedPathReads) {
+    std::shared_ptr<Segment> written;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&written));
+    written.reset();
+
+    config::segment_column_meta_region_buffer_max_bytes = 0;
+    std::shared_ptr<LocalCacheProbeReader> unbuffered;
+    auto segment = reopen(false, &unbuffered);
+    OlapReaderStatistics unbuffered_stats;
+    ASSERT_TRUE(read_once(segment, &unbuffered_stats).ok());
+    segment.reset();
+
+    config::segment_column_meta_region_buffer_max_bytes = 2 * 1024 * 1024;
+    const int64_t skips_before = exposed_counter("segment_column_meta_region_local_skips");
+    std::shared_ptr<LocalCacheProbeReader> buffered;
+    segment = reopen(true, &buffered);
+    OlapReaderStatistics buffered_stats;
+    ASSERT_TRUE(read_once(segment, &buffered_stats).ok());
+
+    EXPECT_EQ(exposed_counter("segment_column_meta_region_local_skips") - skips_before, 1);
+    EXPECT_EQ(buffered->reads, unbuffered->reads);
+    EXPECT_EQ(buffered->bytes, unbuffered->bytes);
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionLocalCacheTest, ColdOpenReadsTheRegionOnce) {
+    std::shared_ptr<Segment> written;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&written));
+    OlapReaderStatistics stats;
+    std::shared_ptr<SegmentFooterPB> footer;
+    ASSERT_TRUE(written->_get_segment_footer(footer, &stats, nullptr).ok());
+    ExternalColMetaUtil::ExternalMetaPointers ptrs;
+    ASSERT_TRUE(ExternalColMetaUtil::parse_external_meta_pointers(*footer, &ptrs).ok());
+    const size_t region_size = ptrs.region_end - ptrs.region_start;
+    ASSERT_GT(region_size, 0);
+    written.reset();
+
+    const int64_t skips_before = exposed_counter("segment_column_meta_region_local_skips");
+    std::shared_ptr<LocalCacheProbeReader> probe;
+    auto segment = reopen(false, &probe);
+    ASSERT_TRUE(segment->_create_column_meta_once(&stats).ok());
+    EXPECT_TRUE(region_kept(segment));
+    EXPECT_GE(probe->largest_read, region_size);
+    EXPECT_GT(stats.segment_column_meta_region_read_timer_ns, 0);
+    EXPECT_EQ(exposed_counter("segment_column_meta_region_local_skips"), skips_before);
+    segment->release_column_meta_region();
 }
 
 } // namespace doris::segment_v2
