@@ -120,6 +120,8 @@ public:
     size_t reads = 0;
     size_t bytes = 0;
     size_t largest_read = 0;
+    // Counts each read as a remote one, as a cache miss would.
+    bool remote = false;
 
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
@@ -127,6 +129,9 @@ protected:
         ++reads;
         bytes += result.size;
         largest_read = std::max(largest_read, result.size);
+        if (remote && io_ctx != nullptr && io_ctx->file_cache_stats != nullptr) {
+            ++io_ctx->file_cache_stats->num_remote_io_total;
+        }
         return _inner->read_at(offset, result, bytes_read, io_ctx);
     }
 
@@ -486,6 +491,46 @@ TEST_F(SegmentMetaRegionLocalCacheTest, ColdOpenReadsTheRegionOnce) {
     EXPECT_GT(stats.segment_column_meta_region_read_timer_ns, 0);
     EXPECT_EQ(exposed_counter("segment_column_meta_region_local_skips"), skips_before);
     segment->release_column_meta_region();
+}
+
+// A cold open: the footer came from remote storage and brought the region into the local cache
+// with it, so the region is local, yet it is read once, whole.
+TEST_F(SegmentMetaRegionLocalCacheTest, ColdFooterReadsTheLocalRegionOnce) {
+    std::shared_ptr<Segment> written;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&written));
+    written.reset();
+
+    const int64_t skips_before = exposed_counter("segment_column_meta_region_local_skips");
+    std::shared_ptr<LocalCacheProbeReader> probe;
+    auto segment = reopen(true, &probe);
+    probe->remote = true;
+    OlapReaderStatistics stats;
+    std::shared_ptr<SegmentFooterPB> footer;
+    ASSERT_TRUE(segment->_parse_footer(footer, &stats, nullptr).ok());
+    EXPECT_TRUE(segment->_footer_read_remote);
+    probe->remote = false;
+    ASSERT_TRUE(segment->_create_column_meta_once(&stats).ok());
+    EXPECT_TRUE(region_kept(segment));
+    EXPECT_EQ(exposed_counter("segment_column_meta_region_local_skips"), skips_before);
+    segment->release_column_meta_region();
+}
+
+// A warm re-open: the footer was read from the local cache, so the local region is skipped.
+TEST_F(SegmentMetaRegionLocalCacheTest, LocalFooterSkipsTheLocalRegion) {
+    std::shared_ptr<Segment> written;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&written));
+    written.reset();
+
+    const int64_t skips_before = exposed_counter("segment_column_meta_region_local_skips");
+    std::shared_ptr<LocalCacheProbeReader> probe;
+    auto segment = reopen(true, &probe);
+    OlapReaderStatistics stats;
+    std::shared_ptr<SegmentFooterPB> footer;
+    ASSERT_TRUE(segment->_parse_footer(footer, &stats, nullptr).ok());
+    EXPECT_FALSE(segment->_footer_read_remote);
+    ASSERT_TRUE(segment->_create_column_meta_once(&stats).ok());
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(exposed_counter("segment_column_meta_region_local_skips") - skips_before, 1);
 }
 
 } // namespace doris::segment_v2

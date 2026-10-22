@@ -300,6 +300,8 @@ private:
     int64_t _meta_mem_usage;
     int64_t _tracked_meta_mem_usage = 0;
     std::atomic<int64_t> _column_meta_bytes {0};
+    // Whether parsing the footer read from remote storage (or a peer) rather than the local cache.
+    std::atomic<bool> _footer_read_remote {false};
     std::atomic<int64_t> _cache_charge {0};
     // The value last added to segment_real_retained_bytes for this segment.
     std::atomic<int64_t> _reported_real_bytes {0};
