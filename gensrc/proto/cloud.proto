@@ -1404,6 +1404,10 @@ message GetRowsetResponse {
     optional int64 partition_max_version = 5;
     // The cluster_id of the requester
     optional string requester_cluster_id = 6;
+    // True when no lazy-commit txn of the partition was pending when the rowsets were read, in
+    // the same meta-service transaction that read partition_max_version: every version up to
+    // partition_max_version that this tablet has no rowset for is then known to be empty.
+    optional bool lazy_commit_resolved = 7;
 }
 
 message GetSchemaDictRequest {

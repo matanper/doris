@@ -174,6 +174,46 @@ public:
     // tablets do, so MoW delete bitmaps and schema change alter_version handling are unaffected.
     bool can_use_hole_rowset_version_range() const;
 
+    // Implicit version gaps (see config::enable_implicit_version_gaps). A gap is a run of
+    // versions this tablet has no rowset for, known empty from a get_rowset response that read
+    // the partition version with no lazy-commit txn pending. It is a version graph edge only:
+    // there is no rowset, rowset meta or meta-service key for it. A reader or a compaction that
+    // needs it gets a transient empty hole rowset (see `on_demand_rowset_unlocked` and
+    // `traverse_gap_rowsets_unlocked`). A version is treated as empty only if it is inside a gap.
+    bool can_use_implicit_version_gaps() const;
+
+    // Record `versions`, none of them covered by a rowset or a gap and all at or below
+    // `watermark` (the partition max version of the response that found them empty), as a gap,
+    // merged with a gap ending right before it. MUST hold EXCLUSIVE `_meta_lock`.
+    void add_implicit_gaps(const Version& versions, const RowsetMetaSharedPtr& template_meta,
+                           int64_t watermark);
+
+    // Replace every gap with hole rowsets. MUST hold EXCLUSIVE `_meta_lock`.
+    Status materialize_implicit_gaps(std::unique_lock<BthreadSharedMutex>& meta_lock);
+
+    // The parts of `range` not covered by a gap. MUST hold `_meta_lock`.
+    std::vector<Version> versions_not_in_gaps_unlocked(const Version& range) const;
+
+    // Gaps, first version -> last version. MUST hold `_meta_lock`.
+    const std::map<int64_t, int64_t>& implicit_gaps_unlocked() const { return _gap_versions; }
+
+    // Visit a transient empty hole rowset for every gap, for compaction to pick from like any
+    // other rowset. MUST hold `_meta_lock`.
+    void traverse_gap_rowsets_unlocked(
+            const std::function<void(const RowsetSharedPtr&)>& visitor) const;
+
+    // Like traverse_rowsets_unlocked, then traverse_gap_rowsets_unlocked.
+    void traverse_rowsets_and_gaps_unlocked(
+            const std::function<void(const RowsetSharedPtr&)>& visitor) const {
+        traverse_rowsets_unlocked(visitor);
+        traverse_gap_rowsets_unlocked(visitor);
+    }
+
+    // INPUT_GAP_UNSAFE when a transient gap rowset among compaction `inputs` is no longer inside
+    // a gap of this tablet, or a rowset now overlaps it: the compaction must not commit, since
+    // its output would cover versions no longer known to be empty.
+    Status check_gap_inputs(const std::vector<RowsetSharedPtr>& inputs) const;
+
     // Fill every version in `versions` with empty hole rowsets. None of these versions may be
     // covered by a live rowset. `template_meta` provides the schema of the new rowsets.
     //
@@ -437,7 +477,6 @@ private:
     void _log_stuck_unused_rowset(const Rowset& rowset, long use_count, int64_t age_s);
 
 public:
-
     // A rowset already unused is not added, or counted, again.
     void add_unused_rowsets(const std::vector<RowsetSharedPtr>& rowsets);
     void remove_unused_rowsets();
@@ -691,6 +730,31 @@ private:
     // The hole rowset range [s, e] strictly holding `version` (s <= version < e) when no rowset
     // on the stale path ends at `version`, so a read of it needs an on-demand prefix.
     std::optional<Version> _hole_range_needing_prefix_unlocked(int64_t version) const;
+
+    // The gap holding `version`, if any.
+    std::optional<Version> _gap_containing_unlocked(int64_t version) const;
+    // A transient empty hole rowset for `version`, which must be a gap or a prefix [s, v] of
+    // gap [s, e]; shared with other holders while one is alive.
+    RowsetSharedPtr _transient_gap_rowset_unlocked(const Version& version) const;
+    // Whether `rs` is a transient gap rowset.
+    bool _is_transient_gap_rowset_unlocked(const RowsetSharedPtr& rs) const;
+    void _add_gap_edge_unlocked(const Version& gap);
+    void _erase_gap_unlocked(std::map<int64_t, int64_t>::iterator it);
+    // A compaction consumed transient gap `version`: drop it, or the part of the gap holding it.
+    // Returns whether the version graph still has the edge `version`.
+    bool _release_gap_input_unlocked(const Version& version);
+    // Drop the gaps a rowset of `to_add` overlaps; the parts it does not cover stay gaps. A gap
+    // inside the rowset moves to the stale path, which keeps its versions readable a while.
+    void _consume_gaps_overlapped_by(const std::vector<RowsetSharedPtr>& to_add,
+                                     std::unique_lock<BthreadSharedMutex>& meta_lock);
+
+    // Gaps, first version -> last version; disjoint, each a version graph edge.
+    std::map<int64_t, int64_t> _gap_versions;
+    // Partition max version of the newest response gaps were recorded from; every gap ends at
+    // or below it.
+    int64_t _gap_watermark = -1;
+    // Schema and storage settings of transient gap rowsets.
+    RowsetMetaSharedPtr _gap_template;
 
     // On-demand prefix rowsets, by version, while some reader holds them.
     mutable std::mutex _on_demand_prefix_lock;

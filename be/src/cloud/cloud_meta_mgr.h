@@ -165,8 +165,11 @@ public:
                                           int64_t tablet_id);
 
     // Fill version holes by creating empty rowsets for missing versions
+    // With `lazy_commit_resolved` (the get_rowset response read `max_version` with no lazy-commit
+    // txn pending), holes of a tablet that can use implicit version gaps become gaps.
     Status fill_version_holes(CloudTablet* tablet, int64_t max_version,
-                              std::unique_lock<BthreadSharedMutex>& wlock);
+                              std::unique_lock<BthreadSharedMutex>& wlock,
+                              bool lazy_commit_resolved = false);
 
     // Create an empty rowset to fill a version hole
     Status create_empty_rowset_for_hole(const CloudTablet* tablet, int64_t version,

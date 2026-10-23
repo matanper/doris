@@ -232,6 +232,8 @@ bvar::Adder<uint64_t> g_cloud_meta_mgr_ms_too_busy_reason_no_stress_condition_ma
 bvar::LatencyRecorder g_cloud_be_mow_get_dbm_lock_backoff_sleep_time(
         "cloud_be_mow_get_dbm_lock_backoff_sleep_time");
 bvar::Adder<uint64_t> g_cloud_version_hole_filled_count("cloud_version_hole_filled_count");
+bvar::Adder<uint64_t> g_implicit_gap_filled_count("implicit_gap_filled_count");
+bvar::Adder<uint64_t> g_implicit_gap_disabled_unsafe_ms("implicit_gap_disabled_unsafe_ms");
 
 class MetaServiceProxy {
 public:
@@ -982,7 +984,9 @@ Status CloudMetaMgr::sync_tablet_rowsets_unlocked(CloudTablet* tablet,
             // Fill version holes
             int64_t partition_max_version =
                     resp.has_partition_max_version() ? resp.partition_max_version() : -1;
-            RETURN_IF_ERROR(fill_version_holes(tablet, partition_max_version, wlock));
+            RETURN_IF_ERROR(fill_version_holes(
+                    tablet, partition_max_version, wlock,
+                    resp.has_lazy_commit_resolved() && resp.lazy_commit_resolved()));
 
             tablet->last_base_compaction_success_time_ms = stats.last_base_compaction_time_ms();
             tablet->last_cumu_compaction_success_time_ms = stats.last_cumu_compaction_time_ms();
@@ -2346,8 +2350,7 @@ void CloudMetaMgr::check_table_size_correctness(RowsetMeta& rs_meta) {
                      << ", rowset index disk size:" << rs_meta.index_disk_size()
                      << ", rowset real index disk size:" << total_inverted_index_size
                      << ", rowset total disk size:" << rs_meta.total_disk_size()
-                     << ", rowset segment path:"
-                     << remote_segment_path_of(rs_meta, 0);
+                     << ", rowset segment path:" << remote_segment_path_of(rs_meta, 0);
         DCHECK(false);
     }
 }
@@ -2442,10 +2445,17 @@ int64_t CloudMetaMgr::get_inverted_index_file_size(RowsetMeta& rs_meta) {
 }
 
 Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version,
-                                        std::unique_lock<BthreadSharedMutex>& wlock) {
+                                        std::unique_lock<BthreadSharedMutex>& wlock,
+                                        bool lazy_commit_resolved) {
     if (max_version <= 0) {
         return Status::OK();
     }
+    const bool gaps_enabled = tablet->can_use_implicit_version_gaps();
+    if (!gaps_enabled && !tablet->implicit_gaps_unlocked().empty()) {
+        // Implicit gaps were turned off: no version may depend on them any more.
+        RETURN_IF_ERROR(tablet->materialize_implicit_gaps(wlock));
+    }
+    const bool use_gaps = gaps_enabled && lazy_commit_resolved;
 
     // The index keeps the visible versions ordered and their holes current, so this runs in
     // O(log N + filled versions) under the exclusive meta lock instead of sorting every rowset
@@ -2475,6 +2485,12 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
     if (holes.empty()) {
         return Status::OK();
     }
+    if (gaps_enabled && !use_gaps) {
+        // The meta-service did not confirm the versions empty for this read.
+        g_implicit_gap_disabled_unsafe_ms << 1;
+    }
+    std::vector<std::pair<Version, RowsetMetaSharedPtr>> gap_ranges;
+    int64_t gap_version_count = 0;
 
     // A non-MoW RUNNING tablet fills each hole with hole rowsets covering version ranges (see
     // CloudTablet::add_hole_rowsets); other tablets keep one hole rowset per version.
@@ -2495,29 +2511,45 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
         int64_t first_to_fill = is_schema_change_tablet
                                         ? std::max(hole.first, tablet->alter_version() + 1)
                                         : hole.first;
-        if (first_to_fill <= hole.last) {
-            hole_version_count += hole.last - first_to_fill + 1;
+        if (first_to_fill > hole.last) {
+            continue;
         }
-        if (use_version_range) {
-            // Filled after the walk: adding rowsets changes the index `holes` came from.
-            if (first_to_fill <= hole.last) {
-                hole_ranges.emplace_back(Version(first_to_fill, hole.last), anchor_it->second);
+        // Gaps leave no version in the index, so their versions come back as holes on every
+        // sync; only the rest needs filling.
+        const auto to_fill =
+                tablet->versions_not_in_gaps_unlocked(Version(first_to_fill, hole.last));
+        for (const auto& range : to_fill) {
+            if (use_gaps) {
+                gap_version_count += range.second - range.first + 1;
+                gap_ranges.emplace_back(range, anchor_it->second);
+                continue;
             }
-        } else {
-            for (int64_t ver = first_to_fill; ver <= hole.last; ++ver) {
-                RowsetSharedPtr hole_rowset;
-                RETURN_IF_ERROR(create_empty_rowset_for_hole(tablet, ver, anchor_it->second,
-                                                             &hole_rowset));
-                hole_rowsets.push_back(hole_rowset);
+            hole_version_count += range.second - range.first + 1;
+            if (use_version_range) {
+                // Filled after the walk: adding rowsets changes the index `holes` came from.
+                hole_ranges.emplace_back(range, anchor_it->second);
+            } else {
+                for (int64_t ver = range.first; ver <= range.second; ++ver) {
+                    RowsetSharedPtr hole_rowset;
+                    RETURN_IF_ERROR(create_empty_rowset_for_hole(tablet, ver, anchor_it->second,
+                                                                 &hole_rowset));
+                    hole_rowsets.push_back(hole_rowset);
+                }
             }
         }
-        LOG(INFO) << "Created empty rowset for version hole, from " << hole.first << " to "
-                  << hole.last << " for tablet " << tablet->tablet_id()
-                  << (is_schema_change_tablet
-                              ? (", schema change tablet skipped filling versions <= " +
-                                 std::to_string(tablet->alter_version()))
-                              : "");
+        if (!to_fill.empty() && !use_gaps) {
+            LOG(INFO) << "Created empty rowset for version hole, from " << to_fill.front().first
+                      << " to " << to_fill.back().second << " for tablet " << tablet->tablet_id()
+                      << (is_schema_change_tablet
+                                  ? (", schema change tablet skipped filling versions <= " +
+                                     std::to_string(tablet->alter_version()))
+                                  : "");
+        }
     }
+    for (const auto& [versions, template_meta] : gap_ranges) {
+        tablet->add_implicit_gaps(versions, template_meta, max_version);
+    }
+    g_implicit_gap_filled_count << gap_version_count;
 
     if (!hole_rowsets.empty()) {
         tablet->add_rowsets(std::move(hole_rowsets), false, wlock, false);
@@ -2538,7 +2570,8 @@ Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet, int
                                         std::move(prev_rowset_meta), rowset);
 }
 
-Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet, const Version& versions,
+Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet,
+                                                  const Version& versions,
                                                   RowsetMetaSharedPtr prev_rowset_meta,
                                                   RowsetSharedPtr* rowset,
                                                   const RowsetId* rowset_id) {
