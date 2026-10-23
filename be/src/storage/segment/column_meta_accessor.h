@@ -104,8 +104,8 @@ public:
 
     // Read the whole external Column Meta Region (V3) with one read and keep it, so that the
     // later meta lookups of this accessor, and of the VARIANT readers given meta_region(), parse
-    // from memory instead of reading the file. Does nothing for the inline (V2) layout, or when
-    // the region is larger than max_bytes. Not thread-safe: call it before the accessor is shared.
+    // from memory instead of reading the file. Does nothing for the inline (V2) layout, when the
+    // region is larger than max_bytes, or when the local file cache already holds all of it. Not thread-safe: call it before the accessor is shared.
     Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
                             OlapReaderStatistics* stats = nullptr,
                             const io::IOContext* source_io_ctx = nullptr);

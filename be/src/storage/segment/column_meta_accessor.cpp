@@ -23,11 +23,17 @@
 #include <utility>
 #include <vector>
 
+#include <bvar/bvar.h>
+
+#include "io/fs/file_reader.h"
 #include "io/io_common.h"
 #include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/segment.h" // SEGMENT_FOOTER_VERSION_V3_EXT_COL_META
 
 namespace doris::segment_v2 {
+
+// Segments whose column meta region was left unread because the local file cache already held it.
+bvar::Adder<int64_t> g_column_meta_region_local_skips("segment_column_meta_region_local_skips");
 
 // Abstract base implementation shared by both V2 and V3 layouts.
 class ColumnMetaAccessor::Impl {
@@ -293,6 +299,14 @@ public:
         if (_holder->get() != nullptr || _ptrs.region_end <= _ptrs.region_start ||
             _ptrs.region_end - _ptrs.region_start >
                     static_cast<uint64_t>(std::max<int64_t>(0, max_bytes))) {
+            return Status::OK();
+        }
+        // A region the local file cache already holds is cheaper to read in the few small spans
+        // the lookups need: re-reading and copying the whole region costs more than they do. The
+        // whole region is read when some of it would come from remote storage.
+        if (_file_reader->is_range_in_local_cache(_ptrs.region_start,
+                                                  _ptrs.region_end - _ptrs.region_start)) {
+            g_column_meta_region_local_skips << 1;
             return Status::OK();
         }
         std::shared_ptr<const ColumnMetaRegion> region;
