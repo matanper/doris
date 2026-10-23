@@ -17,30 +17,32 @@
 
 #include <CLucene.h>
 #include <CLucene/config/repl_wchar.h>
-#include <time.h>
 #include <bvar/bvar.h>
 #include <gtest/gtest.h>
-#include <roaring/roaring.hh>
+#include <time.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <random>
+#include <roaring/roaring.hh>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "common/config.h"
-#include "util/defer_op.h"
-#include "core/data_type_serde/data_type_variant_v2_serde.h"
-#include "core/column/variant_v2/column_variant_v2.h"
 #include "core/column/column_nullable.h"
+#include "core/column/variant_v2/column_variant_v2.h"
+#include "core/data_type_serde/data_type_variant_v2_serde.h"
 #include "runtime/exec_env.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_reader.h"
-#include "storage/rowset/beta_rowset.h"
 #include "storage/index/inverted/inverted_index_desc.h"
+#include "storage/rowset/beta_rowset.h"
 #include "storage/variant/index_storage_variant_test_base.h"
+#include "util/defer_op.h"
 
 namespace doris::index_storage_test {
 namespace {
@@ -175,8 +177,8 @@ protected:
     }
     bool _old_index_compaction = true;
 
-    IndexTabletOptions options(int64_t tablet_id, const std::set<int64_t>& index_ids = {20001, 20002,
-                                                                             20003}) {
+    IndexTabletOptions options(int64_t tablet_id,
+                               const std::set<int64_t>& index_ids = {20001, 20002, 20003}) {
         IndexTabletOptions options;
         options.tablet_id = tablet_id;
         options.index_storage_format = InvertedIndexStorageFormatPB::V3;
@@ -208,10 +210,21 @@ protected:
         return options;
     }
 
-    static IndexRowsetSpec rowset(int64_t version, int rows = 600) {
+    static constexpr int kDeletedRows = 100;
+
+    // With deleted_row_terms, the first kDeletedRows rows of version 1 carry terms that no other
+    // row has, so a delete of exactly those rows leaves terms whose every posting is dropped.
+    static IndexRowsetSpec rowset(int64_t version, int rows = 600, bool deleted_row_terms = false) {
         std::mt19937_64 rng(77 + version);
         std::vector<std::string> jsons;
         for (int row = 0; row < rows; ++row) {
+            if (deleted_row_terms && version == 1 && row < kDeletedRows) {
+                const std::string n = std::to_string(row);
+                jsons.push_back(R"({"msg":"purgedterm)" + n + R"( logged in","host":"doomed-)" + n +
+                                R"(.corp.example.com","code":"ZGONE)" + n + R"(","other":)" + n +
+                                "}");
+                continue;
+            }
             std::string json = "{";
             if (row % 7 != 3) {
                 json += R"("msg":"user u)" + std::to_string(rng() % 50) + " logged in from host " +
@@ -228,8 +241,8 @@ protected:
         IndexRowsetSpec spec;
         spec.version = version;
         spec.max_rows_per_segment = 100000;
-        spec.batches.push_back(IndexBatch::single_variant(std::move(jsons),
-                                                          static_cast<int32_t>(version) * 1000));
+        spec.batches.push_back(
+                IndexBatch::single_variant(std::move(jsons), static_cast<int32_t>(version) * 1000));
         return spec;
     }
 
@@ -252,6 +265,52 @@ protected:
         if (compaction_cpu != nullptr) {
             *compaction_cpu = process_cpu_seconds() - cpu_before;
         }
+        EXPECT_TRUE(compacted.has_value()) << compacted.error();
+        return compacted.has_value() ? compacted.value() : nullptr;
+    }
+
+    // A full compaction of three written rowsets plus a fourth whose delete predicate removes
+    // keys [1000, 1000 + kDeletedRows), the rows of version 1 that alone hold the
+    // deleted_row_terms. *source receives the version 1 rowset.
+    RowsetSharedPtr write_delete_and_compact(int64_t tablet_id, RowsetSharedPtr* source) {
+        EXPECT_TRUE(create_tablet(options(tablet_id)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            auto written = write_rowset(rowset(version, 600, true));
+            EXPECT_TRUE(written.has_value()) << written.error();
+            if (!written.has_value()) {
+                return nullptr;
+            }
+            rowsets.push_back(written.value());
+        }
+        *source = rowsets[1];
+
+        IndexRowsetSpec spec;
+        spec.version = 3;
+        spec.max_rows_per_segment = 100000;
+        spec.batches.push_back(IndexBatch::single_variant(
+                {R"({"msg":"user u1 logged in from host 1 after 1 retries",)"
+                 R"("host":"web-1.corp.example.com","code":"E1","other":0})"},
+                3000));
+        auto written = write_rowset(spec);
+        EXPECT_TRUE(written.has_value()) << written.error();
+        if (!written.has_value()) {
+            return nullptr;
+        }
+        DeletePredicatePB predicate;
+        predicate.set_version(3);
+        for (const auto& [op, value] : std::vector<std::pair<std::string, std::string>> {
+                     {">=", "1000"}, {"<<", std::to_string(1000 + kDeletedRows)}}) {
+            auto* sub = predicate.add_sub_predicates_v2();
+            sub->set_column_unique_id(1);
+            sub->set_column_name("k");
+            sub->set_op(op);
+            sub->set_cond_value(value);
+        }
+        written.value()->rowset_meta()->set_delete_predicate(std::move(predicate));
+        rowsets.push_back(written.value());
+
+        auto compacted = compact_rowsets(IndexCompactionKind::FULL, rowsets);
         EXPECT_TRUE(compacted.has_value()) << compacted.error();
         return compacted.has_value() ? compacted.value() : nullptr;
     }
@@ -311,8 +370,70 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnes) {
         auto expected = postings(dir.get());
         auto actual = postings(it->second.get());
         ASSERT_FALSE(expected.empty()) << key.first << " " << key.second;
-        EXPECT_TRUE(expected == actual) << key.first << " " << key.second << ": "
-                                        << expected.size() << " vs " << actual.size() << " terms";
+        EXPECT_TRUE(expected == actual) << key.first << " " << key.second << ": " << expected.size()
+                                        << " vs " << actual.size() << " terms";
+        ++compared;
+    }
+    EXPECT_EQ(compared, 3);
+}
+
+// Rows removed by a delete predicate map to no destination row, so terms that only those rows
+// held have no documents left. The merged indexes drop them exactly as a rebuild does: the
+// complete term maps are equal and none of those terms remain.
+TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnesWithDeletedRows) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    Defer restore {[&] { config::enable_variant_typed_path_index_compaction = old_flag; }};
+    const auto deleted_only = [](const std::string& term) {
+        return term.find("purgedterm") != std::string::npos ||
+               term.find("doomed") != std::string::npos || term.find("ZGONE") != std::string::npos;
+    };
+
+    config::enable_variant_typed_path_index_compaction = false;
+    RowsetSharedPtr rebuilt_source;
+    auto rebuilt = write_delete_and_compact(130011, &rebuilt_source);
+    ASSERT_NE(rebuilt, nullptr);
+
+    config::enable_variant_typed_path_index_compaction = true;
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    RowsetSharedPtr merged_source;
+    auto merged = write_delete_and_compact(130012, &merged_source);
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 0);
+    EXPECT_EQ(rebuilt->num_rows(), 3 * 600 + 1 - kDeletedRows);
+    EXPECT_EQ(merged->num_rows(), rebuilt->num_rows());
+
+    // The source index does hold the deleted-only terms, in each of the three paths.
+    std::shared_ptr<IndexFileReader> source_reader;
+    size_t source_paths_with_deleted_terms = 0;
+    for (const auto& [key, dir] : directories(merged_source, &source_reader)) {
+        auto terms = postings(dir.get());
+        if (std::any_of(terms.begin(), terms.end(),
+                        [&](const auto& entry) { return deleted_only(entry.first); })) {
+            ++source_paths_with_deleted_terms;
+        }
+    }
+    EXPECT_EQ(source_paths_with_deleted_terms, 3);
+
+    std::shared_ptr<IndexFileReader> rebuilt_reader;
+    std::shared_ptr<IndexFileReader> merged_reader;
+    auto rebuilt_dirs = directories(rebuilt, &rebuilt_reader);
+    auto merged_dirs = directories(merged, &merged_reader);
+    ASSERT_EQ(rebuilt_dirs.size(), merged_dirs.size());
+    size_t compared = 0;
+    for (const auto& [key, dir] : rebuilt_dirs) {
+        auto it = merged_dirs.find(key);
+        ASSERT_NE(it, merged_dirs.end()) << key.first << " " << key.second;
+        auto expected = postings(dir.get());
+        auto actual = postings(it->second.get());
+        ASSERT_FALSE(expected.empty()) << key.first << " " << key.second;
+        EXPECT_TRUE(expected == actual) << key.first << " " << key.second << ": " << expected.size()
+                                        << " vs " << actual.size() << " terms";
+        for (const auto& [term, docs] : actual) {
+            EXPECT_FALSE(deleted_only(term)) << key.first << " keeps " << term;
+            EXPECT_FALSE(docs.empty()) << key.first << " keeps " << term << " with no documents";
+        }
         ++compared;
     }
     EXPECT_EQ(compared, 3);
@@ -403,6 +524,114 @@ TEST_F(VariantTypedPathIndexMergeTest, MergeHandlesAbsentAllNullAndSparseV2Paths
     EXPECT_GE(compared, 6);
 }
 
+// Index properties are compared as the schema defines the index, by what decides its content:
+// per-subcolumn copies of an index are ignored, defaults equal missing keys, and a real
+// difference or an index known only through copies rebuilds. (A rowset in another index storage
+// format cannot be read by a compaction at all, so its rejection is not exercised here.)
+TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
+    struct Case {
+        const char* name;
+        std::function<void(TabletSchemaPB&)> patch;
+        int64_t merged;
+        int64_t props_mismatch;
+        int64_t format_mismatch;
+    };
+    auto reorder = [](TabletSchemaPB& pb,
+                      const std::function<void(std::vector<TabletIndexPB>&)>& fn) {
+        std::vector<TabletIndexPB> indexes(pb.index().begin(), pb.index().end());
+        fn(indexes);
+        pb.clear_index();
+        for (auto& index : indexes) {
+            *pb.add_index() = index;
+        }
+    };
+    auto stripped_copy = [](const TabletIndexPB& index) {
+        TabletIndexPB copy = index;
+        copy.set_index_suffix_name("v%2Eother");
+        copy.mutable_properties()->erase("parser");
+        copy.mutable_properties()->erase("support_phrase");
+        return copy;
+    };
+    const std::vector<Case> cases {
+            {"stripped copy listed first",
+             [&](TabletSchemaPB& pb) {
+                 reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {
+                     for (const auto& index : std::vector<TabletIndexPB>(indexes)) {
+                         if (index.index_id() == 20001) {
+                             indexes.insert(indexes.begin(), stripped_copy(index));
+                         }
+                     }
+                 });
+             },
+             3, 0, 0},
+            {"explicit default",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["lower_case"] = "true";
+                     }
+                 }
+             },
+             3, 0, 0},
+            {"different parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["parser"] = "unicode";
+                     }
+                 }
+             },
+             2, 1, 0},
+            {"only copies",
+             [&](TabletSchemaPB& pb) {
+                 reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {
+                     for (auto& index : indexes) {
+                         if (index.index_id() == 20001) {
+                             index.set_index_suffix_name("v%2Eother");
+                         }
+                     }
+                 });
+             },
+             2, 1, 0},
+    };
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    Defer restore {[&]() { config::enable_variant_typed_path_index_compaction = old_flag; }};
+    int64_t tablet_id = 130100;
+    for (const auto& c : cases) {
+        ASSERT_TRUE(create_tablet(options(++tablet_id)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            auto written = write_rowset(rowset(version));
+            ASSERT_TRUE(written.has_value()) << written.error();
+            rowsets.push_back(written.value());
+        }
+        // The last input carries the patched schema; the output follows the first one.
+        TabletSchemaPB pb;
+        rowsets[2]->tablet_schema()->to_schema_pb(&pb);
+        c.patch(pb);
+        auto patched = std::make_shared<TabletSchema>();
+        patched->init_from_pb(pb);
+        rowsets[2]->rowset_meta()->set_tablet_schema(patched);
+        rowsets[2]->_schema = patched;
+
+        const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+        const int64_t props_before = exposed("compaction_variant_index_rebuild_props_mismatch");
+        const int64_t format_before =
+                exposed("compaction_variant_index_rebuild_props_format_mismatch");
+        auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+        ASSERT_TRUE(compacted.has_value()) << c.name << ": " << compacted.error();
+        EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, c.merged)
+                << c.name;
+        EXPECT_EQ(exposed("compaction_variant_index_rebuild_props_mismatch") - props_before,
+                  c.props_mismatch)
+                << c.name;
+        EXPECT_EQ(exposed("compaction_variant_index_rebuild_props_format_mismatch") - format_before,
+                  c.format_mismatch)
+                << c.name;
+    }
+}
+
 // Typed paths shaped like melian.logs fields, one index per run.
 struct BenchKind {
     std::string name;
@@ -442,8 +671,8 @@ protected:
     }
 
     static std::string word(std::mt19937_64& rng, size_t vocabulary) {
-        static const char* syllables[] = {"ka", "lo", "mi", "ten", "ra", "vex", "sul", "po",
-                                          "dri", "an", "qu", "zor", "el", "ny", "fa", "gim"};
+        static const char* syllables[] = {"ka",  "lo", "mi", "ten", "ra", "vex", "sul", "po",
+                                          "dri", "an", "qu", "zor", "el", "ny",  "fa",  "gim"};
         uint64_t id = rng() % vocabulary;
         std::string w;
         do {
@@ -482,15 +711,15 @@ protected:
                                std::to_string(rng() % 100) + ".corp";
             std::string json = R"({"message":")" + message + R"(","cmd_line":")" + cmd +
                                R"(","file_path":")" + path + R"(","hostname":")" + host +
-                               R"(","uid":")" + hex(rng, 32) + R"(","n":)" +
-                               std::to_string(row) + "}";
+                               R"(","uid":")" + hex(rng, 32) + R"(","n":)" + std::to_string(row) +
+                               "}";
             jsons.push_back(std::move(json));
         }
         IndexRowsetSpec spec;
         spec.version = version;
         spec.max_rows_per_segment = 10000000;
-        spec.batches.push_back(IndexBatch::single_variant(std::move(jsons),
-                                                          static_cast<int32_t>(version) * rows));
+        spec.batches.push_back(
+                IndexBatch::single_variant(std::move(jsons), static_cast<int32_t>(version) * rows));
         return spec;
     }
 
@@ -554,7 +783,9 @@ TEST_F(VariantTypedPathIndexMergeBench, MergeVersusRebuildCpu) {
                                                            {"support_phrase", "true"}};
     const std::vector<BenchKind> kinds {
             {"no index", "", {}},
-            {"alnum_lower+phrase", "message", {{"analyzer", "alnum_lower"}, {"support_phrase", "true"}}},
+            {"alnum_lower+phrase",
+             "message",
+             {{"analyzer", "alnum_lower"}, {"support_phrase", "true"}}},
             {"ngram4_lower+phrase cmd", "cmd_line", ngram_phrase},
             {"ngram4_lower+phrase path", "file_path", ngram_phrase},
             {"ngram4_lower+phrase name", "hostname", ngram_phrase},
@@ -569,8 +800,8 @@ TEST_F(VariantTypedPathIndexMergeBench, MergeVersusRebuildCpu) {
             const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
             auto compacted = bench_write_and_compact(++tablet_id, kind, rows, &cpu);
             ASSERT_NE(compacted, nullptr);
-            std::cout << "MERGE_BENCH kind=" << kind.name << " mode="
-                      << (merge ? "merge" : "rebuild") << " merged_paths="
+            std::cout << "MERGE_BENCH kind=" << kind.name
+                      << " mode=" << (merge ? "merge" : "rebuild") << " merged_paths="
                       << exposed("compaction_variant_index_merge_paths") - merged_before
                       << " rows=" << compacted->num_rows() << " compaction_cpu_s=" << cpu
                       << std::endl;
