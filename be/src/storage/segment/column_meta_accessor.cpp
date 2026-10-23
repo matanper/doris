@@ -17,6 +17,7 @@
 
 #include "storage/segment/column_meta_accessor.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -59,6 +60,12 @@ public:
                 },
                 stats, source_io_ctx);
     }
+    virtual Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
+                                    OlapReaderStatistics* stats,
+                                    const io::IOContext* source_io_ctx) {
+        return Status::OK();
+    }
+    virtual std::shared_ptr<const ColumnMetaRegion> meta_region() const { return nullptr; }
 };
 
 // V2: inline layout using only footer.columns().
@@ -134,7 +141,8 @@ public:
         // Prefer external Column Meta Region first.
         if (column_ordinal_id < _ptrs.num_columns) {
             return ExternalColMetaUtil::read_col_meta(_file_reader, footer, _ptrs,
-                                                      column_ordinal_id, out, stats, source_io_ctx);
+                                                      column_ordinal_id, out, stats, source_io_ctx,
+                                                      _region.get());
         }
         return Status::Corruption(
                 "no column meta available for column_id={} (inline/external missing)",
@@ -145,6 +153,14 @@ public:
                           const std::function<void(const ColumnMetaPB&)>& visitor,
                           OlapReaderStatistics* stats,
                           const io::IOContext* source_io_ctx) const override {
+        if (_region != nullptr) {
+            for (uint32_t i = 0; i < _ptrs.num_columns; ++i) {
+                ColumnMetaPB meta;
+                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*_region, i, &meta));
+                visitor(meta);
+            }
+            return Status::OK();
+        }
         const uint64_t region_size = (_ptrs.region_end > _ptrs.region_start)
                                              ? (_ptrs.region_end - _ptrs.region_start)
                                              : 0;
@@ -203,6 +219,17 @@ public:
         if (footer.column_meta_entries_size() != _ptrs.num_columns) {
             return Status::Corruption("column_meta_entries size mismatch");
         }
+        if (_region != nullptr) {
+            for (uint32_t i = 0; i < _ptrs.num_columns; ++i) {
+                if (footer.column_meta_entries(static_cast<int>(i)).unique_id() == -1) {
+                    continue;
+                }
+                ColumnMetaPB meta;
+                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*_region, i, &meta));
+                visitor(meta);
+            }
+            return Status::OK();
+        }
         struct Span {
             uint64_t begin;
             uint64_t end;
@@ -257,9 +284,25 @@ public:
         return Status::OK();
     }
 
+    Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
+                            OlapReaderStatistics* stats,
+                            const io::IOContext* source_io_ctx) override {
+        if (_region != nullptr || _ptrs.region_end <= _ptrs.region_start ||
+            _ptrs.region_end - _ptrs.region_start >
+                    static_cast<uint64_t>(std::max<int64_t>(0, max_bytes))) {
+            return Status::OK();
+        }
+        return ExternalColMetaUtil::read_region(_file_reader, footer, _ptrs, &_region, stats,
+                                                source_io_ctx);
+    }
+
+    std::shared_ptr<const ColumnMetaRegion> meta_region() const override { return _region; }
+
 private:
     io::FileReaderSPtr _file_reader;
     ExternalColMetaUtil::ExternalMetaPointers _ptrs;
+    // Set by load_meta_region before the accessor is shared, and read-only after.
+    std::shared_ptr<const ColumnMetaRegion> _region;
 };
 
 ColumnMetaAccessor::ColumnMetaAccessor() = default;
@@ -316,6 +359,16 @@ Status ColumnMetaAccessor::traverse_top_level_metas(
         const SegmentFooterPB& footer, const std::function<void(const ColumnMetaPB&)>& visitor,
         OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) const {
     return _impl->traverse_top_level_metas(footer, visitor, stats, source_io_ctx);
+}
+
+Status ColumnMetaAccessor::load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
+                                            OlapReaderStatistics* stats,
+                                            const io::IOContext* source_io_ctx) {
+    return _impl->load_meta_region(footer, max_bytes, stats, source_io_ctx);
+}
+
+std::shared_ptr<const ColumnMetaRegion> ColumnMetaAccessor::meta_region() const {
+    return _impl == nullptr ? nullptr : _impl->meta_region();
 }
 
 } // namespace doris::segment_v2

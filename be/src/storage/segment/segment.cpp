@@ -75,6 +75,7 @@
 #include "storage/segment/column_reader.h"
 #include "storage/segment/column_reader_cache.h"
 #include "storage/segment/empty_segment_iterator.h"
+#include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/page_io.h"
 #include "storage/segment/page_pointer.h"
 #include "storage/segment/segment_iterator.h"
@@ -822,7 +823,13 @@ Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
         // counts here.
         const int64_t allocated_before = thread_net_allocated_bytes();
         Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-        _column_meta_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
+        // The allocation delta misses what a thread without heap accounting allocates, so the
+        // column meta region, the bulk of it, is charged by its own size at least.
+        const auto region =
+                _column_meta_accessor != nullptr ? _column_meta_accessor->meta_region() : nullptr;
+        const int64_t region_bytes = region != nullptr ? region->charged_bytes : 0;
+        _column_meta_bytes = std::max<int64_t>(
+                {0, thread_net_allocated_bytes() - allocated_before, region_bytes});
         return st;
     });
 }
@@ -832,12 +839,23 @@ Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderSta
     // Initialize column meta accessor which internally maintains uid -> column_ordinal mapping.
     _column_meta_accessor = std::make_unique<ColumnMetaAccessor>();
     RETURN_IF_ERROR(_column_meta_accessor->init(footer, _file_reader));
+    // One read of the whole meta region serves every later meta lookup of this segment: the
+    // top-level metas below, each column reader's meta and each VARIANT subcolumn's. The region
+    // is allocated here, so it is counted in _column_meta_bytes and charged to the segment cache.
+    if (const int64_t max_bytes = config::segment_column_meta_region_buffer_max_bytes;
+        max_bytes > 0) {
+        auto st = _column_meta_accessor->load_meta_region(footer, max_bytes, stats, source_io_ctx);
+        if (!st.ok()) {
+            LOG(WARNING) << "Failed to read the column meta region of " << _file_reader->path()
+                         << ", metas are read one at a time: " << st;
+        }
+    }
 
     if (config::enable_adaptive_batch_size) {
         // Cache raw_data_bytes per column uid for adaptive batch size prediction. Only top-level
-        // columns are kept, so only their metas are read: a wide VARIANT's subcolumn metas, most
-        // of the meta region, are skipped. This runs under call_once, so no thread-safety
-        // concerns.
+        // columns are kept. Without the region in memory only their metas are read: a wide
+        // VARIANT's subcolumn metas, most of the region, are skipped. This runs under call_once,
+        // so no thread-safety concerns.
         auto st = _column_meta_accessor->traverse_top_level_metas(
                 footer,
                 [this](const ColumnMetaPB& meta) {

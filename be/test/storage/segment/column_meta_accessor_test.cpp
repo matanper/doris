@@ -17,6 +17,7 @@
 
 #include "storage/segment/column_meta_accessor.h"
 
+#include <bvar/bvar.h>
 #include <crc32c/crc32c.h>
 #include <gtest/gtest.h>
 
@@ -912,6 +913,114 @@ TEST(ColumnMetaAccessorTest, V3_TopLevelTraverseReadsOnlyTopLevelMetas) {
     EXPECT_EQ(counting->reads.size(), 3);
     EXPECT_EQ(counting->bytes_read(), top_level_bytes);
     EXPECT_LT(counting->bytes_read() * 50, region_bytes);
+}
+
+// With the meta region loaded, one read of the region serves the top-level traverse, the full
+// traverse and every meta lookup, which return the same metas as reading each one from the file.
+// The region's heap is counted while it lives. A region over the limit is not loaded.
+TEST(ColumnMetaAccessorTest, V3_LoadedMetaRegionServesEveryMetaFromOneRead) {
+    auto exposed = [](const std::string& name) {
+        return std::stoll(bvar::Variable::describe_exposed(name));
+    };
+    std::vector<ColumnMetaPB> metas;
+    uint32_t column_id = 0;
+    metas.push_back(make_meta(column_id++, 1, 1001, ""));
+    metas.push_back(make_meta(column_id++, 2, 1002, ""));
+    for (int i = 0; i < 500; ++i) {
+        metas.push_back(make_meta(column_id++, -1, 10000 + i, "v.k" + std::to_string(i)));
+    }
+    metas.push_back(make_meta(column_id++, 3, 1003, ""));
+
+    SegmentFooterPB footer;
+    footer.set_version(SEGMENT_FOOTER_VERSION_V3_EXT_COL_META);
+    std::string file_path = make_test_file_path("v3_meta_region_buffer.bin");
+    auto fs = io::global_local_filesystem();
+    io::FileWriterPtr fw;
+    ASSERT_TRUE(fs->create_file(file_path, &fw).ok());
+    ASSERT_TRUE(fw->append(Slice(std::string(4096, 'X'))).ok());
+    const uint64_t region_start = fw->bytes_appended();
+    footer.set_col_meta_region_start(region_start);
+    for (const auto& meta : metas) {
+        std::string bytes;
+        ASSERT_TRUE(meta.SerializeToString(&bytes));
+        ASSERT_TRUE(fw->append(Slice(bytes)).ok());
+        auto* entry = footer.add_column_meta_entries();
+        entry->set_unique_id(static_cast<int32_t>(meta.unique_id()));
+        entry->set_length(static_cast<uint32_t>(bytes.size()));
+    }
+    const uint64_t region_bytes = fw->bytes_appended() - region_start;
+    ASSERT_TRUE(append_footer_trailer(fw.get(), &footer).ok());
+    ASSERT_TRUE(fw->close().ok());
+
+    io::FileReaderSPtr fr;
+    io::FileReaderOptions opts;
+    ASSERT_TRUE(fs->open_file(file_path, &fr, &opts).ok());
+    SegmentFooterPB loaded;
+    ASSERT_TRUE(read_footer_from_file(fr, &loaded).ok());
+
+    auto all_metas = [&](const ColumnMetaAccessor& accessor) {
+        std::vector<std::string> out;
+        for (uint32_t i = 0; i < metas.size(); ++i) {
+            ColumnMetaPB meta;
+            EXPECT_TRUE(accessor.get_column_meta_by_column_ordinal_id(loaded, i, &meta).ok());
+            out.push_back(meta.SerializeAsString());
+        }
+        return out;
+    };
+    ColumnMetaAccessor unbuffered;
+    ASSERT_TRUE(unbuffered.init(loaded, fr).ok());
+    EXPECT_EQ(unbuffered.meta_region(), nullptr);
+    const auto expected_metas = all_metas(unbuffered);
+    const auto expected_top_level = raw_bytes_by_uid(unbuffered, loaded, true);
+    const auto expected_all = raw_bytes_by_uid(unbuffered, loaded, false);
+    ASSERT_EQ(expected_top_level.size(), 3);
+
+    const int64_t bytes_before = exposed("segment_column_meta_region_bytes");
+    const int64_t regions_before = exposed("segment_column_meta_regions");
+    {
+        auto counting = std::make_shared<CountingFileReader>(fr);
+        ColumnMetaAccessor accessor;
+        ASSERT_TRUE(accessor.init(loaded, counting).ok());
+        ASSERT_TRUE(accessor.load_meta_region(loaded, 1 << 30).ok());
+        ASSERT_NE(accessor.meta_region(), nullptr);
+        ASSERT_EQ(counting->reads.size(), 1);
+        EXPECT_EQ(counting->reads[0].first, region_start);
+        EXPECT_EQ(counting->reads[0].second, region_bytes);
+
+        EXPECT_EQ(raw_bytes_by_uid(accessor, loaded, true), expected_top_level);
+        EXPECT_EQ(raw_bytes_by_uid(accessor, loaded, false), expected_all);
+        EXPECT_EQ(all_metas(accessor), expected_metas);
+        ColumnMetaPB by_uid;
+        ASSERT_TRUE(accessor.get_column_meta_by_uid(loaded, 3, &by_uid).ok());
+        EXPECT_EQ(by_uid.raw_data_bytes(), 1003);
+        EXPECT_EQ(counting->reads.size(), 1);
+
+        const int64_t charged = accessor.meta_region()->charged_bytes;
+        EXPECT_GE(charged, static_cast<int64_t>(region_bytes));
+        EXPECT_EQ(exposed("segment_column_meta_region_bytes") - bytes_before, charged);
+        EXPECT_EQ(exposed("segment_column_meta_regions") - regions_before, 1);
+    }
+    EXPECT_EQ(exposed("segment_column_meta_region_bytes"), bytes_before);
+    EXPECT_EQ(exposed("segment_column_meta_regions"), regions_before);
+
+    auto counting = std::make_shared<CountingFileReader>(fr);
+    ColumnMetaAccessor limited;
+    ASSERT_TRUE(limited.init(loaded, counting).ok());
+    ASSERT_TRUE(limited.load_meta_region(loaded, static_cast<int64_t>(region_bytes) - 1).ok());
+    EXPECT_EQ(limited.meta_region(), nullptr);
+    EXPECT_TRUE(counting->reads.empty());
+    EXPECT_EQ(all_metas(limited), expected_metas);
+    EXPECT_EQ(counting->reads.size(), metas.size());
+}
+
+// A meta whose offsets run past the bytes of its region is Corruption.
+TEST(ColumnMetaAccessorTest, V3_MetaRegionEntriesBeyondTheRegionAreCorruption) {
+    ColumnMetaRegion region;
+    region.bytes = "abc";
+    region.offsets = {0, 2, 5};
+    ColumnMetaPB meta;
+    EXPECT_TRUE(ExternalColMetaUtil::parse_col_meta(region, 1, &meta).is<ErrorCode::CORRUPTION>());
+    EXPECT_TRUE(ExternalColMetaUtil::parse_col_meta(region, 2, &meta).is<ErrorCode::CORRUPTION>());
 }
 
 // The inline (V2) layout visits the top-level metas of footer.columns() only.
