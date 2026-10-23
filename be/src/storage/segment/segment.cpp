@@ -523,10 +523,20 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
                 options_with_pruned_predicates.col_id_to_predicates[pred->column_id()]
                         ->add_column_predicate(SingleColumnBlockPredicate::create_unique(pred));
             }
-            return iter->get()->init(options_with_pruned_predicates);
+            auto st = iter->get()->init(options_with_pruned_predicates);
+            release_column_meta_region();
+            return st;
         }
     }
-    return iter->get()->init(read_options);
+    auto st = iter->get()->init(read_options);
+    release_column_meta_region();
+    return st;
+}
+
+void Segment::release_column_meta_region() {
+    if (_create_column_meta_once_call.has_called() && _column_meta_accessor != nullptr) {
+        _column_meta_accessor->release_meta_region();
+    }
 }
 
 Status Segment::_write_error_file(size_t file_size, size_t offset, size_t bytes_read, char* data,
@@ -823,13 +833,14 @@ Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
         // counts here.
         const int64_t allocated_before = thread_net_allocated_bytes();
         Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-        // The allocation delta misses what a thread without heap accounting allocates, so the
-        // column meta region, the bulk of it, is charged by its own size at least.
+        // The column meta region is let go after the segment's first iterator is set up (see
+        // `release_column_meta_region`), so it never counts toward the segment cache charge.
         const auto region =
                 _column_meta_accessor != nullptr ? _column_meta_accessor->meta_region() : nullptr;
         const int64_t region_bytes = region != nullptr ? region->charged_bytes : 0;
+        const int64_t allocated = thread_net_allocated_bytes() - allocated_before;
         _column_meta_bytes = std::max<int64_t>(
-                {0, thread_net_allocated_bytes() - allocated_before, region_bytes});
+                0, allocated >= region_bytes ? allocated - region_bytes : allocated);
         return st;
     });
 }

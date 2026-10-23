@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,6 +69,24 @@ struct ColumnMetaRegion {
     // Heap held by bytes and offsets, counted in the segment_column_meta_region_bytes bvar while
     // the region lives.
     int64_t charged_bytes = 0;
+};
+
+// A segment's column meta region while the segment keeps it, shared by its column meta accessor
+// and VARIANT readers. Once released, they read each meta from the file again.
+class ColumnMetaRegionHolder {
+public:
+    std::shared_ptr<const ColumnMetaRegion> get() const {
+        std::lock_guard lock(_mutex);
+        return _region;
+    }
+    void set(std::shared_ptr<const ColumnMetaRegion> region) {
+        std::lock_guard lock(_mutex);
+        _region = std::move(region);
+    }
+
+private:
+    mutable std::mutex _mutex;
+    std::shared_ptr<const ColumnMetaRegion> _region;
 };
 
 // Wrapper class to expose static methods for external column meta utilities.

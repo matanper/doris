@@ -66,6 +66,8 @@ public:
         return Status::OK();
     }
     virtual std::shared_ptr<const ColumnMetaRegion> meta_region() const { return nullptr; }
+    virtual std::shared_ptr<ColumnMetaRegionHolder> meta_region_holder() const { return nullptr; }
+    virtual void release_meta_region() {}
 };
 
 // V2: inline layout using only footer.columns().
@@ -140,9 +142,10 @@ public:
                                                 const io::IOContext* source_io_ctx) const override {
         // Prefer external Column Meta Region first.
         if (column_ordinal_id < _ptrs.num_columns) {
+            const auto region = _holder->get();
             return ExternalColMetaUtil::read_col_meta(_file_reader, footer, _ptrs,
                                                       column_ordinal_id, out, stats, source_io_ctx,
-                                                      _region.get());
+                                                      region.get());
         }
         return Status::Corruption(
                 "no column meta available for column_id={} (inline/external missing)",
@@ -153,10 +156,10 @@ public:
                           const std::function<void(const ColumnMetaPB&)>& visitor,
                           OlapReaderStatistics* stats,
                           const io::IOContext* source_io_ctx) const override {
-        if (_region != nullptr) {
+        if (const auto region = _holder->get(); region != nullptr) {
             for (uint32_t i = 0; i < _ptrs.num_columns; ++i) {
                 ColumnMetaPB meta;
-                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*_region, i, &meta));
+                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*region, i, &meta));
                 visitor(meta);
             }
             return Status::OK();
@@ -219,13 +222,13 @@ public:
         if (footer.column_meta_entries_size() != _ptrs.num_columns) {
             return Status::Corruption("column_meta_entries size mismatch");
         }
-        if (_region != nullptr) {
+        if (const auto region = _holder->get(); region != nullptr) {
             for (uint32_t i = 0; i < _ptrs.num_columns; ++i) {
                 if (footer.column_meta_entries(static_cast<int>(i)).unique_id() == -1) {
                     continue;
                 }
                 ColumnMetaPB meta;
-                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*_region, i, &meta));
+                RETURN_IF_ERROR(ExternalColMetaUtil::parse_col_meta(*region, i, &meta));
                 visitor(meta);
             }
             return Status::OK();
@@ -287,22 +290,26 @@ public:
     Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
                             OlapReaderStatistics* stats,
                             const io::IOContext* source_io_ctx) override {
-        if (_region != nullptr || _ptrs.region_end <= _ptrs.region_start ||
+        if (_holder->get() != nullptr || _ptrs.region_end <= _ptrs.region_start ||
             _ptrs.region_end - _ptrs.region_start >
                     static_cast<uint64_t>(std::max<int64_t>(0, max_bytes))) {
             return Status::OK();
         }
-        return ExternalColMetaUtil::read_region(_file_reader, footer, _ptrs, &_region, stats,
-                                                source_io_ctx);
+        std::shared_ptr<const ColumnMetaRegion> region;
+        RETURN_IF_ERROR(ExternalColMetaUtil::read_region(_file_reader, footer, _ptrs, &region,
+                                                         stats, source_io_ctx));
+        _holder->set(std::move(region));
+        return Status::OK();
     }
 
-    std::shared_ptr<const ColumnMetaRegion> meta_region() const override { return _region; }
+    std::shared_ptr<const ColumnMetaRegion> meta_region() const override { return _holder->get(); }
+    std::shared_ptr<ColumnMetaRegionHolder> meta_region_holder() const override { return _holder; }
+    void release_meta_region() override { _holder->set(nullptr); }
 
 private:
     io::FileReaderSPtr _file_reader;
     ExternalColMetaUtil::ExternalMetaPointers _ptrs;
-    // Set by load_meta_region before the accessor is shared, and read-only after.
-    std::shared_ptr<const ColumnMetaRegion> _region;
+    std::shared_ptr<ColumnMetaRegionHolder> _holder = std::make_shared<ColumnMetaRegionHolder>();
 };
 
 ColumnMetaAccessor::ColumnMetaAccessor() = default;
@@ -369,6 +376,16 @@ Status ColumnMetaAccessor::load_meta_region(const SegmentFooterPB& footer, int64
 
 std::shared_ptr<const ColumnMetaRegion> ColumnMetaAccessor::meta_region() const {
     return _impl == nullptr ? nullptr : _impl->meta_region();
+}
+
+std::shared_ptr<ColumnMetaRegionHolder> ColumnMetaAccessor::meta_region_holder() const {
+    return _impl == nullptr ? nullptr : _impl->meta_region_holder();
+}
+
+void ColumnMetaAccessor::release_meta_region() {
+    if (_impl != nullptr) {
+        _impl->release_meta_region();
+    }
 }
 
 } // namespace doris::segment_v2

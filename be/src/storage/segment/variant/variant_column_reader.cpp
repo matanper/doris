@@ -1370,7 +1370,7 @@ Status VariantColumnReader::init(const ColumnReaderOptions& opts, ColumnMetaAcce
     _ext_meta_reader = std::make_unique<VariantExternalMetaReader>();
     RETURN_IF_ERROR(_ext_meta_reader->init_from_footer(
             footer, file_reader, _root_unique_id, stats, source_io_ctx,
-            accessor != nullptr ? accessor->meta_region() : nullptr));
+            accessor != nullptr ? accessor->meta_region_holder() : nullptr));
 
     // NestedGroup initialization is provider-driven. Disabled providers keep fallback behavior,
     // while enabled providers populate nested group readers from segment footer.

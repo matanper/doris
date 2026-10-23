@@ -49,13 +49,13 @@ public:
     // long as this reader; callers should pass in the same footer shared_ptr
     // they own (e.g. from Segment::_get_segment_footer).
     //
-    // With meta_region, the segment's Column Meta Region already in memory, subcolumn metas are
-    // parsed from it instead of read from the file.
+    // While `meta_region` holds the segment's Column Meta Region, subcolumn metas are parsed from
+    // it instead of read from the file.
     Status init_from_footer(std::shared_ptr<const SegmentFooterPB> footer,
                             const io::FileReaderSPtr& file_reader, int32_t root_uid,
                             OlapReaderStatistics* stats = nullptr,
                             const io::IOContext* source_io_ctx = nullptr,
-                            std::shared_ptr<const ColumnMetaRegion> meta_region = nullptr);
+                            std::shared_ptr<ColumnMetaRegionHolder> meta_region = nullptr);
 
     bool available() const { return _key_reader != nullptr; }
 
@@ -92,7 +92,7 @@ private:
     std::shared_ptr<const SegmentFooterPB> _footer;
     ExternalColMetaUtil::ExternalMetaPointers _meta_ptrs;
     io::FileReaderSPtr _file_reader;
-    std::shared_ptr<const ColumnMetaRegion> _meta_region;
+    std::shared_ptr<ColumnMetaRegionHolder> _meta_region;
 
     // Global column_id of the variant root in external Column Meta Region.
     // For its non-sparse subcolumns, their column_id is derived as:

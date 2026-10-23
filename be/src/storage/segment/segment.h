@@ -182,6 +182,10 @@ public:
     // metas, creating its column readers, loading their external meta and opening its index file
     // allocated and kept. Updates the segment_real_retained_bytes bvar.
     int64_t real_mem_usage();
+    // Let the column meta region go once the readers the first query needs exist: later lookups
+    // read each meta from the file, and the segment keeps only the metas its readers hold.
+    void release_column_meta_region();
+
     // The charge the segment cache holds this segment with.
     int64_t cache_charge() const { return _cache_charge.load(std::memory_order_relaxed); }
     void set_cache_charge(int64_t charge) { _cache_charge = charge; }
