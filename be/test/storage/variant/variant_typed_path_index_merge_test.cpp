@@ -36,11 +36,15 @@
 #include "core/column/column_nullable.h"
 #include "core/column/variant_v2/column_variant_v2.h"
 #include "core/data_type_serde/data_type_variant_v2_serde.h"
+#include "cpp/sync_point.h"
+#include "io/fs/file_system.h"
 #include "runtime/exec_env.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_reader.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/rowset/beta_rowset.h"
+#include "storage/rowset/rowset_factory.h"
+#include "storage/rowset/rowset_writer.h"
 #include "storage/variant/index_storage_variant_test_base.h"
 #include "util/defer_op.h"
 
@@ -315,6 +319,51 @@ protected:
         return compacted.has_value() ? compacted.value() : nullptr;
     }
 
+    // A rowset of `version` without any segment, added to the tablet, as a version hole is.
+    RowsetSharedPtr write_empty_rowset(int64_t version) {
+        RowsetWriterContext context;
+        RowsetId rowset_id;
+        rowset_id.init(version + 1000);
+        context.rowset_id = rowset_id;
+        context.rowset_type = BETA_ROWSET;
+        context.data_dir = data_dir();
+        context.rowset_state = VISIBLE;
+        context.tablet_schema = tablet_schema();
+        context.tablet_path = tablet()->tablet_path();
+        context.tablet_id = tablet()->tablet_id();
+        context.tablet_uid = tablet()->tablet_uid();
+        context.tablet = tablet();
+        context.version = Version(version, version);
+        context.segments_overlap = NONOVERLAPPING;
+        auto writer = RowsetFactory::create_rowset_writer(*storage_engine(), context, false);
+        EXPECT_TRUE(writer.has_value()) << writer.error();
+        if (!writer.has_value()) {
+            return nullptr;
+        }
+        RowsetSharedPtr rowset;
+        EXPECT_TRUE(writer.value()->build(rowset).ok());
+        EXPECT_TRUE(tablet()->add_rowset(rowset).ok());
+        return rowset;
+    }
+
+    // Three written rowsets and, with `empty_last`, a fourth without segments.
+    std::vector<RowsetSharedPtr> write_inputs(int64_t tablet_id, bool empty_last) {
+        EXPECT_TRUE(create_tablet(options(tablet_id)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            auto written = write_rowset(rowset(version));
+            EXPECT_TRUE(written.has_value()) << written.error();
+            if (!written.has_value()) {
+                return {};
+            }
+            rowsets.push_back(written.value());
+        }
+        if (empty_last) {
+            rowsets.push_back(write_empty_rowset(3));
+        }
+        return rowsets;
+    }
+
     static double process_cpu_seconds() {
         timespec ts {};
         clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
@@ -437,6 +486,80 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnesWit
         ++compared;
     }
     EXPECT_EQ(compared, 3);
+}
+
+// An input rowset without segments, whose meta has no storage resource as a cloud version hole's
+// may not, is skipped: the typed paths still merge and the scan is not aborted.
+TEST_F(VariantTypedPathIndexMergeTest, InputsWithoutSegmentsOrStorageStillMerge) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    auto rowsets = write_inputs(130301, true);
+    ASSERT_EQ(rowsets.size(), 4);
+    ASSERT_NE(rowsets[3], nullptr);
+    ASSERT_EQ(rowsets[3]->num_segments(), 0);
+
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    bool empty_rowset_resolved = false;
+    SyncPoint::CallbackGuard fs_guard;
+    sp->set_call_back(
+            "Compaction::construct_variant_index_compaction_paths:fs",
+            [&](auto&& args) {
+                auto* rowset = try_any_cast<BetaRowset*>(args[0]);
+                if (rowset->num_segments() == 0) {
+                    empty_rowset_resolved = true;
+                    *try_any_cast<io::FileSystemSPtr*>(args[1]) = nullptr;
+                }
+            },
+            &fs_guard);
+    Defer restore {[&]() {
+        sp->disable_processing();
+        config::enable_variant_typed_path_index_compaction = old_flag;
+    }};
+
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t aborted_before = exposed("compaction_variant_index_scan_aborted");
+    auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+    ASSERT_TRUE(compacted.has_value()) << compacted.error();
+    EXPECT_EQ(compacted.value()->num_rows(), 3 * 600);
+    EXPECT_FALSE(empty_rowset_resolved);
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_scan_aborted") - aborted_before, 0);
+}
+
+// An input rowset with segments whose storage cannot be resolved stops the scan: every typed path
+// of the compaction is rebuilt, and the abort is counted once.
+TEST_F(VariantTypedPathIndexMergeTest, AnAbortedScanIsCountedOnce) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    auto rowsets = write_inputs(130302, false);
+    ASSERT_EQ(rowsets.size(), 3);
+
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    SyncPoint::CallbackGuard fs_guard;
+    sp->set_call_back(
+            "Compaction::construct_variant_index_compaction_paths:fs",
+            [&](auto&& args) {
+                if (try_any_cast<BetaRowset*>(args[0]) == rowsets[1].get()) {
+                    *try_any_cast<io::FileSystemSPtr*>(args[1]) = nullptr;
+                }
+            },
+            &fs_guard);
+    Defer restore {[&]() {
+        sp->disable_processing();
+        config::enable_variant_typed_path_index_compaction = old_flag;
+    }};
+
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    const int64_t aborted_before = exposed("compaction_variant_index_scan_aborted");
+    auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+    ASSERT_TRUE(compacted.has_value()) << compacted.error();
+    EXPECT_EQ(compacted.value()->num_rows(), 3 * 600);
+    EXPECT_EQ(exposed("compaction_variant_index_scan_aborted") - aborted_before, 1);
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 0);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 0);
 }
 
 // VARIANT V2 inputs where an input segment lacks a typed path entirely, where a path is all
@@ -582,6 +705,27 @@ TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
                  }
              },
              2, 1, 0},
+            // idx_code has no parser: its lower_case changes neither the terms it writes nor
+            // the terms its reader looks up.
+            {"lower_case false without a parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20003) {
+                         (*index.mutable_properties())["lower_case"] = "false";
+                     }
+                 }
+             },
+             3, 0, 0},
+            // idx_msg has the english parser: lower_case decides its terms.
+            {"lower_case false with a parser",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20001) {
+                         (*index.mutable_properties())["lower_case"] = "false";
+                     }
+                 }
+             },
+             2, 1, 0},
             {"only copies",
              [&](TabletSchemaPB& pb) {
                  reorder(pb, [&](std::vector<TabletIndexPB>& indexes) {
@@ -629,6 +773,87 @@ TEST_F(VariantTypedPathIndexMergeTest, IndexPropertiesComparedByContent) {
         EXPECT_EQ(exposed("compaction_variant_index_rebuild_props_format_mismatch") - format_before,
                   c.format_mismatch)
                 << c.name;
+    }
+}
+
+// An input whose index properties differ from the output's only in ways the normalized
+// comparison ignores still merges, and is counted once per compaction. Each distinct difference
+// is logged once per process: a second compaction with the same difference logs nothing more.
+TEST_F(VariantTypedPathIndexMergeTest, PropertiesEqualAfterNormalizeAreCountedAndLoggedOnce) {
+    struct Case {
+        const char* name;
+        std::function<void(TabletSchemaPB&)> patch;
+        int64_t logged_first;
+    };
+    const std::vector<Case> cases {
+            // The defined entry of idx_host carries a key no content setting reads: raw_diff.
+            {"extra key",
+             [](TabletSchemaPB& pb) {
+                 for (auto& index : *pb.mutable_index()) {
+                     if (index.index_id() == 20002 && index.index_suffix_name().empty()) {
+                         (*index.mutable_properties())["probe_note"] = "raw";
+                     }
+                 }
+             },
+             1},
+            // A copy of idx_code with an extra key is listed first: the lookup by id alone would
+            // compare the copy, matched_copy.
+            {"copy listed first",
+             [](TabletSchemaPB& pb) {
+                 std::vector<TabletIndexPB> indexes(pb.index().begin(), pb.index().end());
+                 for (const auto& index : std::vector<TabletIndexPB>(indexes)) {
+                     if (index.index_id() == 20003 && index.index_suffix_name().empty()) {
+                         TabletIndexPB copy = index;
+                         copy.set_index_suffix_name("v%2Eprobe");
+                         (*copy.mutable_properties())["probe_key"] = "probe_value";
+                         indexes.insert(indexes.begin(), copy);
+                     }
+                 }
+                 pb.clear_index();
+                 for (auto& index : indexes) {
+                     *pb.add_index() = index;
+                 }
+             },
+             1},
+    };
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    Defer restore {[&]() { config::enable_variant_typed_path_index_compaction = old_flag; }};
+    int64_t tablet_id = 130200;
+    for (const auto& c : cases) {
+        for (int run = 0; run < 2; ++run) {
+            ASSERT_TRUE(create_tablet(options(++tablet_id)).ok());
+            std::vector<RowsetSharedPtr> rowsets;
+            for (int64_t version = 0; version < 3; ++version) {
+                auto written = write_rowset(rowset(version));
+                ASSERT_TRUE(written.has_value()) << written.error();
+                rowsets.push_back(written.value());
+            }
+            TabletSchemaPB pb;
+            rowsets[2]->tablet_schema()->to_schema_pb(&pb);
+            c.patch(pb);
+            auto patched = std::make_shared<TabletSchema>();
+            patched->init_from_pb(pb);
+            rowsets[2]->rowset_meta()->set_tablet_schema(patched);
+            rowsets[2]->_schema = patched;
+
+            const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+            const int64_t equal_before =
+                    exposed("compaction_variant_index_props_equal_after_normalize");
+            const int64_t logged_before =
+                    exposed("compaction_variant_index_props_normalize_logged");
+            auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+            ASSERT_TRUE(compacted.has_value()) << c.name << ": " << compacted.error();
+            EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3)
+                    << c.name << " run " << run;
+            EXPECT_EQ(
+                    exposed("compaction_variant_index_props_equal_after_normalize") - equal_before,
+                    1)
+                    << c.name << " run " << run;
+            EXPECT_EQ(exposed("compaction_variant_index_props_normalize_logged") - logged_before,
+                      run == 0 ? c.logged_first : 0)
+                    << c.name << " run " << run;
+        }
     }
 }
 
