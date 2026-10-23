@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <bvar/variable.h>
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -34,6 +35,7 @@
 #include "storage/iterators.h"
 #include "storage/olap_common.h"
 #include "storage/row_cursor.h"
+#include "storage/segment/column_meta_accessor.h"
 #include "storage/segment/row_ranges.h"
 #include "storage/segment/segment.h"
 #include "storage/segment/segment_iterator.h"
@@ -91,12 +93,18 @@ private:
     std::string _expr_name = "int_max_at_least_expr";
 };
 
-TabletSchemaSPtr make_tablet_schema() {
+TabletSchemaSPtr make_tablet_schema(
+        TabletStorageFormatPB format = TabletStorageFormatPB::TABLET_STORAGE_FORMAT_V2) {
     auto tablet_schema = std::make_shared<TabletSchema>();
     tablet_schema->append_column(*doris::create_int_key(0, false));
     tablet_schema->append_column(*doris::create_int_key(1, false));
     tablet_schema->set_storage_page_size(4096);
+    tablet_schema->set_storage_format(format);
     return tablet_schema;
+}
+
+int64_t live_meta_regions() {
+    return std::stoll(bvar::Variable::describe_exposed("segment_column_meta_regions"));
 }
 
 SchemaSPtr make_read_schema(const TabletSchemaSPtr& tablet_schema) {
@@ -239,6 +247,135 @@ TEST_F(SegmentIteratorExprZonemapTest, ApplyExprZonemapPrunesPageRowRanges) {
     EXPECT_GT(row_ranges.from(), 0);
     EXPECT_LT(row_ranges.count(), kNumRows);
     EXPECT_EQ(kNumRows, row_ranges.to());
+}
+
+// A segment with the external column meta region (V3) reads the region once when its column metas
+// are created. Whatever first uses the segment lets the region go when it returns, so a cached
+// segment never keeps it: an iterator, an empty iterator for a pruned segment, a column reader or a
+// meta traversal.
+class SegmentMetaRegionReleaseTest : public SegmentIteratorExprZonemapTest {
+protected:
+    void SetUp() override {
+        SegmentIteratorExprZonemapTest::SetUp();
+        _tablet_schema = make_tablet_schema(TabletStorageFormatPB::TABLET_STORAGE_FORMAT_V3);
+        _old_max_bytes = config::segment_column_meta_region_buffer_max_bytes;
+        config::segment_column_meta_region_buffer_max_bytes = 2 * 1024 * 1024;
+        _regions_before = live_meta_regions();
+    }
+    void TearDown() override {
+        config::segment_column_meta_region_buffer_max_bytes = _old_max_bytes;
+        SegmentIteratorExprZonemapTest::TearDown();
+    }
+    static bool region_kept(const std::shared_ptr<Segment>& segment) {
+        return segment->_column_meta_accessor->meta_region() != nullptr;
+    }
+
+    int64_t _old_max_bytes = 0;
+    int64_t _regions_before = 0;
+};
+
+TEST_F(SegmentMetaRegionReleaseTest, CreatingColumnMetasReadsTheRegionAndTimesItApart) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    ASSERT_TRUE(segment->_create_column_meta_once(&_stats).ok());
+    ASSERT_NE(segment->_column_meta_accessor->meta_region_holder(), nullptr);
+    EXPECT_TRUE(region_kept(segment));
+    EXPECT_EQ(live_meta_regions() - _regions_before, 1);
+    EXPECT_GT(_stats.segment_column_meta_region_read_timer_ns, 0);
+    EXPECT_GE(_stats.segment_create_column_readers_timer_ns, 0);
+    segment->release_column_meta_region();
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, NoRegionReadWithoutABuffer) {
+    config::segment_column_meta_region_buffer_max_bytes = 0;
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    ASSERT_TRUE(segment->_create_column_meta_once(&_stats).ok());
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(_stats.segment_column_meta_region_read_timer_ns, 0);
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, NewIteratorOfAPrunedSegmentLetsTheRegionGo) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    auto read_schema = make_read_schema(_tablet_schema);
+    auto expr_ctx = std::make_shared<VExprContext>(std::make_shared<IntMaxAtLeastExpr>(1, 2000));
+    ASSERT_NO_FATAL_FAILURE(prepare_expr_context(expr_ctx));
+    StorageReadOptions read_options;
+    read_options.stats = &_stats;
+    read_options.runtime_state = &_runtime_state;
+    read_options.tablet_schema = _tablet_schema;
+    read_options.common_expr_ctxs_push_down = {expr_ctx};
+
+    std::unique_ptr<RowwiseIterator> iter;
+    auto st = segment->new_iterator(read_schema, read_options, &iter);
+    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_TRUE(iter->empty());
+    EXPECT_EQ(1, _stats.expr_zonemap_filtered_segments);
+    EXPECT_GT(_stats.segment_column_meta_region_read_timer_ns, 0);
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, NewIteratorOfAReadSegmentLetsTheRegionGo) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    auto read_schema = make_read_schema(_tablet_schema);
+    StorageReadOptions read_options;
+    read_options.stats = &_stats;
+    read_options.runtime_state = &_runtime_state;
+    read_options.tablet_schema = _tablet_schema;
+
+    std::unique_ptr<RowwiseIterator> iter;
+    auto st = segment->new_iterator(read_schema, read_options, &iter);
+    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_FALSE(iter->empty());
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, AColumnReaderAsFirstUseLetsTheRegionGo) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    std::shared_ptr<ColumnReader> reader;
+    auto st = segment->get_column_reader(_tablet_schema->column(1), &reader, &_stats);
+    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_NE(reader, nullptr);
+    EXPECT_GT(_stats.segment_column_meta_region_read_timer_ns, 0);
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+
+    std::shared_ptr<ColumnReader> by_uid;
+    st = segment->get_column_reader(_tablet_schema->column(0).unique_id(), &by_uid, &_stats);
+    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_NE(by_uid, nullptr);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, AMetaTraversalAsFirstUseLetsTheRegionGo) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    size_t metas = 0;
+    auto st = segment->traverse_column_meta_pbs([&](const ColumnMetaPB&) { ++metas; });
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(metas, _tablet_schema->num_columns());
+    EXPECT_FALSE(region_kept(segment));
+    EXPECT_EQ(live_meta_regions(), _regions_before);
+}
+
+TEST_F(SegmentMetaRegionReleaseTest, AUseAfterTheFirstDoesNotReleaseAnotherCallersRegion) {
+    std::shared_ptr<Segment> segment;
+    ASSERT_NO_FATAL_FAILURE(build_segment(&segment));
+    // new_iterator creates the metas and then looks column readers up itself; those lookups did
+    // not create the metas, so only new_iterator lets the region go, once it is done.
+    ASSERT_TRUE(segment->_create_column_meta_once(&_stats).ok());
+    std::shared_ptr<ColumnReader> reader;
+    auto st = segment->get_column_reader(_tablet_schema->column(1), &reader, &_stats);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(region_kept(segment));
+    segment->release_column_meta_region();
+    EXPECT_FALSE(region_kept(segment));
 }
 
 } // namespace doris::segment_v2

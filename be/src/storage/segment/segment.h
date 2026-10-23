@@ -268,8 +268,12 @@ private:
 
     Status _open_index_file_reader();
 
+    // `created` is set when this call created the column metas, and so read the meta region.
     Status _create_column_meta_once(OlapReaderStatistics* stats,
-                                    const io::IOContext* io_ctx = nullptr);
+                                    const io::IOContext* io_ctx = nullptr,
+                                    bool* created = nullptr);
+
+    void release_region_if(bool created);
 
     virtual Status _get_segment_footer(std::shared_ptr<SegmentFooterPB>&,
                                        OlapReaderStatistics* stats,
