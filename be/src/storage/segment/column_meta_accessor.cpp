@@ -68,7 +68,7 @@ public:
     }
     virtual Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
                                     OlapReaderStatistics* stats,
-                                    const io::IOContext* source_io_ctx) {
+                                    const io::IOContext* source_io_ctx, bool skip_if_local) {
         return Status::OK();
     }
     virtual std::shared_ptr<const ColumnMetaRegion> meta_region() const { return nullptr; }
@@ -294,17 +294,16 @@ public:
     }
 
     Status load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
-                            OlapReaderStatistics* stats,
-                            const io::IOContext* source_io_ctx) override {
+                            OlapReaderStatistics* stats, const io::IOContext* source_io_ctx,
+                            bool skip_if_local) override {
         if (_holder->get() != nullptr || _ptrs.region_end <= _ptrs.region_start ||
             _ptrs.region_end - _ptrs.region_start >
                     static_cast<uint64_t>(std::max<int64_t>(0, max_bytes))) {
             return Status::OK();
         }
         // A region the local file cache already holds is cheaper to read in the few small spans
-        // the lookups need: re-reading and copying the whole region costs more than they do. The
-        // whole region is read when some of it would come from remote storage.
-        if (_file_reader->is_range_in_local_cache(_ptrs.region_start,
+        // the lookups need than whole: re-reading and copying it costs more than they do.
+        if (skip_if_local && _file_reader->is_range_in_local_cache(_ptrs.region_start,
                                                   _ptrs.region_end - _ptrs.region_start)) {
             g_column_meta_region_local_skips << 1;
             return Status::OK();
@@ -384,8 +383,9 @@ Status ColumnMetaAccessor::traverse_top_level_metas(
 
 Status ColumnMetaAccessor::load_meta_region(const SegmentFooterPB& footer, int64_t max_bytes,
                                             OlapReaderStatistics* stats,
-                                            const io::IOContext* source_io_ctx) {
-    return _impl->load_meta_region(footer, max_bytes, stats, source_io_ctx);
+                                            const io::IOContext* source_io_ctx,
+                                            bool skip_if_local) {
+    return _impl->load_meta_region(footer, max_bytes, stats, source_io_ctx, skip_if_local);
 }
 
 std::shared_ptr<const ColumnMetaRegion> ColumnMetaAccessor::meta_region() const {

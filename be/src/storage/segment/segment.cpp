@@ -623,6 +623,16 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     size_t bytes_read = 0;
     auto io_ctx = create_index_io_context(source_io_ctx, stats);
     TEST_SYNC_POINT_CALLBACK("Segment::_parse_footer::io_ctx", &io_ctx);
+    io::FileCacheStatistics footer_cache_stats;
+    if (io_ctx.file_cache_stats == nullptr) {
+        io_ctx.file_cache_stats = &footer_cache_stats;
+    }
+    const auto remote_ios = [&io_ctx] {
+        return io_ctx.file_cache_stats->num_remote_io_total +
+               io_ctx.file_cache_stats->num_peer_io_total;
+    };
+    const int64_t remote_ios_before = remote_ios();
+    Defer record_remote {[&] { _footer_read_remote = remote_ios() > remote_ios_before; }};
     RETURN_IF_ERROR(
             _file_reader->read_at(file_size - 12, Slice(fixed_buf, 12), &bytes_read, &io_ctx));
     DCHECK_EQ(bytes_read, 12);
@@ -873,7 +883,12 @@ Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderSta
         Status st;
         {
             SCOPED_RAW_TIMER(&region_read_ns);
-            st = _column_meta_accessor->load_meta_region(footer, max_bytes, stats, source_io_ctx);
+            // A footer this open fetched from remote storage brought the file tail, and so most
+            // or all of the region, into the local file cache only now: the segment is cold, and
+            // one local read of the region replaces many small ones. A segment whose footer was
+            // already cached or local is a re-open, which reads only the metas it needs.
+            st = _column_meta_accessor->load_meta_region(footer, max_bytes, stats, source_io_ctx,
+                                                         !_footer_read_remote);
         }
         stats->segment_column_meta_region_read_timer_ns += region_read_ns;
         stats->segment_create_column_readers_timer_ns -= region_read_ns;
