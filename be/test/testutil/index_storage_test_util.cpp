@@ -16,6 +16,7 @@
 // under the License.
 
 #include "testutil/index_storage_test_util.h"
+#include "core/data_type/data_type_variant_v2.h"
 
 #include <cctz/time_zone.h>
 #include <unistd.h>
@@ -446,7 +447,8 @@ Status validate_direct_variant_column(const VariantColumnSpec& column_spec, cons
         }
         nested_column = &nullable_column->get_nested_column();
     }
-    if (check_and_get_column<ColumnVariant>(nested_column) == nullptr) {
+    if (check_and_get_column<ColumnVariant>(nested_column) == nullptr &&
+        check_and_get_column<ColumnVariantV2>(nested_column) == nullptr) {
         return Status::InvalidArgument(
                 "direct variant column {} must be ColumnVariant or ColumnNullable(ColumnVariant), "
                 "actual={}",
@@ -516,6 +518,19 @@ Status fill_block(const TabletSchema& schema, const IndexTabletOptions& tablet_o
 
     CHECK_EQ(column_pos, schema.num_columns());
     block->set_columns(std::move(columns));
+    // A direct ColumnVariantV2 is written as VARIANT V2 data; the block's type follows it.
+    for (size_t pos = 0; pos < block->columns(); ++pos) {
+        const IColumn* column = block->get_by_position(pos).column.get();
+        const bool nullable = column->is_nullable();
+        if (nullable) {
+            column = &assert_cast<const ColumnNullable*>(column)->get_nested_column();
+        }
+        if (check_and_get_column<ColumnVariantV2>(column) != nullptr) {
+            DataTypePtr type = std::make_shared<DataTypeVariantV2>(
+                    schema.column(pos).variant_max_subcolumns_count());
+            block->get_by_position(pos).type = nullable ? make_nullable(type) : type;
+        }
+    }
     return Status::OK();
 }
 

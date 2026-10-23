@@ -20,6 +20,7 @@
 #include <time.h>
 #include <bvar/bvar.h>
 #include <gtest/gtest.h>
+#include <roaring/roaring.hh>
 
 #include <chrono>
 #include <cstdlib>
@@ -30,9 +31,14 @@
 #include <vector>
 
 #include "common/config.h"
+#include "util/defer_op.h"
+#include "core/data_type_serde/data_type_variant_v2_serde.h"
+#include "core/column/variant_v2/column_variant_v2.h"
+#include "core/column/column_nullable.h"
 #include "runtime/exec_env.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "storage/index/index_file_reader.h"
+#include "storage/rowset/beta_rowset.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/variant/index_storage_variant_test_base.h"
 
@@ -123,6 +129,35 @@ private:
     IndexPolicyMgr _mgr;
     IndexPolicyMgr* _previous = nullptr;
 };
+
+// The null documents of an index, empty when it has no null_bitmap file.
+roaring::Roaring null_bitmap(lucene::store::Directory* dir) {
+    roaring::Roaring bitmap;
+    if (!dir->fileExists("null_bitmap")) {
+        return bitmap;
+    }
+    lucene::store::IndexInput* in = dir->openInput("null_bitmap");
+    std::string buf(static_cast<size_t>(in->length()), '\0');
+    if (!buf.empty()) {
+        in->readBytes(reinterpret_cast<uint8_t*>(buf.data()), static_cast<int32_t>(buf.size()));
+        bitmap = roaring::Roaring::read(buf.data(), false);
+    }
+    in->close();
+    _CLLDELETE(in);
+    return bitmap;
+}
+
+// A VARIANT V2 column of the given JSON objects.
+ColumnPtr variant_v2_column(const std::vector<std::string>& jsons) {
+    auto values = ColumnVariantV2::create();
+    DataTypeVariantV2SerDe serde;
+    DataTypeSerDe::FormatOptions format;
+    for (const auto& json : jsons) {
+        Slice slice(json.data(), json.size());
+        EXPECT_TRUE(serde.deserialize_one_cell_from_json(*values, slice, format).ok()) << json;
+    }
+    return values;
+}
 
 } // namespace
 
@@ -228,8 +263,9 @@ protected:
     }
 
     static InvertedIndexDirectoryMap directories(const RowsetSharedPtr& rowset,
-                                                 std::shared_ptr<IndexFileReader>* reader) {
-        auto seg_path = rowset->segment_path(0);
+                                                 std::shared_ptr<IndexFileReader>* reader,
+                                                 int segment = 0) {
+        auto seg_path = rowset->segment_path(segment);
         EXPECT_TRUE(seg_path.has_value());
         *reader = std::make_shared<IndexFileReader>(
                 rowset->rowset_meta()->fs(),
@@ -253,10 +289,14 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnes) {
 
     config::enable_variant_typed_path_index_compaction = true;
     const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    const int64_t aborted_before = exposed("compaction_variant_index_scan_aborted");
     auto merged = write_and_compact(130002);
     config::enable_variant_typed_path_index_compaction = old_flag;
     ASSERT_NE(merged, nullptr);
     EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 0);
+    EXPECT_EQ(exposed("compaction_variant_index_scan_aborted") - aborted_before, 0);
     EXPECT_EQ(merged->num_rows(), rebuilt->num_rows());
 
     std::shared_ptr<IndexFileReader> rebuilt_reader;
@@ -276,6 +316,91 @@ TEST_F(VariantTypedPathIndexMergeTest, MergedTypedPathIndexesEqualRebuiltOnes) {
         ++compared;
     }
     EXPECT_EQ(compared, 3);
+}
+
+// VARIANT V2 inputs where an input segment lacks a typed path entirely, where a path is all
+// null, and where a path has values in only a few rows: the merged indexes equal the rebuilt
+// ones, null documents included, across several destination segments.
+TEST_F(VariantTypedPathIndexMergeTest, MergeHandlesAbsentAllNullAndSparseV2Paths) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    const int64_t old_segment_size = config::vertical_compaction_max_segment_size;
+    config::vertical_compaction_max_segment_size = 8 * 1024;
+    Defer restore {[&]() {
+        config::enable_variant_typed_path_index_compaction = old_flag;
+        config::vertical_compaction_max_segment_size = old_segment_size;
+    }};
+    auto write_and_compact_v2 = [&](int64_t tablet_id) -> RowsetSharedPtr {
+        EXPECT_TRUE(create_tablet(options(tablet_id)).ok());
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t version = 0; version < 3; ++version) {
+            std::mt19937_64 rng(900 + version);
+            std::vector<std::string> jsons;
+            for (int row = 0; row < 1500; ++row) {
+                std::string json = R"({"msg":"user u)" + std::to_string(rng() % 50) +
+                                   " logged in from host " + std::to_string(rng() % 9) + R"(",)";
+                if (version == 2) {
+                    json += R"("host":null,)"; // all null
+                } else {
+                    json += R"("host":"web-)" + std::to_string(rng() % 20) + R"(.corp",)";
+                }
+                if (version == 0 || (version == 2 && row % 500 == 7)) {
+                    // version 1 has no code at all; version 2 has it in three rows
+                    json += R"("code":"E)" + std::to_string(rng() % 30) + R"(",)";
+                }
+                json += R"("other":)" + std::to_string(row) + "}";
+                jsons.push_back(std::move(json));
+            }
+            IndexRowsetSpec spec;
+            spec.version = version;
+            spec.max_rows_per_segment = 100000;
+            spec.batches.push_back(IndexBatch::single_variant_column(
+                    variant_v2_column(jsons), static_cast<int32_t>(version) * 2000));
+            auto written = write_rowset(spec);
+            EXPECT_TRUE(written.has_value()) << written.error();
+            if (!written.has_value()) {
+                return nullptr;
+            }
+            rowsets.push_back(written.value());
+        }
+        auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+        EXPECT_TRUE(compacted.has_value()) << compacted.error();
+        return compacted.has_value() ? compacted.value() : nullptr;
+    };
+
+    config::enable_variant_typed_path_index_compaction = false;
+    auto rebuilt = write_and_compact_v2(130011);
+    ASSERT_NE(rebuilt, nullptr);
+    config::enable_variant_typed_path_index_compaction = true;
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t missing_before = exposed("compaction_variant_index_rebuild_missing_in_segment");
+    auto merged = write_and_compact_v2(130012);
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_missing_in_segment") - missing_before, 0);
+    ASSERT_EQ(merged->num_rows(), rebuilt->num_rows());
+    ASSERT_EQ(merged->num_segments(), rebuilt->num_segments());
+    EXPECT_GT(merged->num_segments(), 1);
+
+    size_t compared = 0;
+    for (int segment = 0; segment < merged->num_segments(); ++segment) {
+        std::shared_ptr<IndexFileReader> rebuilt_reader;
+        std::shared_ptr<IndexFileReader> merged_reader;
+        auto rebuilt_dirs = directories(rebuilt, &rebuilt_reader, segment);
+        auto merged_dirs = directories(merged, &merged_reader, segment);
+        ASSERT_EQ(rebuilt_dirs.size(), merged_dirs.size()) << "segment " << segment;
+        for (const auto& [key, dir] : rebuilt_dirs) {
+            auto it = merged_dirs.find(key);
+            ASSERT_NE(it, merged_dirs.end()) << key.first << " " << key.second;
+            EXPECT_TRUE(postings(dir.get()) == postings(it->second.get()))
+                    << "segment " << segment << " " << key.second;
+            EXPECT_TRUE(null_bitmap(dir.get()) == null_bitmap(it->second.get()))
+                    << "segment " << segment << " " << key.second << ": "
+                    << null_bitmap(dir.get()).cardinality() << " vs "
+                    << null_bitmap(it->second.get()).cardinality() << " nulls";
+            ++compared;
+        }
+    }
+    EXPECT_GE(compared, 6);
 }
 
 // Typed paths shaped like melian.logs fields, one index per run.
@@ -388,6 +513,30 @@ protected:
         return compacted.has_value() ? compacted.value() : nullptr;
     }
 };
+
+// An input rowset marked to skip index compaction of the VARIANT makes every typed path rebuild,
+// counted under its reason.
+TEST_F(VariantTypedPathIndexMergeTest, RejectedPathsAreCountedByReason) {
+    const bool old_flag = config::enable_variant_typed_path_index_compaction;
+    config::enable_variant_typed_path_index_compaction = true;
+    ASSERT_TRUE(create_tablet(options(130003)).ok());
+    std::vector<RowsetSharedPtr> rowsets;
+    for (int64_t version = 0; version < 3; ++version) {
+        auto written = write_rowset(rowset(version));
+        ASSERT_TRUE(written.has_value()) << written.error();
+        rowsets.push_back(written.value());
+    }
+    static_cast<BetaRowset*>(rowsets[1].get())->set_skip_index_compaction(kVariantUid);
+    const int64_t merged_before = exposed("compaction_variant_index_merge_paths");
+    const int64_t rebuilt_before = exposed("compaction_variant_index_rebuild_paths");
+    const int64_t skip_before = exposed("compaction_variant_index_rebuild_skip_marked");
+    auto compacted = compact_rowsets(IndexCompactionKind::CUMULATIVE, rowsets);
+    config::enable_variant_typed_path_index_compaction = old_flag;
+    ASSERT_TRUE(compacted.has_value()) << compacted.error();
+    EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 0);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 3);
+    EXPECT_EQ(exposed("compaction_variant_index_rebuild_skip_marked") - skip_before, 3);
+}
 
 // Compaction CPU with each index kind merged and rebuilt. Runs only when
 // VARIANT_INDEX_MERGE_BENCH_ROWS gives the rows per input rowset.
