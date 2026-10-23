@@ -860,4 +860,64 @@ TEST_F(ScannerContextTest, get_block_from_queue) {
     EXPECT_EQ(scanner_context->_num_finished_scanners, 1);
 }
 
+namespace {
+// Records, when the scheduler updates its profile, how many tasks the context already holds.
+class HandBackProbeScanner : public Scanner {
+public:
+    HandBackProbeScanner(RuntimeState* state, ScanLocalStateBase* local_state,
+                         RuntimeProfile* profile)
+            : Scanner(state, local_state, 100, profile) {}
+
+    void update_realtime_counters() override {
+        ++updates;
+        queued_at_update = context == nullptr ? -1 : context->_tasks_queue.size();
+    }
+
+    ScannerContext* context = nullptr;
+    int updates = 0;
+    int64_t queued_at_update = -1;
+
+protected:
+    Status _get_block_impl(RuntimeState*, Block*, bool* eof) override {
+        *eof = true;
+        return Status::OK();
+    }
+};
+} // namespace
+
+// Once a task is back in the context another scan thread may run its scanner, reach the end and
+// release the scanner's tablet reader. The scheduler therefore updates the scanner's profile
+// before it hands the task back, on the yield path as on the eos path.
+TEST_F(ScannerContextTest, scanner_profile_is_updated_before_the_task_is_handed_back) {
+    const int parallel_tasks = 1;
+    auto scan_operator = std::make_unique<OlapScanOperatorX>(obj_pool.get(), tnode, 0, *descs,
+                                                             parallel_tasks, TQueryCacheParam {});
+    auto olap_scan_local_state =
+            OlapScanLocalState::create_unique(state.get(), scan_operator.get());
+    auto probe = std::make_shared<HandBackProbeScanner>(state.get(), olap_scan_local_state.get(),
+                                                        profile.get());
+    std::shared_ptr<Scanner> scanner = probe;
+    std::list<std::shared_ptr<ScannerDelegate>> scanners {
+            std::make_shared<ScannerDelegate>(scanner)};
+    std::shared_ptr<ScannerContext> scanner_context = ScannerContext::create_shared(
+            state.get(), olap_scan_local_state.get(), output_tuple_desc, output_row_descriptor,
+            scanners, 100, scan_dependency, parallel_tasks);
+    probe->context = scanner_context.get();
+    scanner_context->_num_scheduled_scanners = 2;
+
+    for (bool eos : {false, true}) {
+        auto scan_task = std::make_shared<ScanTask>(std::make_shared<ScannerDelegate>(scanner));
+        const auto queued_before = static_cast<int64_t>(scanner_context->_tasks_queue.size());
+        const int updates_before = probe->updates;
+        ScannerScheduler::_hand_back_scan_task(scanner_context, *probe, scan_task, eos,
+                                               Status::OK());
+        EXPECT_EQ(probe->updates, updates_before + 1) << "eos=" << eos;
+        EXPECT_EQ(probe->queued_at_update, queued_before) << "eos=" << eos;
+        EXPECT_EQ(static_cast<int64_t>(scanner_context->_tasks_queue.size()), queued_before + 1)
+                << "eos=" << eos;
+        EXPECT_EQ(scan_task->is_eos(), eos);
+    }
+    EXPECT_TRUE(probe->need_to_close());
+}
+
 } // namespace doris

@@ -45,6 +45,8 @@
 #include "storage/rowset/beta_rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_writer.h"
+#include "storage/segment/column_meta_accessor.h"
+#include "storage/segment/segment.h"
 #include "storage/variant/index_storage_variant_test_base.h"
 #include "util/defer_op.h"
 
@@ -560,6 +562,63 @@ TEST_F(VariantTypedPathIndexMergeTest, AnAbortedScanIsCountedOnce) {
     EXPECT_EQ(exposed("compaction_variant_index_scan_aborted") - aborted_before, 1);
     EXPECT_EQ(exposed("compaction_variant_index_merge_paths") - merged_before, 0);
     EXPECT_EQ(exposed("compaction_variant_index_rebuild_paths") - rebuilt_before, 0);
+}
+
+// A segment of a wide VARIANT caches, for adaptive batch size, the raw_data_bytes of exactly
+// the top-level columns that a traverse of every column meta finds.
+TEST_F(VariantTypedPathIndexMergeTest, SegmentCachesTopLevelRawBytesOfAWideVariant) {
+    const bool old_adaptive = config::enable_adaptive_batch_size;
+    config::enable_adaptive_batch_size = true;
+    Defer restore {[&]() { config::enable_adaptive_batch_size = old_adaptive; }};
+    ASSERT_TRUE(create_tablet(options(130401)).ok());
+    std::vector<std::string> jsons;
+    for (int row = 0; row < 600; ++row) {
+        std::string json = R"({"msg":"user u)" + std::to_string(row % 50) +
+                           R"( logged in","host":"web-1.corp.example.com","code":"E1")";
+        for (int k = 0; k < 8; ++k) {
+            json += R"(,"wide_)" + std::to_string((row * 8 + k) % 400) + R"(":")" +
+                    std::to_string(row) + R"(")";
+        }
+        json += "}";
+        jsons.push_back(std::move(json));
+    }
+    IndexRowsetSpec spec;
+    spec.version = 0;
+    spec.max_rows_per_segment = 100000;
+    spec.batches.push_back(IndexBatch::single_variant(std::move(jsons), 0));
+    auto written = write_rowset(spec);
+    ASSERT_TRUE(written.has_value()) << written.error();
+    std::vector<segment_v2::SegmentSharedPtr> segments;
+    ASSERT_TRUE(
+            std::static_pointer_cast<BetaRowset>(written.value())->load_segments(&segments).ok());
+    ASSERT_EQ(segments.size(), 1);
+    auto& segment = segments[0];
+
+    OlapReaderStatistics stats;
+    std::shared_ptr<SegmentFooterPB> footer;
+    ASSERT_TRUE(segment->_get_segment_footer(footer, &stats, nullptr).ok());
+    ASSERT_EQ(footer->version(), segment_v2::SEGMENT_FOOTER_VERSION_V3_EXT_COL_META);
+    int subcolumn_entries = 0;
+    for (const auto& entry : footer->column_meta_entries()) {
+        subcolumn_entries += entry.unique_id() == -1;
+    }
+    EXPECT_GE(subcolumn_entries, 400);
+
+    segment_v2::ColumnMetaAccessor accessor;
+    ASSERT_TRUE(accessor.init(*footer, segment->_file_reader).ok());
+    std::unordered_map<int32_t, uint64_t> expected;
+    ASSERT_TRUE(accessor.traverse_metas(*footer,
+                                        [&](const ColumnMetaPB& meta) {
+                                            if (meta.has_unique_id() && meta.unique_id() != -1 &&
+                                                meta.has_raw_data_bytes()) {
+                                                expected[meta.unique_id()] = meta.raw_data_bytes();
+                                            }
+                                        })
+                        .ok());
+    ASSERT_FALSE(expected.empty());
+
+    ASSERT_TRUE(segment->_create_column_meta_once(&stats, nullptr).ok());
+    EXPECT_EQ(segment->_column_uid_to_raw_bytes, expected);
 }
 
 // VARIANT V2 inputs where an input segment lacks a typed path entirely, where a path is all

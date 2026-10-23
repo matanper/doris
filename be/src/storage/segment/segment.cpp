@@ -834,9 +834,11 @@ Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderSta
     RETURN_IF_ERROR(_column_meta_accessor->init(footer, _file_reader));
 
     if (config::enable_adaptive_batch_size) {
-        // Cache raw_data_bytes per column uid for adaptive batch size prediction.
-        // This runs under call_once, so no thread-safety concerns.
-        auto st = _column_meta_accessor->traverse_metas(
+        // Cache raw_data_bytes per column uid for adaptive batch size prediction. Only top-level
+        // columns are kept, so only their metas are read: a wide VARIANT's subcolumn metas, most
+        // of the meta region, are skipped. This runs under call_once, so no thread-safety
+        // concerns.
+        auto st = _column_meta_accessor->traverse_top_level_metas(
                 footer,
                 [this](const ColumnMetaPB& meta) {
                     if (meta.has_unique_id() && meta.unique_id() != -1 &&

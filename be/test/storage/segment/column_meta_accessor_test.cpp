@@ -20,6 +20,7 @@
 #include <crc32c/crc32c.h>
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -778,4 +779,156 @@ TEST(ColumnMetaAccessorTest, MultipleSequentialAccesses) {
             ASSERT_TRUE(accessor.get_column_meta_by_uid(footer, i, &meta).ok());
         }
     }
+}
+
+namespace {
+
+// Forwards reads to a file reader and records the byte range of each.
+class CountingFileReader final : public io::FileReader {
+public:
+    explicit CountingFileReader(io::FileReaderSPtr inner) : _inner(std::move(inner)) {}
+    Status close() override { return _inner->close(); }
+    const io::Path& path() const override { return _inner->path(); }
+    size_t size() const override { return _inner->size(); }
+    bool closed() const override { return _inner->closed(); }
+    int64_t mtime() const override { return 0; }
+
+    uint64_t bytes_read() const {
+        uint64_t total = 0;
+        for (const auto& [offset, length] : reads) {
+            total += length;
+        }
+        return total;
+    }
+
+    std::vector<std::pair<size_t, size_t>> reads;
+
+protected:
+    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                        const io::IOContext* io_ctx) override {
+        reads.emplace_back(offset, result.size);
+        return _inner->read_at(offset, result, bytes_read, io_ctx);
+    }
+
+private:
+    io::FileReaderSPtr _inner;
+};
+
+ColumnMetaPB make_meta(uint32_t column_id, int32_t unique_id, uint64_t raw_data_bytes,
+                       const std::string& path) {
+    ColumnMetaPB meta;
+    meta.set_column_id(column_id);
+    meta.set_unique_id(unique_id);
+    meta.set_type(static_cast<int>(FieldType::OLAP_FIELD_TYPE_STRING));
+    meta.set_length(16);
+    meta.set_raw_data_bytes(raw_data_bytes);
+    if (!path.empty()) {
+        meta.mutable_column_path_info()->set_path(path);
+        meta.mutable_column_path_info()->set_parrent_column_unique_id(2);
+    }
+    return meta;
+}
+
+// What Segment::_create_column_meta keeps for adaptive batch size.
+std::map<uint32_t, uint64_t> raw_bytes_by_uid(const ColumnMetaAccessor& accessor,
+                                              const SegmentFooterPB& footer, bool top_level_only) {
+    std::map<uint32_t, uint64_t> out;
+    auto visitor = [&](const ColumnMetaPB& meta) {
+        if (meta.has_unique_id() && meta.unique_id() != -1 && meta.has_raw_data_bytes()) {
+            out[meta.unique_id()] = meta.raw_data_bytes();
+        }
+    };
+    auto st = top_level_only ? accessor.traverse_top_level_metas(footer, visitor)
+                             : accessor.traverse_metas(footer, visitor);
+    EXPECT_TRUE(st.ok()) << st.to_string();
+    return out;
+}
+
+} // namespace
+
+// A segment with two wide VARIANTs: the top-level traverse yields the same raw_data_bytes as the
+// full traverse, and reads only the top-level metas, adjacent ones in one read, instead of the
+// whole meta region.
+TEST(ColumnMetaAccessorTest, V3_TopLevelTraverseReadsOnlyTopLevelMetas) {
+    // uid 1, VARIANT root uid 2 and 2,100 subcolumns, uid 3, VARIANT root uid 4 and 60
+    // subcolumns, uid 5.
+    std::vector<ColumnMetaPB> metas;
+    uint32_t column_id = 0;
+    metas.push_back(make_meta(column_id++, 1, 1001, ""));
+    metas.push_back(make_meta(column_id++, 2, 1002, ""));
+    for (int i = 0; i < 2100; ++i) {
+        metas.push_back(make_meta(column_id++, -1, 10000 + i,
+                                  "event.metadata.product.feature.subcolumn_" + std::to_string(i)));
+    }
+    metas.push_back(make_meta(column_id++, 3, 1003, ""));
+    metas.push_back(make_meta(column_id++, 4, 1004, ""));
+    for (int i = 0; i < 60; ++i) {
+        metas.push_back(make_meta(column_id++, -1, 20000 + i, "tags.k" + std::to_string(i)));
+    }
+    metas.push_back(make_meta(column_id++, 5, 1005, ""));
+
+    SegmentFooterPB footer;
+    footer.set_version(SEGMENT_FOOTER_VERSION_V3_EXT_COL_META);
+    std::string file_path = make_test_file_path("v3_top_level_traverse.bin");
+    auto fs = io::global_local_filesystem();
+    io::FileWriterPtr fw;
+    ASSERT_TRUE(fs->create_file(file_path, &fw).ok());
+    ASSERT_TRUE(fw->append(Slice(std::string(4096, 'X'))).ok());
+    const uint64_t region_start = fw->bytes_appended();
+    footer.set_col_meta_region_start(region_start);
+    uint64_t top_level_bytes = 0;
+    for (const auto& meta : metas) {
+        std::string bytes;
+        ASSERT_TRUE(meta.SerializeToString(&bytes));
+        ASSERT_TRUE(fw->append(Slice(bytes)).ok());
+        auto* entry = footer.add_column_meta_entries();
+        entry->set_unique_id(static_cast<int32_t>(meta.unique_id()));
+        entry->set_length(static_cast<uint32_t>(bytes.size()));
+        if (meta.unique_id() != -1) {
+            top_level_bytes += bytes.size();
+        }
+    }
+    const uint64_t region_bytes = fw->bytes_appended() - region_start;
+    ASSERT_TRUE(append_footer_trailer(fw.get(), &footer).ok());
+    ASSERT_TRUE(fw->close().ok());
+
+    io::FileReaderSPtr fr;
+    io::FileReaderOptions opts;
+    ASSERT_TRUE(fs->open_file(file_path, &fr, &opts).ok());
+    SegmentFooterPB loaded;
+    ASSERT_TRUE(read_footer_from_file(fr, &loaded).ok());
+
+    ColumnMetaAccessor full_accessor;
+    ASSERT_TRUE(full_accessor.init(loaded, fr).ok());
+    const auto expected = raw_bytes_by_uid(full_accessor, loaded, false);
+    ASSERT_EQ(expected.size(), 5);
+
+    auto counting = std::make_shared<CountingFileReader>(fr);
+    ColumnMetaAccessor accessor;
+    ASSERT_TRUE(accessor.init(loaded, counting).ok());
+    EXPECT_EQ(raw_bytes_by_uid(accessor, loaded, true), expected);
+
+    // [1, 2], [3, 4] and [5]: one read each, of exactly the top-level metas.
+    EXPECT_EQ(counting->reads.size(), 3);
+    EXPECT_EQ(counting->bytes_read(), top_level_bytes);
+    EXPECT_LT(counting->bytes_read() * 50, region_bytes);
+}
+
+// The inline (V2) layout visits the top-level metas of footer.columns() only.
+TEST(ColumnMetaAccessorTest, V2_TopLevelTraverseSkipsVariantSubcolumns) {
+    SegmentFooterPB footer;
+    footer.set_version(SEGMENT_FOOTER_VERSION_V2_BASELINE);
+    *footer.add_columns() = make_meta(0, 1, 11, "");
+    *footer.add_columns() = make_meta(1, 2, 12, "");
+    *footer.add_columns() = make_meta(2, -1, 13, "v.a");
+    *footer.add_columns() = make_meta(3, 3, 14, "");
+    ColumnMetaAccessor accessor;
+    ASSERT_TRUE(accessor.init(footer, nullptr).ok());
+    std::vector<uint32_t> uids;
+    ASSERT_TRUE(accessor.traverse_top_level_metas(
+                                footer,
+                                [&](const ColumnMetaPB& meta) { uids.push_back(meta.unique_id()); })
+                        .ok());
+    EXPECT_EQ(uids, (std::vector<uint32_t> {1, 2, 3}));
+    EXPECT_EQ(raw_bytes_by_uid(accessor, footer, true), raw_bytes_by_uid(accessor, footer, false));
 }

@@ -91,6 +91,14 @@ public:
                           OlapReaderStatistics* stats = nullptr,
                           const io::IOContext* source_io_ctx = nullptr) const;
 
+    // Traverse the ColumnMetaPBs of top-level columns only (unique_id != -1), skipping VARIANT
+    // subcolumns. With the external Column Meta Region (V3) only the spans of those metas are
+    // read, not the whole region.
+    Status traverse_top_level_metas(const SegmentFooterPB& footer,
+                                    const std::function<void(const ColumnMetaPB&)>& visitor,
+                                    OlapReaderStatistics* stats = nullptr,
+                                    const io::IOContext* source_io_ctx = nullptr) const;
+
 private:
     std::unique_ptr<Impl> _impl;
     // map column unique id ---> column ordinal id (footer ordinal in legacy mode, or external CMO column id)
