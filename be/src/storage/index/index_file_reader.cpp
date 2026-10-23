@@ -331,6 +331,24 @@ Status IndexFileReader::read_range_at_slice(const io::PackedSliceLocation& slice
     return Status::OK();
 }
 
+std::string IndexFileReader::describe_cached_blocks(const TabletIndex* index_meta, int64_t offset,
+                                                    int64_t length, bool* any_peer) const {
+    *any_peer = false;
+    auto* factory = io::FileCacheFactory::instance();
+    if (!config::enable_file_cache || factory == nullptr ||
+        factory->get_cache_instance_size() == 0 || offset < 0 || length <= 0) {
+        return "no file cache";
+    }
+    const auto hash =
+            io::BlockFileCache::hash(io::remote_file_cache_name(get_index_file_path(index_meta)));
+    auto* cache = factory->get_by_path(hash);
+    if (cache == nullptr) {
+        return "no file cache";
+    }
+    return cache->describe_blocks(hash, static_cast<size_t>(offset),
+                                  static_cast<size_t>(offset + length - 1), any_peer);
+}
+
 void IndexFileReader::evict_cached_index_file(const TabletIndex* index_meta) const {
     auto* factory = io::FileCacheFactory::instance();
     if (!config::enable_file_cache || factory == nullptr ||

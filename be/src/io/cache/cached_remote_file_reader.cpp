@@ -97,7 +97,8 @@ bvar::Window<bvar::Adder<uint64_t>> g_read_cache_indirect_total_bytes_1min_windo
         "cached_remote_reader_indirect_total_bytes_1min_window", &g_read_cache_indirect_total_bytes,
         60);
 // Compaction reads served by a MemoryPreloadedFile, and those it could not serve.
-bvar::Adder<uint64_t> g_memory_preloaded_read_bytes("cached_remote_reader_memory_preloaded_read_bytes");
+bvar::Adder<uint64_t> g_memory_preloaded_read_bytes(
+        "cached_remote_reader_memory_preloaded_read_bytes");
 bvar::Adder<uint64_t> g_memory_preloaded_reads("cached_remote_reader_memory_preloaded_reads");
 bvar::Adder<uint64_t> g_memory_preloaded_fallback_reads(
         "cached_remote_reader_memory_preloaded_fallback_reads");
@@ -935,6 +936,11 @@ Status CachedRemoteFileReader::_read_remote_blocks_into_cache(
                          << ", block=" << block->get_info_for_log()
                          << ", cache_file=" << block->get_cache_file() << ", err=" << st;
         } else {
+            block->set_fill_source(
+                    !stats.from_peer_cache              ? FileBlock::FillSource::REMOTE
+                    : peer_result.server_fill_requested ? FileBlock::FillSource::PEER_SERVER_FILL
+                                                        : FileBlock::FillSource::PEER,
+                    stats.from_peer_cache ? FileBlock::ipv4_of(peer_result.host) : 0);
             _insert_file_reader(block);
             stats.bytes_write_into_file_cache += block_size;
         }

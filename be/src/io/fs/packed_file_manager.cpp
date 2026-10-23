@@ -169,6 +169,9 @@ void do_write_to_file_cache(const std::string& small_file_path, const std::strin
                 if (st.ok()) {
                     st = block->finalize();
                 }
+                if (st.ok()) {
+                    block->set_fill_source(FileBlock::FillSource::LOCAL_WRITE);
+                }
                 if (!st.ok()) {
                     LOG(WARNING) << "Write small file to cache failed: " << st.msg();
                 }
