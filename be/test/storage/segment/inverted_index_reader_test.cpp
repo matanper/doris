@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <random>
@@ -35,6 +36,8 @@
 #include "core/field.h"
 #include "core/value/vdatetime_value.h"
 #include "cpp/sync_point.h"
+#include "io/fs/packed_file_system.h"
+#include "io/fs/packed_file_trailer.h"
 #include "runtime/runtime_state.h"
 #include "storage/index/index_file_reader.h"
 #include "storage/index/index_file_writer.h"
@@ -46,6 +49,7 @@
 #include "storage/key_coder.h"
 #include "storage/tablet/tablet_schema.h"
 #include "storage/tablet/tablet_schema_helper.h"
+#include "util/coding.h"
 #include "util/defer_op.h"
 #include "util/slice.h"
 
@@ -4826,6 +4830,92 @@ TEST_F(InvertedIndexReaderTest, CorruptNullBitmapInFileIsCorruption) {
     EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
     EXPECT_NE(st.to_string().find("first_bytes=ffff"), std::string::npos) << st;
     EXPECT_EQ(exposed_bvar("index_bytes_cache_mismatch"), mismatch_before);
+}
+
+// An index file in a packed file whose rowset meta records the wrong slice: the read through that
+// slice finds a corrupt null bitmap, and so does the storage re-read, which resolves the same
+// slice. The slice the packed file's own trailer records is read instead, and the bitmap
+// recovered.
+TEST_F(InvertedIndexReaderTest, NullBitmapAtAWrongPackedSliceIsReadFromTheTrailersSlice) {
+    TabletIndex idx_meta;
+    std::string index_path_prefix;
+    prepare_null_index("test_packed_wrong_slice_null_bitmap", 0, &idx_meta, &index_path_prefix);
+    const std::string index_path =
+            InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+
+    int64_t offset = -1;
+    int64_t length = -1;
+    {
+        auto file_reader = std::make_shared<IndexFileReader>(
+                io::global_local_filesystem(), index_path_prefix, InvertedIndexStorageFormatPB::V2);
+        ASSERT_TRUE(file_reader->init().ok());
+        auto dir = file_reader->open(&idx_meta);
+        ASSERT_TRUE(dir.has_value()) << dir.error();
+        ASSERT_TRUE(dir.value()->entry_range(
+                InvertedIndexDescriptor::get_temporary_null_bitmap_file_name(), &offset, &length));
+    }
+    ASSERT_GT(length, 0);
+    std::string good;
+    {
+        std::ifstream file(index_path, std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        good.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    // Parsed directly, so no read goes through the query cache this test's read must miss.
+    auto expected = read_native_roaring(good.data() + offset, static_cast<size_t>(length));
+    ASSERT_TRUE(expected.has_value());
+    const uint64_t expected_nulls = expected->cardinality();
+    std::string bad = good;
+    bad.replace(static_cast<size_t>(offset), static_cast<size_t>(length),
+                std::string(static_cast<size_t>(length), '\xff'));
+
+    // [bad copy][good copy][trailer recording the good copy].
+    cloud::PackedFileFooterPB footer;
+    auto* slice = footer.mutable_packed_file_info()->add_slices();
+    slice->set_path(index_path);
+    slice->set_offset(static_cast<int64_t>(bad.size()));
+    slice->set_size(static_cast<int64_t>(good.size()));
+    std::string serialized;
+    ASSERT_TRUE(footer.SerializeToString(&serialized));
+    std::string container = bad + good + serialized;
+    put_fixed32_le(&container, static_cast<uint32_t>(serialized.size()));
+    put_fixed32_le(&container, io::kPackedFileTrailerVersion);
+    const std::string container_path = index_path_prefix + ".packed.bin";
+    {
+        std::ofstream file(container_path, std::ios::binary | std::ios::trunc);
+        file.write(container.data(), static_cast<std::streamsize>(container.size()));
+    }
+    std::unordered_map<std::string, io::PackedSliceLocation> index_map;
+    io::PackedSliceLocation wrong;
+    wrong.packed_file_path = container_path;
+    wrong.offset = 0;
+    wrong.size = static_cast<int64_t>(good.size());
+    wrong.packed_file_size = static_cast<int64_t>(container.size());
+    index_map[index_path] = wrong;
+    auto packed_fs =
+            std::make_shared<io::PackedFileSystem>(io::global_local_filesystem(), index_map);
+
+    const int64_t corrupt_before = exposed_bvar("index_null_bitmap_corrupt");
+    const int64_t mismatch_before = exposed_bvar("index_bytes_cache_mismatch");
+    const int64_t slice_mismatch_before = exposed_bvar("index_packed_slice_mismatch");
+    OlapReaderStatistics stats;
+    RuntimeState runtime_state;
+    io::IOContext io_ctx;
+    auto file_reader = std::make_shared<IndexFileReader>(packed_fs, index_path_prefix,
+                                                         InvertedIndexStorageFormatPB::V2);
+    ASSERT_TRUE(file_reader->init().ok());
+    auto reader = StringTypeInvertedIndexReader::create_shared(&idx_meta, file_reader);
+    auto context = std::make_shared<IndexQueryContext>();
+    context->io_ctx = &io_ctx;
+    context->stats = &stats;
+    context->runtime_state = &runtime_state;
+    InvertedIndexQueryCacheHandle cache_handle;
+    auto st = reader->read_null_bitmap(context, &cache_handle, nullptr);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(cache_handle.get_bitmap()->cardinality(), expected_nulls);
+    EXPECT_EQ(exposed_bvar("index_null_bitmap_corrupt") - corrupt_before, 1);
+    EXPECT_EQ(exposed_bvar("index_bytes_cache_mismatch"), mismatch_before);
+    EXPECT_EQ(exposed_bvar("index_packed_slice_mismatch") - slice_mismatch_before, 1);
 }
 
 } // namespace doris::segment_v2

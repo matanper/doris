@@ -24,6 +24,7 @@
 #include <string_view>
 
 #include "common/status.h"
+#include "io/fs/file_system.h"
 
 namespace doris::io {
 
@@ -34,6 +35,12 @@ Status parse_packed_file_trailer(std::string_view data, cloud::PackedFileFooterP
                                  uint32_t* version);
 
 Status read_packed_file_trailer(const std::string& file_path, cloud::PackedFileFooterPB* debug_pb,
+                                uint32_t* version);
+
+// Reads the trailer of a packed file through fs, bypassing the file cache. packed_file_size may
+// be -1 when unknown.
+Status read_packed_file_trailer(const FileSystemSPtr& fs, const std::string& packed_file_path,
+                                int64_t packed_file_size, cloud::PackedFileFooterPB* footer,
                                 uint32_t* version);
 
 } // namespace doris::io
