@@ -102,6 +102,8 @@ public:
     static const char* getClassName();
     const char* getObjectName() const override;
     CL_NS(store)::IndexInput* getDorisIndexInput();
+    // Offset and length of the entry `name` in the index file, if the reader has it.
+    bool entry_range(const char* name, int64_t* offset, int64_t* length) const;
 
 private:
     void initialize(const io::IOContext* io_ctx);

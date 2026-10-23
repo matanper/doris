@@ -27,6 +27,7 @@
 #include <CLucene/util/FutureArrays.h>
 #include <CLucene/util/bkd/bkd_docid_iterator.h>
 #include <CLucene/util/stringUtil.h>
+#include <bvar/bvar.h>
 
 #include <memory>
 #include <ostream>
@@ -42,13 +43,16 @@
 #include "core/data_type/primitive_type.h"
 #include "core/string_ref.h"
 #include "core/type_limit.h"
+#include "cpp/sync_point.h"
 #include "runtime/runtime_profile.h"
 #include "runtime/runtime_state.h"
 #include "storage/index/index_file_reader.h"
 #include "storage/index/index_reader_helper.h"
 #include "storage/index/inverted/analyzer/analyzer.h"
+#include "storage/index/inverted/index_bitmap_util.h"
 #include "storage/index/inverted/inverted_index_cache.h"
 #include "storage/index/inverted/inverted_index_common.h"
+#include "storage/index/inverted/inverted_index_compound_reader.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/inverted/inverted_index_iterator.h"
 #include "storage/index/inverted/inverted_index_parser.h"
@@ -192,10 +196,21 @@ Status InvertedIndexReader::read_null_bitmap(const IndexQueryContextPtr& context
         if (dir->fileExists(null_bitmap_file_name)) {
             null_bitmap_in = dir->openInput(null_bitmap_file_name);
             auto null_bitmap_size = cast_set<int32_t>(null_bitmap_in->length());
-            faststring buf;
-            buf.resize(null_bitmap_size);
-            null_bitmap_in->readBytes(buf.data(), null_bitmap_size);
-            *null_bitmap = roaring::Roaring::read(reinterpret_cast<char*>(buf.data()), false);
+            std::string buf(static_cast<size_t>(null_bitmap_size), '\0');
+            null_bitmap_in->readBytes(reinterpret_cast<uint8_t*>(buf.data()), null_bitmap_size);
+            TEST_SYNC_POINT_CALLBACK("InvertedIndexReader::read_null_bitmap:bytes", &buf);
+            auto parsed = read_native_roaring(buf.data(), buf.size());
+            if (!parsed.has_value()) {
+                auto st = _recover_corrupt_null_bitmap(dir, null_bitmap_file_name, buf, &parsed);
+                if (!st.ok()) {
+                    FINALLY_FINALIZE_INPUT(null_bitmap_in);
+                    if (owned_dir) {
+                        FINALLY_FINALIZE_INPUT(dir);
+                    }
+                    return st;
+                }
+            }
+            *null_bitmap = std::move(*parsed);
             null_bitmap->runOptimize();
             cache->insert(cache_key, null_bitmap, cache_handle);
             FINALIZE_INPUT(null_bitmap_in);
@@ -212,9 +227,64 @@ Status InvertedIndexReader::read_null_bitmap(const IndexQueryContextPtr& context
         }
         return Status::Error<doris::ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(
                 "Inverted index read null bitmap error occurred, reason={}", e.what());
+    } catch (const std::exception& e) {
+        FINALLY_FINALIZE_INPUT(null_bitmap_in);
+        if (owned_dir) {
+            FINALLY_FINALIZE_INPUT(dir);
+        }
+        return Status::Corruption("inverted index null bitmap of index {} in {} unreadable: {}",
+                                  _index_meta.index_id(),
+                                  _index_file_reader->get_index_file_path(&_index_meta), e.what());
     }
 
     return Status::OK();
+}
+
+namespace {
+// Null bitmaps that did not parse, and the bytes read for them that differ from the storage's.
+bvar::Adder<uint64_t> g_index_null_bitmap_corrupt("index_null_bitmap_corrupt");
+bvar::Adder<uint64_t> g_index_bytes_cache_mismatch("index_bytes_cache_mismatch");
+} // namespace
+
+Status InvertedIndexReader::_recover_corrupt_null_bitmap(lucene::store::Directory* dir,
+                                                         const char* file_name,
+                                                         const std::string& bytes,
+                                                         std::optional<roaring::Roaring>* parsed) {
+    g_index_null_bitmap_corrupt << 1;
+    const std::string path = _index_file_reader->get_index_file_path(&_index_meta);
+    int64_t offset = -1;
+    int64_t length = -1;
+    auto* compound = dynamic_cast<DorisCompoundReader*>(dir);
+    const bool located = compound != nullptr && compound->entry_range(file_name, &offset, &length);
+    std::string from_storage;
+    Status storage_st = located ? _index_file_reader->read_range_from_storage(&_index_meta, offset,
+                                                                              length, &from_storage)
+                                : Status::NotSupported("entry not located in the index file");
+    const bool differs = storage_st.ok() && from_storage != bytes;
+    if (differs) {
+        g_index_bytes_cache_mismatch << 1;
+    }
+    LOG(WARNING) << "inverted index null bitmap unreadable: index_id=" << _index_meta.index_id()
+                 << " file=" << path << " offset=" << offset << " length=" << length
+                 << " read_bytes=" << bytes.size() << " first_bytes=" << hex_prefix(bytes)
+                 << " storage_read=" << storage_st.to_string()
+                 << (storage_st.ok()
+                             ? (differs ? " storage_bytes_differ=true first_storage_bytes=" +
+                                                  hex_prefix(from_storage)
+                                        : " storage_bytes_differ=false")
+                             : "");
+    if (differs) {
+        *parsed = read_native_roaring(from_storage.data(), from_storage.size());
+        if (parsed->has_value()) {
+            // The cached copy of the file is wrong; the storage's is good.
+            _index_file_reader->evict_cached_index_file(&_index_meta);
+            return Status::OK();
+        }
+    }
+    return Status::Corruption(
+            "inverted index null bitmap unreadable: index_id={} file={} offset={} length={} "
+            "first_bytes={}",
+            _index_meta.index_id(), path, offset, length, hex_prefix(bytes));
 }
 
 bool InvertedIndexReader::handle_query_cache(const IndexQueryContextPtr& context,
@@ -812,6 +882,11 @@ Status BkdIndexReader::try_query(const IndexQueryContextPtr& context,
     } catch (const CLuceneError& e) {
         return Status::Error<ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(
                 "BKD Query CLuceneError Occurred, error msg: {}", e.what());
+    } catch (const Exception& e) {
+        return e.to_status();
+    } catch (const std::exception& e) {
+        return Status::Corruption("BKD index {} in {} unreadable: {}", _index_meta.index_id(),
+                                  _index_file_reader->get_index_file_path(&_index_meta), e.what());
     }
 
     VLOG_DEBUG << "BKD index try search column: " << column_name << " result: " << *count;
@@ -859,6 +934,13 @@ Status BkdIndexReader::query(const IndexQueryContextPtr& context, const std::str
                    << " file_path:" << _index_file_reader->get_index_file_path(&_index_meta);
         return Status::Error<ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(
                 "BKD Query CLuceneError Occurred, error msg: {}", e.what());
+    } catch (const Exception& e) {
+        LOG(WARNING) << "BKD query failed: " << e.what()
+                     << " file_path:" << _index_file_reader->get_index_file_path(&_index_meta);
+        return e.to_status();
+    } catch (const std::exception& e) {
+        return Status::Corruption("BKD index {} in {} unreadable: {}", _index_meta.index_id(),
+                                  _index_file_reader->get_index_file_path(&_index_meta), e.what());
     }
 }
 
@@ -1082,7 +1164,13 @@ void InvertedIndexVisitor<QT>::visit(std::vector<char>& doc_id,
     if (matches(packed_value.data()) != 0) {
         return;
     }
-    visit(roaring::Roaring::read(doc_id.data(), false));
+    auto doc_ids = read_native_roaring(doc_id.data(), doc_id.size());
+    if (!doc_ids.has_value()) {
+        throw Exception(ErrorCode::CORRUPTION,
+                        "BKD leaf doc ids unreadable: {} bytes, first_bytes={}", doc_id.size(),
+                        hex_prefix(std::string_view(doc_id.data(), doc_id.size())));
+    }
+    visit(*doc_ids);
 }
 
 template <InvertedIndexQueryType QT>

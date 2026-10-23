@@ -21,6 +21,9 @@
 #include <memory>
 #include <utility>
 
+#include "io/cache/block_file_cache.h"
+#include "io/cache/block_file_cache_factory.h"
+#include "io/cache/file_cache_common.h"
 #include "runtime/memory/untracked_heap_account.h"
 #include "storage/index/inverted/inverted_index_compound_reader.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
@@ -243,6 +246,41 @@ Result<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>> IndexFileReader::
 std::string IndexFileReader::get_index_file_cache_key(const TabletIndex* index_meta) const {
     return InvertedIndexDescriptor::get_index_file_cache_key(
             _index_path_prefix, index_meta->index_id(), index_meta->get_index_suffix());
+}
+
+Status IndexFileReader::read_range_from_storage(const TabletIndex* index_meta, int64_t offset,
+                                                int64_t length, std::string* out) const {
+    if (_fs == nullptr || offset < 0 || length < 0) {
+        return Status::InvalidArgument("cannot read index file range [{}, +{}) from storage",
+                                       offset, length);
+    }
+    io::FileReaderOptions opts;
+    opts.cache_type = io::FileCachePolicy::NO_CACHE;
+    opts.tablet_id = _tablet_id;
+    io::FileReaderSPtr reader;
+    RETURN_IF_ERROR(_fs->open_file(get_index_file_path(index_meta), &reader, &opts));
+    out->resize(static_cast<size_t>(length));
+    size_t bytes_read = 0;
+    RETURN_IF_ERROR(reader->read_at(static_cast<size_t>(offset), Slice(out->data(), out->size()),
+                                    &bytes_read));
+    if (bytes_read != out->size()) {
+        return Status::Corruption("short read of index file range [{}, +{}): {} bytes", offset,
+                                  length, bytes_read);
+    }
+    return Status::OK();
+}
+
+void IndexFileReader::evict_cached_index_file(const TabletIndex* index_meta) const {
+    auto* factory = io::FileCacheFactory::instance();
+    if (!config::enable_file_cache || factory == nullptr ||
+        factory->get_cache_instance_size() == 0) {
+        return;
+    }
+    const auto hash =
+            io::BlockFileCache::hash(io::remote_file_cache_name(get_index_file_path(index_meta)));
+    if (auto* cache = factory->get_by_path(hash); cache != nullptr) {
+        cache->remove_if_cached_async(hash);
+    }
 }
 
 std::string IndexFileReader::get_index_file_path(const TabletIndex* index_meta) const {
