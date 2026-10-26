@@ -23,7 +23,6 @@
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/config.h"
-#include "cpp/sync_point.h"
 #include "load/channel/tablets_channel.h"
 #include "load/delta_writer/delta_writer.h"
 
@@ -43,19 +42,21 @@ std::unique_ptr<BaseDeltaWriter> CloudTabletsChannel::create_delta_writer(
 }
 
 Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& request,
-                                      PTabletWriterAddBlockResult* response,
-                                      const Block* local_block) {
+                                      PTabletWriterAddBlockResult* response) {
     // FIXME(plat1ko): Too many duplicate code with `TabletsChannel`
     SCOPED_TIMER(_add_batch_timer);
     int64_t cur_seq = 0;
-    if (_add_batch_number_counter != nullptr) {
-        _add_batch_number_counter->update(1);
+    _add_batch_number_counter->update(1);
+
+    auto status = _get_current_seq(cur_seq, request);
+    if (UNLIKELY(!status.ok())) {
+        return status;
     }
 
-    bool should_write = false;
-    auto status = _get_current_seq(cur_seq, request, should_write);
-    if (UNLIKELY(!status.ok()) || !should_write) {
-        return status;
+    if (request.packet_seq() < cur_seq) {
+        LOG(INFO) << "packet has already recept before, expect_seq=" << cur_seq
+                  << ", recept_seq=" << request.packet_seq();
+        return Status::OK();
     }
 
     if (request.is_adaptive_random_bucket()) {
@@ -74,7 +75,7 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
             }
         }
         return _write_block_data_for_adaptive_random_bucket(request, cur_seq, partition_to_rowidxs,
-                                                            response, local_block);
+                                                            response);
     }
 
     std::unordered_map<int64_t, DorisVector<uint32_t>> tablet_to_rowidxs;
@@ -101,7 +102,7 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
         }
     }
 
-    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response, local_block);
+    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response);
 }
 
 Status CloudTabletsChannel::_prepare_adaptive_random_bucket_writer(BaseDeltaWriter* writer) {
@@ -130,9 +131,9 @@ Status CloudTabletsChannel::_init_writers_by_partition_ids(
 Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
                                   PTabletWriterAddBlockResult* res, bool* finished) {
     // FIXME(plat1ko): Too many duplicate code with `TabletsChannel`
-    std::unique_lock l(_lock);
+    std::lock_guard l(_lock);
     if (_state == kFinished) {
-        return _get_close_result(l, req.sender_id(), res);
+        return _close_status;
     }
 
     auto sender_id = req.sender_id();
@@ -158,15 +159,9 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
         return Status::OK();
     }
 
-    return _close_and_notify(l, sender_id, parent, req, res);
-}
-
-Status CloudTabletsChannel::_close_writers(LoadChannel* /*parent*/,
-                                           const PTabletWriterAddBlockRequest& /*req*/,
-                                           PTabletWriterAddBlockResult* res) {
     auto* tablet_errors = res->mutable_tablet_errors();
     auto* tablet_vec = res->mutable_tablet_vec();
-    TEST_SYNC_POINT_RETURN_WITH_VALUE("CloudTabletsChannel::close.before_flush", Status::OK(), res);
+    _state = kFinished;
 
     // All senders are closed
     // 1. close all delta writers. under _lock.

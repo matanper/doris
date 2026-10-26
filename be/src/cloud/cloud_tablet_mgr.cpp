@@ -173,64 +173,7 @@ private:
     std::unordered_map<int64_t, std::shared_ptr<CloudTablet>> _map;
 };
 
-// LRU value type. `CacheValue`'s lifetime MUST NOT be longer than `CloudTabletMgr`
-class CloudTabletMgr::CacheValue : public LRUCacheValueBase {
-public:
-    CacheValue(const std::shared_ptr<CloudTablet>& tablet, TabletMap& tablet_map)
-            : tablet(tablet), tablet_map(tablet_map) {}
-    ~CacheValue() override { tablet_map.erase(tablet.get()); }
-
-    // FIXME(plat1ko): The ownership of tablet seems to belong to 'TabletMap', while `CacheValue`
-    // only requires a reference.
-    std::shared_ptr<CloudTablet> tablet;
-    TabletMap& tablet_map;
-};
-
-namespace {
-
-// Drops tablets that nobody has used for config::tablet_cache_stale_sweep_time_sec, such as the
-// tablets of another BE that this BE served while that BE was down. A tablet held by a reader,
-// a load or a compaction through get_tablet is not in the cache's LRU list and is never dropped.
-//
-// Memory GC leaves the cache alone: dropping every unused tablet at once would make the next
-// touch of each one fetch its rowsets from the meta-service again. Only a forced prune, as
-// /api/clear_cache asks for, empties it.
-class CloudTabletCache final : public LRUCachePolicy {
-public:
-    explicit CloudTabletCache(CloudTabletMgr* mgr)
-            : LRUCachePolicy(CachePolicy::CacheType::CLOUD_TABLET_CACHE,
-                             config::tablet_cache_capacity, LRUCacheType::NUMBER,
-                             /*stale_sweep_time_s*/ 0,
-                             static_cast<uint32_t>(config::tablet_cache_shards),
-                             /*element_count_capacity*/ 0, /*enable_prune*/ true,
-                             /*is_lru_k*/ false),
-              _mgr(mgr) {}
-
-    void prune_stale() override {
-        _mgr->evict_idle_foreign_tablets();
-        _stale_sweep_time_s = static_cast<uint32_t>(
-                std::clamp<int64_t>(config::tablet_cache_stale_sweep_time_sec, 0, UINT32_MAX));
-        LRUCachePolicy::prune_stale();
-    }
-
-    // However few tablets are cached, the ones not used for the sweep time go.
-    bool exceed_prune_limit() override { return true; }
-
-    void prune_all(bool force) override {
-        if (force) {
-            LRUCachePolicy::prune_all(force);
-        }
-    }
-
-    // Drops every unreferenced entry `pred` matches, wherever it is in the LRU order.
-    PrunedInfo prune_matching(const CachePrunePredicate& pred) { return _cache->prune_if(pred); }
-
-private:
-    CloudTabletMgr* _mgr;
-};
-
-} // namespace
-
+// TODO(plat1ko): Prune cache
 CloudTabletMgr::CloudTabletMgr(CloudStorageEngine& engine)
         : _engine(engine),
           _tablet_map(std::make_unique<TabletMap>()),
@@ -249,6 +192,19 @@ Result<std::shared_ptr<CloudTablet>> CloudTabletMgr::get_tablet(int64_t tablet_i
                                                                 SyncRowsetStats* sync_stats,
                                                                 bool force_use_only_cached,
                                                                 bool cache_on_miss) {
+    // LRU value type. `Value`'s lifetime MUST NOT be longer than `CloudTabletMgr`
+    class Value : public LRUCacheValueBase {
+    public:
+        Value(const std::shared_ptr<CloudTablet>& tablet, TabletMap& tablet_map)
+                : tablet(tablet), tablet_map(tablet_map) {}
+        ~Value() override { tablet_map.erase(tablet.get()); }
+
+        // FIXME(plat1ko): The ownership of tablet seems to belong to 'TabletMap', while `Value`
+        // only requires a reference.
+        std::shared_ptr<CloudTablet> tablet;
+        TabletMap& tablet_map;
+    };
+
     VLOG_DEBUG << "get_tablet tablet_id=" << tablet_id << " stack: " << get_stack_trace();
 
     auto tablet_id_str = std::to_string(tablet_id);
@@ -311,7 +267,7 @@ Result<std::shared_ptr<CloudTablet>> CloudTabletMgr::get_tablet(int64_t tablet_i
                 return tablet;
             }
 
-            auto value = std::make_unique<CacheValue>(tablet, *_tablet_map);
+            auto value = std::make_unique<Value>(tablet, *_tablet_map);
             auto* insert_handle = _cache->insert(key, value.release(), 1, sizeof(CloudTablet),
                                                  CachePriority::NORMAL);
             auto ret = std::shared_ptr<CloudTablet>(tablet.get(),
@@ -335,8 +291,7 @@ Result<std::shared_ptr<CloudTablet>> CloudTabletMgr::get_tablet(int64_t tablet_i
     if (sync_stats) {
         ++sync_stats->tablet_meta_cache_hit;
     }
-    CloudTablet* tablet_raw_ptr =
-            reinterpret_cast<CacheValue*>(_cache->value(handle))->tablet.get();
+    CloudTablet* tablet_raw_ptr = reinterpret_cast<Value*>(_cache->value(handle))->tablet.get();
     set_tablet_access_time_ms(tablet_raw_ptr);
     auto tablet = std::shared_ptr<CloudTablet>(tablet_raw_ptr, [this, handle](CloudTablet* tablet) {
         set_tablet_access_time_ms(tablet);
@@ -649,8 +604,7 @@ void CloudTabletMgr::sync_tablets(const CountDownLatch& stop_latch) {
 
 Status CloudTabletMgr::get_topn_tablets_to_compact(
         int n, CompactionType compaction_type, const std::function<bool(CloudTablet*)>& filter_out,
-        std::vector<std::shared_ptr<CloudTablet>>* tablets, int64_t* max_score,
-        std::vector<std::shared_ptr<CloudTablet>>* skipped, size_t max_skipped) {
+        std::vector<std::shared_ptr<CloudTablet>>* tablets, int64_t* max_score) {
     DCHECK(compaction_type == CompactionType::BASE_COMPACTION ||
            compaction_type == CompactionType::CUMULATIVE_COMPACTION);
     *max_score = 0;
@@ -719,22 +673,9 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     }};
     std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> buf;
     buf.reserve(n + 1);
-    std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> skipped_buf;
-    if (skipped != nullptr) { skipped_buf.reserve(max_skipped + 1); }
     for (auto& weak_tablet : weak_tablets) {
         auto t = weak_tablet.lock();
         if (t == nullptr) { continue; }
-        // A dropped tablet stays reachable here while anything still holds it, and its score
-        // stays as high as the backlog it was dropped with.
-        if (t->is_dropped()) {
-            dropped_tablets.push_back(t->tablet_id());
-            continue;
-        }
-        // The BE that owns it compacts it; compacting it here would also keep it cached.
-        if (config::enable_foreign_tablet_eviction && is_foreign_tablet(t->tablet_id())) {
-            g_foreign_tablets_skipped_for_compaction << 1;
-            continue;
-        }
 
         int64_t s = score(t.get());
         if (s <= 0) { continue; }
@@ -745,26 +686,9 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
             max_score_tablet_outcome = nullptr;
         }
 
-        if (filter_out(t.get())) {
-            ++num_filtered;
-            if (is_max) { max_score_tablet_outcome = "filtered (preparing, submitted or not running)"; }
-            continue;
-        }
-        if (disable(t.get())) {
-            ++num_disabled;
-            if (is_max) { max_score_tablet_outcome = "disabled (disable_auto_compaction)"; }
-            continue;
-        }
-        if (skip(t.get())) {
-            ++num_skipped;
-            if (is_max) { max_score_tablet_outcome = "skipped (recent failure, no suitable version or frozen)"; }
-            if (skipped != nullptr && max_skipped > 0) {
-                skipped_buf.emplace_back(std::move(t), s);
-                std::sort(skipped_buf.begin(), skipped_buf.end(), [](auto& a, auto& b) { return a.second > b.second; });
-                if (skipped_buf.size() > max_skipped) { skipped_buf.pop_back(); }
-            }
-            continue;
-        }
+        if (filter_out(t.get())) { ++num_filtered; continue; }
+        if (disable(t.get())) { ++num_disabled; continue; }
+        if (skip(t.get())) { ++num_skipped; continue; }
 
         buf.emplace_back(std::move(t), s);
         std::sort(buf.begin(), buf.end(), [](auto& a, auto& b) { return a.second > b.second; });
@@ -793,12 +717,6 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     tablets->reserve(n + 1);
     for (auto& [t, _] : buf) {
         tablets->emplace_back(std::move(t));
-    }
-    if (skipped != nullptr) {
-        skipped->clear();
-        for (auto& [t, _] : skipped_buf) {
-            skipped->emplace_back(std::move(t));
-        }
     }
 
     return Status::OK();
@@ -909,16 +827,6 @@ std::vector<std::shared_ptr<CloudTablet>> CloudTabletMgr::get_all_tablet() {
 
 void CloudTabletMgr::put_tablet_for_UT(std::shared_ptr<CloudTablet> tablet) {
     _tablet_map->put(tablet);
-}
-
-void CloudTabletMgr::put_tablet_in_cache_for_UT(std::shared_ptr<CloudTablet> tablet) {
-    auto tablet_id_str = std::to_string(tablet->tablet_id());
-    CacheKey key(tablet_id_str);
-    auto value = std::make_unique<CacheValue>(tablet, *_tablet_map);
-    auto* handle =
-            _cache->insert(key, value.release(), 1, sizeof(CloudTablet), CachePriority::NORMAL);
-    _cache->release(handle);
-    _tablet_map->put(std::move(tablet));
 }
 
 } // namespace doris

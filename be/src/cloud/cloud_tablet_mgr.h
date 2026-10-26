@@ -91,16 +91,12 @@ public:
      *                   whether skipping the tablet, true for skip
      * @param tablets output param
      * @param max_score output param, max score of existed tablets
-     * @param skipped optional output param, the up to max_skipped highest-scoring tablets that
-     *                the compaction policy skipped, highest first
      * @return status of this call
      */
     Status get_topn_tablets_to_compact(int n, CompactionType compaction_type,
                                        const std::function<bool(CloudTablet*)>& filter_out,
                                        std::vector<std::shared_ptr<CloudTablet>>* tablets,
-                                       int64_t* max_score,
-                                       std::vector<std::shared_ptr<CloudTablet>>* skipped = nullptr,
-                                       size_t max_skipped = 0);
+                                       int64_t* max_score);
 
     /**
      * Gets tablets info and total tablet num that are reported
@@ -121,15 +117,10 @@ public:
     // **ATTN: JUST FOR UT**
     void put_tablet_for_UT(std::shared_ptr<CloudTablet> tablet);
 
-    // **ATTN: JUST FOR UT AND BENCHMARKS**
-    // Caches `tablet` as a get_tablet() cache miss would, without the meta service RPCs.
-    void put_tablet_in_cache_for_UT(std::shared_ptr<CloudTablet> tablet);
-
 private:
     CloudStorageEngine& _engine;
 
     class TabletMap;
-    class CacheValue;
     std::unique_ptr<TabletMap> _tablet_map;
     std::unique_ptr<LRUCachePolicy> _cache;
 

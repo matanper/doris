@@ -169,7 +169,6 @@ Status CloudIndexChangeCompaction::request_global_lock(bool& should_skip_err) {
         } else if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
             // tablet not found
 #ifndef BE_TEST
-            cloud_tablet()->mark_dropped();
             cloud_tablet()->clear_cache();
 #endif
         } else if (resp.status().code() == cloud::JOB_TABLET_BUSY) {
@@ -315,7 +314,6 @@ Status CloudIndexChangeCompaction::modify_rowsets() {
     if (!st.ok()) {
         if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
 #ifndef BE_TEST
-            cloud_tablet()->mark_dropped();
             cloud_tablet()->clear_cache();
 #endif
         } else if (resp.status().code() == cloud::JOB_CHECK_ALTER_VERSION) {
@@ -441,13 +439,8 @@ void CloudIndexChangeCompaction::do_lease() {
     int64_t lease_time = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() +
                          config::lease_compaction_interval_seconds * 4;
     compaction_job->set_lease(lease_time);
-    cloud::FinishTabletJobResponse resp;
-    auto st = _engine.meta_mgr().lease_tablet_job(job, &resp);
+    auto st = _engine.meta_mgr().lease_tablet_job(job);
     if (!st.ok()) {
-        if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
-            // The partition or index was dropped. A running merge stops at its next block.
-            _tablet->mark_dropped();
-        }
         LOG_WARNING("[index_change]failed to lease compaction job")
                 .tag("job_id", _uuid)
                 .tag("tablet_id", _tablet->tablet_id())

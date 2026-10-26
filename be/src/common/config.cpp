@@ -934,8 +934,6 @@ DEFINE_mBool(brpc_usercode_in_pthread, "false");
 // is greater than 1.8G. This is to avoid the error of Request length overflow (2G).
 DEFINE_mBool(transfer_large_data_by_brpc, "true");
 
-DEFINE_mBool(enable_local_tablet_writer_shortcut, "true");
-
 // max number of txns for every txn_partition_map in txn manager
 // this is a self protection to avoid too many txns saving in manager
 DEFINE_mInt64(max_runnings_transactions_per_txn_map, "2000");
@@ -1057,22 +1055,6 @@ DEFINE_Int32(send_batch_thread_pool_queue_size, "102400");
 // When doing compaction, each segment may take at least 1MB buffer.
 DEFINE_mInt32(max_segment_num_per_rowset, "1000");
 DEFINE_mInt32(segment_compression_threshold_kb, "256");
-
-DEFINE_mString(load_segment_compression_type, "");
-DEFINE_Validator(load_segment_compression_type, [](const std::string& config) -> bool {
-    std::string upper = config;
-    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-    return upper.empty() || upper == "NO_COMPRESSION" || upper == "SNAPPY" || upper == "LZ4" ||
-           upper == "LZ4F" || upper == "LZ4HC" || upper == "ZLIB" || upper == "ZSTD";
-});
-
-// 3 is ZSTD_CLEVEL_DEFAULT. Negative levels are ZSTD's fast levels.
-DEFINE_mInt32(zstd_compression_level, "3");
-DEFINE_Validator(zstd_compression_level,
-                 [](const int config) -> bool { return config >= -7 && config <= 22; });
-DEFINE_mInt32(load_segment_zstd_compression_level, "0");
-DEFINE_Validator(load_segment_zstd_compression_level,
-                 [](const int config) -> bool { return config >= -7 && config <= 22; });
 
 // Time to clean up useless JDBC connection pool cache
 DEFINE_mInt32(jdbc_connection_pool_cache_clear_time_sec, "28800");
@@ -2471,8 +2453,6 @@ Status set_fuzzy_configs() {
     fuzzy_field_and_value["string_overflow_size"] =
             ((distribution(*generator) % 2) == 0) ? "10" : "4294967295";
     fuzzy_field_and_value["skip_writing_empty_rowset_metadata"] =
-            ((distribution(*generator) % 2) == 0) ? "true" : "false";
-    fuzzy_field_and_value["skip_rowset_writer_for_empty_tablet"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";
     fuzzy_field_and_value["enable_packed_file"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";

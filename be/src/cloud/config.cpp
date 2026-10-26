@@ -58,8 +58,6 @@ DEFINE_mInt64(cumu_compaction_busy_max_backoff_ms, "5000");
 DEFINE_mInt64(base_compaction_freeze_interval_s, "1800");
 DEFINE_mInt64(compaction_load_max_freeze_interval_s, "1200");
 DEFINE_mInt64(cumu_compaction_interval_s, "1800");
-DEFINE_mInt32(cloud_dropped_tablet_probe_batch, "8");
-DEFINE_mInt64(cloud_dropped_tablet_probe_interval_s, "60");
 
 DEFINE_mInt32(compaction_timeout_seconds, "86400");
 DEFINE_mInt32(lease_compaction_interval_seconds, "20");
@@ -134,18 +132,6 @@ DEFINE_mInt32(meta_service_conflict_error_retry_times, "10");
 DEFINE_Bool(enable_check_storage_vault, "true");
 
 DEFINE_mBool(skip_writing_empty_rowset_metadata, "true");
-
-DEFINE_mBool(enable_hole_rowset_version_range, "true");
-DEFINE_mInt64(hole_rowset_max_versions, "128");
-DEFINE_Validator(hole_rowset_max_versions,
-                 [](const int64_t config) -> bool { return config >= 1; });
-DEFINE_mInt64(hole_rowset_eager_prefix_versions, "0");
-DEFINE_Validator(hole_rowset_eager_prefix_versions,
-                 [](const int64_t config) -> bool { return config >= 0; });
-DEFINE_mBool(hole_rowset_drop_extended_tail, "true");
-DEFINE_mBool(enable_implicit_version_gaps, "false");
-
-DEFINE_mBool(skip_rowset_writer_for_empty_tablet, "true");
 
 DEFINE_mInt64(cloud_index_change_task_timeout_second, "3600");
 

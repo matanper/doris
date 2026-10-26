@@ -307,14 +307,7 @@ public class NereidsLoadPlanInfoCollector extends DefaultPlanVisitor<Void, PlanT
                 ? taskInfo.isMemtableOnSinkNode()
                 : false;
         boolean enableSingleReplicaLoad = enableMemtableOnSinkNode ? false : Config.enable_single_replica_load;
-        boolean isGroupCommit = taskInfo instanceof NereidsStreamLoadTask
-                && ((NereidsStreamLoadTask) taskInfo).getGroupCommit() != null;
-        if (partitionIds == null && shouldOpenPartitionsLazily(isGroupCommit, enableSingleReplicaLoad)) {
-            // An empty list makes the sink start from the dummy auto-partition location; the BE then
-            // resolves each partition its rows land in through createPartition and opens only those.
-            partitionIds = new ArrayList<>();
-        }
-        if (isGroupCommit) {
+        if (taskInfo instanceof NereidsStreamLoadTask && ((NereidsStreamLoadTask) taskInfo).getGroupCommit() != null) {
             loadPlanInfo.olapTableSink = new GroupCommitBlockSink(destTable, olapTuple, partitionIds,
                     enableSingleReplicaLoad, partitionExprs, syncMvWhereClauses,
                     ((NereidsStreamLoadTask) taskInfo).getGroupCommit(),
@@ -483,20 +476,6 @@ public class NereidsLoadPlanInfoCollector extends DefaultPlanVisitor<Void, PlanT
             context.createSlotDesc(tupleDescriptor, (SlotReference) slot, table);
         }
         return tupleDescriptor;
-    }
-
-    // A null partition list opens every partition of the table. For an auto-partition table that
-    // costs one writer per tablet of every partition on every target BE, although a load usually
-    // touches a few partitions.
-    private boolean shouldOpenPartitionsLazily(boolean isGroupCommit, boolean enableSingleReplicaLoad) {
-        return Config.enable_auto_partition_lazy_open_for_load
-                && destTable.getPartitionInfo().enableAutomaticPartition()
-                // createPartition rejects a table that is not NORMAL, even for an existing partition,
-                // so a load planned during a schema change keeps opening every partition.
-                && destTable.getState() == OlapTable.OlapTableState.NORMAL
-                && !isGroupCommit
-                && !enableSingleReplicaLoad
-                && uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPSERT;
     }
 
     // get all specified partition ids.

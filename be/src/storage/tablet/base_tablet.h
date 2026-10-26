@@ -68,20 +68,6 @@ public:
     BaseTablet& operator=(const BaseTablet&) = delete;
 
     TabletState tablet_state() const { return _tablet_meta->tablet_state(); }
-
-    // Set once the meta service reports the tablet dropped (its partition or index was dropped,
-    // e.g. by TRUNCATE). Compaction neither picks nor keeps merging a dropped tablet.
-    void mark_dropped() { _dropped.store(true, std::memory_order_relaxed); }
-    bool is_dropped() const { return _dropped.load(std::memory_order_relaxed); }
-
-    // Set while a cancel of the tablet's full compaction is pending. The merge loops stop at
-    // the next block when it is set.
-    void set_compaction_cancel_requested(bool requested) {
-        _compaction_cancel_requested.store(requested, std::memory_order_relaxed);
-    }
-    bool compaction_cancel_requested() const {
-        return _compaction_cancel_requested.load(std::memory_order_relaxed);
-    }
     Status set_tablet_state(TabletState state);
     int64_t table_id() const { return _tablet_meta->table_id(); }
     size_t row_size() const { return _tablet_meta->tablet_schema()->row_size(); }
@@ -419,8 +405,6 @@ protected:
 
     // `_alter_failed` is used to indicate whether the tablet failed to perform a schema change
     std::atomic<bool> _alter_failed = false;
-    std::atomic<bool> _dropped = false;
-    std::atomic<bool> _compaction_cancel_requested = false;
 
     // metrics of this tablet
     std::shared_ptr<MetricEntity> _metric_entity;

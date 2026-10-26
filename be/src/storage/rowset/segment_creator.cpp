@@ -18,8 +18,6 @@
 #include "storage/rowset/segment_creator.h"
 
 // IWYU pragma: no_include <bthread/errno.h>
-#include <algorithm>
-#include <cctype>
 #include <cerrno> // IWYU pragma: keep
 #include <chrono>
 #include <filesystem>
@@ -51,7 +49,6 @@
 #include "storage/segment/vertical_segment_writer.h"
 #include "storage/tablet/tablet_schema.h"
 #include "storage/utils.h"
-#include "util/block_compression.h"
 #include "util/debug_points.h"
 #include "util/json/json_parser.h"
 #include "util/pretty_printer.h"
@@ -59,29 +56,6 @@
 
 namespace doris {
 using namespace ErrorCode;
-
-segment_v2::CompressionTypePB load_segment_compression_type(DataWriteType write_type) {
-    if (write_type != DataWriteType::TYPE_DIRECT) {
-        return segment_v2::UNKNOWN_COMPRESSION;
-    }
-    std::string name = config::load_segment_compression_type;
-    if (name.empty()) {
-        return segment_v2::UNKNOWN_COMPRESSION;
-    }
-    std::transform(name.begin(), name.end(), name.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    segment_v2::CompressionTypePB type = segment_v2::UNKNOWN_COMPRESSION;
-    if (!segment_v2::CompressionTypePB_Parse(name, &type) ||
-        type == segment_v2::DEFAULT_COMPRESSION) {
-        return segment_v2::UNKNOWN_COMPRESSION;
-    }
-    return type;
-}
-
-int load_segment_zstd_compression_level(DataWriteType write_type) {
-    return write_type == DataWriteType::TYPE_DIRECT ? config::load_segment_zstd_compression_level
-                                                    : 0;
-}
 
 SegmentFlusher::SegmentFlusher(RowsetWriterContext& context, SegmentFileCollection& seg_files,
                                InvertedIndexFileCollection& idx_files)
@@ -136,7 +110,6 @@ Status SegmentFlusher::_preload_segment_indexes_to_file_cache() {
 
 Status SegmentFlusher::_add_rows(std::unique_ptr<segment_v2::SegmentWriter>& segment_writer,
                                  const Block* block, size_t row_pos, size_t num_rows) {
-    ScopedZstdCompressionLevel zstd_level(load_segment_zstd_compression_level(_context.write_type));
     RETURN_IF_ERROR(segment_writer->append_block(block, row_pos, num_rows));
     _num_rows_written += num_rows;
     return Status::OK();
@@ -144,7 +117,6 @@ Status SegmentFlusher::_add_rows(std::unique_ptr<segment_v2::SegmentWriter>& seg
 
 Status SegmentFlusher::_add_rows(std::unique_ptr<segment_v2::VerticalSegmentWriter>& segment_writer,
                                  const Block* block, size_t row_pos, size_t num_rows) {
-    ScopedZstdCompressionLevel zstd_level(load_segment_zstd_compression_level(_context.write_type));
     RETURN_IF_ERROR(segment_writer->batch_block(block, row_pos, num_rows));
     RETURN_IF_ERROR(segment_writer->write_batch());
     _num_rows_written += num_rows;
@@ -169,8 +141,6 @@ Status SegmentFlusher::_create_segment_writer(std::unique_ptr<segment_v2::Segmen
     writer_options.mow_ctx = _context.mow_context;
     if (no_compression) {
         writer_options.compression_type = NO_COMPRESSION;
-    } else {
-        writer_options.compression_type = load_segment_compression_type(_context.write_type);
     }
 
     writer = std::make_unique<segment_v2::SegmentWriter>(
@@ -207,8 +177,6 @@ Status SegmentFlusher::_create_segment_writer(
     writer_options.mow_ctx = _context.mow_context;
     if (no_compression) {
         writer_options.compression_type = NO_COMPRESSION;
-    } else {
-        writer_options.compression_type = load_segment_compression_type(_context.write_type);
     }
 
     writer = std::make_unique<segment_v2::VerticalSegmentWriter>(
@@ -233,8 +201,6 @@ Status SegmentFlusher::_create_segment_writer(
 
 Status SegmentFlusher::_flush_segment_writer(
         std::unique_ptr<segment_v2::VerticalSegmentWriter>& writer, int64_t* flush_size) {
-    // Pages are compressed while rows are appended and when the writer is finalized.
-    ScopedZstdCompressionLevel zstd_level(load_segment_zstd_compression_level(_context.write_type));
     MonotonicStopWatch total_timer;
     total_timer.start();
 
@@ -316,8 +282,6 @@ Status SegmentFlusher::_flush_segment_writer(
 
 Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::SegmentWriter>& writer,
                                              int64_t* flush_size) {
-    // Pages are compressed while rows are appended and when the writer is finalized.
-    ScopedZstdCompressionLevel zstd_level(load_segment_zstd_compression_level(_context.write_type));
     MonotonicStopWatch total_timer;
     total_timer.start();
 

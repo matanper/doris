@@ -319,9 +319,6 @@ bool VerticalMergeIteratorContext::compare(const VerticalMergeIteratorContext& r
     return result;
 }
 
-// Runs are often a few rows long, so copy_rows() is called per row range per column; the column
-// is borrowed through assert_mutable_ref() rather than an owning pointer whose reference count
-// would take two atomic updates per call.
 Status VerticalMergeIteratorContext::copy_rows(Block* block, size_t count) {
     Block& src = *_block;
     Block& dst = *block;
@@ -337,7 +334,7 @@ Status VerticalMergeIteratorContext::copy_rows(Block* block, size_t count) {
             ColumnPtr& s_cp = s_col.column;
             ColumnPtr& d_cp = d_col.column;
 
-            d_cp->assert_mutable_ref().insert_range_from(*s_cp, start, count);
+            d_cp->assert_mutable()->insert_range_from(*s_cp, start, count);
         }
     });
     return Status::OK();
@@ -360,7 +357,7 @@ Status VerticalMergeIteratorContext::copy_rows(Block* block, bool advanced) {
             ColumnPtr& s_cp = s_col.column;
             ColumnPtr& d_cp = d_col.column;
 
-            d_cp->assert_mutable_ref().insert_range_from(*s_cp, start, _cur_batch_num);
+            d_cp->assert_mutable()->insert_range_from(*s_cp, start, _cur_batch_num);
         }
     });
     _cur_batch_num = 0;

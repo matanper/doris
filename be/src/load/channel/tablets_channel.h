@@ -20,7 +20,6 @@
 #include <glog/logging.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <ostream>
@@ -48,7 +47,6 @@ class RepeatedPtrField;
 } // namespace google::protobuf
 
 namespace doris {
-class Block;
 class PSlaveTabletNodes;
 class PSuccessSlaveTabletNodeIds;
 class PTabletError;
@@ -83,7 +81,6 @@ class BaseDeltaWriter;
 class MemTableWriter;
 class OlapTableSchemaParam;
 class LoadChannel;
-class EosCompletion;
 struct WriteRequest;
 
 // Write channel for a particular (load, index).
@@ -100,24 +97,19 @@ public:
 
     virtual std::unique_ptr<BaseDeltaWriter> create_delta_writer(const WriteRequest& request) = 0;
 
-    // no-op when this channel has been closed or cancelled.
-    // `local_block` is non-null when a tablet sink on this BE handed the rows over in-process;
-    // the request then carries no serialized block and only describes the rows.
+    // no-op when this channel has been closed or cancelled
     virtual Status add_batch(const PTabletWriterAddBlockRequest& request,
-                             PTabletWriterAddBlockResult* response, const Block* local_block) = 0;
+                             PTabletWriterAddBlockResult* response) = 0;
 
     // Mark sender with 'sender_id' as closed.
     // If all senders are closed, close this channel, set '*finished' to true, update 'tablet_vec'
     // to include all tablets written in this channel.
-    // Release the EOS arrival barrier before final flushing/committing, outside _lock.
     // no-op when this channel has been closed or cancelled
     virtual Status close(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
                          PTabletWriterAddBlockResult* res, bool* finished) = 0;
 
     // no-op when this channel has been closed or cancelled
     virtual Status cancel();
-
-    const std::shared_ptr<EosCompletion>& eos_completion() const { return _eos_completion; }
 
     void refresh_profile();
 
@@ -130,43 +122,22 @@ public:
 
     bool is_finished() const { return _state == kFinished; }
 
-    // Picks the rows of an add-block request: `local_block` when it is set, otherwise the
-    // request's serialized block deserialized into `deserialized`. A request carrying both is
-    // rejected, since the two sources could disagree.
-    static Status resolve_send_block(const PTabletWriterAddBlockRequest& request,
-                                     const Block* local_block, Block* deserialized,
-                                     const Block** send_data);
-
 protected:
-    // Called by the final sender under _lock. Publish arrival before flushing,
-    // releasing the channel lock while invoking RPC callbacks.
-    Status _close_and_notify(std::unique_lock<std::mutex>& lock, int sender_id,
-                             LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
-                             PTabletWriterAddBlockResult* response);
-    Status _get_close_result(std::unique_lock<std::mutex>& lock, int sender_id,
-                             PTabletWriterAddBlockResult* response);
-    // Called exactly once by the final sender, with _lock held.
-    // `parent` and `req` are the final sender's; local single-replica load reads them.
-    virtual Status _close_writers(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
-                                  PTabletWriterAddBlockResult* response) = 0;
-
     Status _init_adaptive_random_bucket_state(const PTabletWriterOpenRequest& request);
     Status _write_block_data(const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
                              std::unordered_map<int64_t, DorisVector<uint32_t>>& tablet_to_rowidxs,
-                             PTabletWriterAddBlockResult* response, const Block* local_block);
+                             PTabletWriterAddBlockResult* response);
     Status _write_block_data_for_adaptive_random_bucket(
             const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
             std::unordered_map<int64_t, DorisVector<uint32_t>>& partition_to_rowidxs,
-            PTabletWriterAddBlockResult* response, const Block* local_block);
+            PTabletWriterAddBlockResult* response);
     virtual Status _prepare_adaptive_random_bucket_writer(BaseDeltaWriter* writer);
     Status _build_partition_to_rowidxs_for_adaptive_random_bucket(
             const PTabletWriterAddBlockRequest& request,
             std::unordered_map<int64_t, DorisVector<uint32_t>>* partition_to_rowidxs);
     std::shared_ptr<std::mutex> _get_partition_route_lock(int64_t partition_id);
 
-    // OK does not imply a write: duplicates and closed channels are no-ops.
-    Status _get_current_seq(int64_t& cur_seq, const PTabletWriterAddBlockRequest& request,
-                            bool& should_write);
+    Status _get_current_seq(int64_t& cur_seq, const PTabletWriterAddBlockRequest& request);
 
     // open all writer
     Status _open_all_writers(const PTabletWriterOpenRequest& request);
@@ -184,7 +155,6 @@ protected:
 
     // id of this load channel
     TabletsChannelKey _key;
-    std::shared_ptr<EosCompletion> _eos_completion;
 
     // protect _state change. open and close. when add_batch finished, lock to change _next_seqs also
     std::mutex _lock;
@@ -209,14 +179,9 @@ protected:
     int _num_remaining_senders = 0;
     std::vector<int64_t> _next_seqs;
     Bitmap _closed_senders;
-    // Arrival releases earlier senders; only the final sender's retries must
-    // wait for flush/commit and receive its status and tablet results. All these
-    // fields are protected by _lock, including while callbacks run without it.
-    int _final_sender_id = -1;
-    bool _final_close_in_progress = false;
-    std::condition_variable _final_close_cv;
+    // status to return when operate on an already closed/cancelled channel
+    // currently it's OK.
     Status _close_status;
-    std::unique_ptr<PTabletWriterAddBlockResult> _final_close_result;
 
     // tablet_id -> TabletChannel. it will only be changed in open() or inc_open()
     std::unordered_map<int64_t, std::unique_ptr<BaseDeltaWriter>> _tablet_writers;
@@ -272,7 +237,7 @@ public:
     std::unique_ptr<BaseDeltaWriter> create_delta_writer(const WriteRequest& request) override;
 
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response, const Block* local_block) override;
+                     PTabletWriterAddBlockResult* response) override;
 
     Status close(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
                  PTabletWriterAddBlockResult* res, bool* finished) override;
@@ -281,8 +246,6 @@ public:
 
 private:
     void _init_profile(RuntimeProfile* profile) override;
-    Status _close_writers(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
-                          PTabletWriterAddBlockResult* response) override;
 
     // deal with DeltaWriter commit_txn(), add tablet to list for return.
     void _commit_txn(DeltaWriter* writer, const PTabletWriterAddBlockRequest& req,
