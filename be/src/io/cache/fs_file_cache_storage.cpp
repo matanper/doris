@@ -29,9 +29,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <limits>
@@ -81,6 +83,26 @@ void FSFileCacheStorage::set_inode_estimation_test_hooks(
 }
 #endif
 
+namespace {
+// A missing file is already removed: concurrent removers and a cleared cache directory both
+// produce it, so it is not an error.
+Status remove_file_if_exists(const std::string& path) {
+    if (::unlink(path.c_str()) == 0 || errno == ENOENT) {
+        return Status::OK();
+    }
+    return Status::IOError("failed to delete file cache block {}: {}", path, std::strerror(errno));
+}
+
+// rmdir only succeeds on an empty directory, which makes it the check and the removal in one
+// call. A directory that still holds blocks or is already gone is left as is.
+void remove_directory_if_empty(const std::string& dir) {
+    if (::rmdir(dir.c_str()) == 0 || errno == ENOENT || errno == ENOTEMPTY || errno == EEXIST) {
+        return;
+    }
+    LOG_WARNING("failed to remove cache directory {}: {}", dir, std::strerror(errno));
+}
+} // namespace
+
 struct BatchLoadArgs {
     UInt128Wrapper hash;
     CacheContext ctx;
@@ -101,33 +123,49 @@ FDCache* FDCache::instance() {
     return ExecEnv::GetInstance()->file_cache_open_fd_cache();
 }
 
+FDCache::Shard& FDCache::_shard_of(const AccessKeyAndOffset& key) {
+    return _shards[KeyAndOffsetHash()(key) % kShardCount];
+}
+
 std::shared_ptr<FileReader> FDCache::get_file_reader(const AccessKeyAndOffset& key) {
     if (config::file_cache_max_file_reader_cache_size == 0) [[unlikely]] {
         return nullptr;
     }
     DCHECK(ExecEnv::GetInstance());
-    std::shared_lock rlock(_mtx);
-    if (auto iter = _file_name_to_reader.find(key); iter != _file_name_to_reader.end()) {
-        return iter->second->second;
+    auto& shard = _shard_of(key);
+    std::shared_lock rlock(shard.mtx);
+    if (auto iter = shard.readers.find(key); iter != shard.readers.end()) {
+        return iter->second.reader;
     }
     return nullptr;
 }
 
 void FDCache::insert_file_reader(const AccessKeyAndOffset& key,
                                  std::shared_ptr<FileReader> file_reader) {
-    if (config::file_cache_max_file_reader_cache_size == 0) [[unlikely]] {
+    const int64_t capacity = config::file_cache_max_file_reader_cache_size;
+    if (capacity == 0) [[unlikely]] {
         return;
     }
-    std::lock_guard wlock(_mtx);
-
-    if (auto iter = _file_name_to_reader.find(key); iter == _file_name_to_reader.end()) {
-        if (config::file_cache_max_file_reader_cache_size == _file_reader_list.size()) {
-            _file_name_to_reader.erase(_file_reader_list.back().first);
-            _file_reader_list.pop_back();
+    std::lock_guard order_lock(_order_mtx);
+    auto& shard = _shard_of(key);
+    {
+        std::shared_lock rlock(shard.mtx);
+        if (shard.readers.contains(key)) {
+            return;
         }
-        _file_reader_list.emplace_front(key, std::move(file_reader));
-        _file_name_to_reader.insert(std::make_pair(key, _file_reader_list.begin()));
     }
+    while (!_order.empty() && static_cast<int64_t>(_order.size()) >= capacity) {
+        const auto& oldest = _order.back();
+        auto& oldest_shard = _shard_of(oldest);
+        {
+            std::lock_guard wlock(oldest_shard.mtx);
+            oldest_shard.readers.erase(oldest);
+        }
+        _order.pop_back();
+    }
+    _order.push_front(key);
+    std::lock_guard wlock(shard.mtx);
+    shard.readers.emplace(key, Entry {std::move(file_reader), _order.begin()});
 }
 
 void FDCache::remove_file_reader(const AccessKeyAndOffset& key) {
@@ -135,21 +173,24 @@ void FDCache::remove_file_reader(const AccessKeyAndOffset& key) {
         return;
     }
     DCHECK(ExecEnv::GetInstance());
-    std::lock_guard wlock(_mtx);
-    if (auto iter = _file_name_to_reader.find(key); iter != _file_name_to_reader.end()) {
-        _file_reader_list.erase(iter->second);
-        _file_name_to_reader.erase(key);
+    std::lock_guard order_lock(_order_mtx);
+    auto& shard = _shard_of(key);
+    std::lock_guard wlock(shard.mtx);
+    if (auto iter = shard.readers.find(key); iter != shard.readers.end()) {
+        _order.erase(iter->second.order_it);
+        shard.readers.erase(iter);
     }
 }
 
 bool FDCache::contains_file_reader(const AccessKeyAndOffset& key) {
-    std::shared_lock rlock(_mtx);
-    return _file_name_to_reader.contains(key);
+    auto& shard = _shard_of(key);
+    std::shared_lock rlock(shard.mtx);
+    return shard.readers.contains(key);
 }
 
 size_t FDCache::file_reader_cache_size() {
-    std::shared_lock rlock(_mtx);
-    return _file_reader_list.size();
+    std::lock_guard order_lock(_order_mtx);
+    return _order.size();
 }
 
 Status FSFileCacheStorage::init(BlockFileCache* mgr) {
@@ -215,14 +256,26 @@ Status FSFileCacheStorage::get_or_create_file_writer(const FileCacheKey& key, Fi
     }
 
     std::string dir = get_path_in_local_cache_v3(key.hash);
-    auto st = fs->create_directory(dir, false);
-    if (!st.ok() && !st.is<ErrorCode::ALREADY_EXIST>()) {
-        return st;
-    }
     std::string tmp_file = get_path_in_local_cache_v3(dir, key.offset, true);
     FileWriterPtr file_writer;
-    FileWriterOptions opts {.sync_file_data = false};
-    RETURN_IF_ERROR(fs->create_file(tmp_file, &file_writer, &opts));
+    FileWriterOptions opts {.sync_file_data = false,
+                            .drop_page_cache_on_close =
+                                    config::file_cache_drop_page_cache_after_write};
+    // The removal of the last block of another offset under this hash may rmdir the directory
+    // between create_directory and create_file; recreate it once in that case.
+    for (int attempt = 0;; ++attempt) {
+        auto st = fs->create_directory(dir, false);
+        if (!st.ok() && !st.is<ErrorCode::ALREADY_EXIST>()) {
+            return st;
+        }
+        st = fs->create_file(tmp_file, &file_writer, &opts);
+        if (st.ok()) {
+            break;
+        }
+        if (attempt > 0 || !st.is<ErrorCode::NOT_FOUND>()) {
+            return st;
+        }
+    }
     *writer = file_writer.get();
     shard.map.emplace(file_writer_map_key, std::move(file_writer));
     return Status::OK();
@@ -416,36 +469,22 @@ Status FSFileCacheStorage::remove(const FileCacheKey& key) {
     const std::string v3_dir = get_path_in_local_cache_v3(key.hash);
     const std::string v3_file = get_path_in_local_cache_v3(v3_dir, key.offset);
     FDCache::instance()->remove_file_reader(std::make_pair(key.hash, key.offset));
-    RETURN_IF_ERROR(fs->delete_file(v3_file));
-    // return OK not means the file is deleted, it may be not exist
+    RETURN_IF_ERROR(remove_file_if_exists(v3_file));
 
-    std::string v2_dir;
-    { // try to detect the file with old v2 format
-        v2_dir = get_path_in_local_cache_v2(key.hash, key.meta.expiration_time);
-        const std::string v2_file = get_path_in_local_cache_v2(v2_dir, key.offset, key.meta.type);
-        RETURN_IF_ERROR(fs->delete_file(v2_file));
+    // A block written in the old v2 layout lives in a directory named after its expiration time.
+    // With expiration time 0 both layouts resolve to the same directory.
+    const std::string v2_dir = get_path_in_local_cache_v2(key.hash, key.meta.expiration_time);
+    const std::string v2_file = get_path_in_local_cache_v2(v2_dir, key.offset, key.meta.type);
+    if (v2_file != v3_file) {
+        RETURN_IF_ERROR(remove_file_if_exists(v2_file));
     }
 
     BlockMetaKey mkey(key.meta.tablet_id, UInt128Wrapper(key.hash), key.offset);
     _meta_store->delete_key(mkey);
-    std::vector<FileInfo> files;
-    bool exists {false};
-    RETURN_IF_ERROR(fs->list(v2_dir, true, &files, &exists));
-    if (exists && files.empty()) {
-        auto st = fs->delete_empty_directory(v2_dir);
-        if (!st.ok()) {
-            LOG_WARNING("failed to remove cache directory {}", v2_dir).error(st);
-        }
-    }
 
-    files.clear();
-    exists = false;
-    RETURN_IF_ERROR(fs->list(v3_dir, true, &files, &exists));
-    if (exists && files.empty()) {
-        auto st = fs->delete_empty_directory(v3_dir);
-        if (!st.ok()) {
-            LOG_WARNING("failed to remove cache directory {}", v3_dir).error(st);
-        }
+    remove_directory_if_empty(v3_dir);
+    if (v2_dir != v3_dir) {
+        remove_directory_if_empty(v2_dir);
     }
     return Status::OK();
 }
