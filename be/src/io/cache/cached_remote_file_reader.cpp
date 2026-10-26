@@ -199,22 +199,6 @@ CachedRemoteFileReader::~CachedRemoteFileReader() {
     static_cast<void>(close());
 }
 
-bool CachedRemoteFileReader::is_range_in_local_cache(size_t offset, size_t size) {
-    if (_cache == nullptr) {
-        return false;
-    }
-    IOContext io_ctx;
-    io_ctx.is_index_data = true;
-    CacheContext cache_context(&io_ctx);
-    cache_context.tablet_id = _tablet_id;
-    FileBlocks blocks;
-    bool fully_covered = false;
-    return _cache->get_downloaded_blocks_if_fully_covered(_cache_hash, offset, size, cache_context,
-                                                          &blocks, &fully_covered)
-                   .ok() &&
-           fully_covered;
-}
-
 Status CachedRemoteFileReader::close() {
     return _remote_file_reader->close();
 }

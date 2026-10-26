@@ -121,11 +121,6 @@ public:
     // File modification time (seconds since epoch). Default to 0 meaning unknown.
     virtual int64_t mtime() const = 0;
 
-    // True when every byte of [offset, offset + size) is already in this BE's local file cache,
-    // so reading the range costs no remote IO. False when it is not, or when the reader cannot
-    // tell. Never reads or downloads anything.
-    virtual bool is_range_in_local_cache(size_t /*offset*/, size_t /*size*/) { return false; }
-
 protected:
     virtual Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                 const IOContext* io_ctx) = 0;

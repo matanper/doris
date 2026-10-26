@@ -521,9 +521,6 @@ DECLARE_Bool(enable_low_cardinality_cache_code);
 // so that each output block stays close to preferred_block_size_bytes.
 // When false, the fixed batch_size row behaviour is preserved.
 DECLARE_mBool(enable_adaptive_batch_size);
-// A segment keeps its whole column meta region in memory, read once when it opens, when the region
-// is at most this many bytes; 0 reads each column meta on its own.
-DECLARE_mInt64(segment_column_meta_region_buffer_max_bytes);
 
 // be policy
 // whether check compaction checksum

@@ -17,8 +17,6 @@
 
 #include "storage/segment/external_col_meta_util.h"
 
-#include <bvar/bvar.h>
-
 #include <limits>
 #include <memory>
 #include <vector>
@@ -30,9 +28,6 @@
 namespace doris::segment_v2 {
 
 namespace {
-
-bvar::Adder<int64_t> g_column_meta_region_bytes("segment_column_meta_region_bytes");
-bvar::Adder<int64_t> g_column_meta_regions("segment_column_meta_regions");
 
 io::IOContext create_index_io_context(const io::IOContext* source_io_ctx,
                                       OlapReaderStatistics* stats) {
@@ -118,90 +113,12 @@ bool ExternalColMetaUtil::is_valid_meta_slice(uint64_t pos, uint64_t size,
     return true;
 }
 
-ColumnMetaRegion::~ColumnMetaRegion() {
-    if (charged_bytes > 0) {
-        g_column_meta_region_bytes << -charged_bytes;
-        g_column_meta_regions << -1;
-    }
-}
-
-Status ExternalColMetaUtil::read_region(const io::FileReaderSPtr& file_reader,
-                                        const SegmentFooterPB& footer,
-                                        const ExternalColMetaUtil::ExternalMetaPointers& p,
-                                        std::shared_ptr<const ColumnMetaRegion>* out,
-                                        OlapReaderStatistics* stats,
-                                        const io::IOContext* source_io_ctx) {
-    if (footer.column_meta_entries_size() != static_cast<int>(p.num_columns)) {
-        return Status::Corruption("column_meta_entries size mismatch: entries={}, num_columns={}",
-                                  footer.column_meta_entries_size(), p.num_columns);
-    }
-    if (p.region_end <= p.region_start) {
-        return Status::Corruption("invalid external meta region: start={}, end={}", p.region_start,
-                                  p.region_end);
-    }
-    const uint64_t size = p.region_end - p.region_start;
-    if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-        return Status::Corruption("column meta region too large to allocate: {}", size);
-    }
-    auto region = std::make_shared<ColumnMetaRegion>();
-    region->offsets.reserve(static_cast<size_t>(p.num_columns) + 1);
-    uint64_t offset = 0;
-    for (uint32_t i = 0; i < p.num_columns; ++i) {
-        region->offsets.push_back(offset);
-        offset += static_cast<uint64_t>(footer.column_meta_entries(static_cast<int>(i)).length());
-    }
-    if (offset > size) {
-        return Status::Corruption("column_meta_entries span {} bytes, beyond the {}-byte region",
-                                  offset, size);
-    }
-    region->offsets.push_back(offset);
-    region->bytes.resize(static_cast<size_t>(size));
-    size_t bytes_read = 0;
-    io::IOContext io_ctx = create_index_io_context(source_io_ctx, stats);
-    RETURN_IF_ERROR(
-            file_reader->read_at(p.region_start, Slice(region->bytes), &bytes_read, &io_ctx));
-    if (bytes_read != region->bytes.size()) {
-        return Status::Corruption("short read on column meta region: expect={}, actual={}", size,
-                                  bytes_read);
-    }
-    region->charged_bytes = static_cast<int64_t>(region->bytes.capacity() +
-                                                 region->offsets.capacity() * sizeof(uint64_t));
-    g_column_meta_region_bytes << region->charged_bytes;
-    g_column_meta_regions << 1;
-    *out = std::move(region);
-    return Status::OK();
-}
-
-Status ExternalColMetaUtil::parse_col_meta(const ColumnMetaRegion& region, uint32_t col_id,
-                                           ColumnMetaPB* out_meta) {
-    if (static_cast<size_t>(col_id) + 1 >= region.offsets.size()) {
-        return Status::Corruption("col_id {} out of range {}", col_id,
-                                  region.offsets.empty() ? 0 : region.offsets.size() - 1);
-    }
-    const uint64_t begin = region.offsets[col_id];
-    const uint64_t end = region.offsets[col_id + 1];
-    if (end <= begin || end > region.bytes.size()) {
-        return Status::Corruption(
-                "invalid ColumnMetaPB bounds in column meta region: col_id={}, begin={}, end={}, "
-                "region_size={}",
-                col_id, begin, end, region.bytes.size());
-    }
-    if (!out_meta->ParseFromArray(region.bytes.data() + begin, static_cast<int>(end - begin))) {
-        return Status::Corruption("failed to parse ColumnMetaPB, col_id={}", col_id);
-    }
-    return Status::OK();
-}
-
 Status ExternalColMetaUtil::read_col_meta(const io::FileReaderSPtr& file_reader,
                                           const SegmentFooterPB& footer,
                                           const ExternalColMetaUtil::ExternalMetaPointers& p,
                                           uint32_t col_id, ColumnMetaPB* out_meta,
                                           OlapReaderStatistics* stats,
-                                          const io::IOContext* source_io_ctx,
-                                          const ColumnMetaRegion* region) {
-    if (region != nullptr) {
-        return parse_col_meta(*region, col_id, out_meta);
-    }
+                                          const io::IOContext* source_io_ctx) {
     if (col_id >= p.num_columns) {
         return Status::Corruption("col_id {} out of range {}", col_id, p.num_columns);
     }

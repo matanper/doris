@@ -26,7 +26,6 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
-#include <mutex>
 #include <random>
 #include <roaring/roaring.hh>
 #include <set>
@@ -47,10 +46,7 @@
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/segment/column_meta_accessor.h"
-#include "storage/segment/column_reader_cache.h"
-#include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/segment.h"
-#include "storage/segment/variant/variant_external_meta_reader.h"
 #include "storage/variant/index_storage_variant_test_base.h"
 #include "util/defer_op.h"
 
@@ -62,42 +58,6 @@ constexpr int32_t kVariantUid = 2;
 int64_t exposed(const std::string& name) {
     return std::stoll(bvar::Variable::describe_exposed(name));
 }
-
-// Records the offset and length of every read.
-class RecordingFileReader final : public io::FileReader {
-public:
-    explicit RecordingFileReader(io::FileReaderSPtr inner) : _inner(std::move(inner)) {}
-    Status close() override { return _inner->close(); }
-    const io::Path& path() const override { return _inner->path(); }
-    size_t size() const override { return _inner->size(); }
-    bool closed() const override { return _inner->closed(); }
-    int64_t mtime() const override { return 0; }
-
-    // Reads that touch [begin, end).
-    size_t reads_in(uint64_t begin, uint64_t end) {
-        std::lock_guard lock(_mutex);
-        size_t n = 0;
-        for (const auto& [offset, length] : _reads) {
-            n += offset < end && offset + length > begin;
-        }
-        return n;
-    }
-
-protected:
-    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
-                        const io::IOContext* io_ctx) override {
-        {
-            std::lock_guard lock(_mutex);
-            _reads.emplace_back(offset, result.size);
-        }
-        return _inner->read_at(offset, result, bytes_read, io_ctx);
-    }
-
-private:
-    io::FileReaderSPtr _inner;
-    std::mutex _mutex;
-    std::vector<std::pair<uint64_t, uint64_t>> _reads;
-};
 
 // Every term of `index` with its documents, frequencies and positions.
 std::map<std::string, std::vector<std::pair<int32_t, std::vector<int32_t>>>> postings(
@@ -659,179 +619,6 @@ TEST_F(VariantTypedPathIndexMergeTest, SegmentCachesTopLevelRawBytesOfAWideVaria
 
     ASSERT_TRUE(segment->_create_column_meta_once(&stats, nullptr).ok());
     EXPECT_EQ(segment->_column_uid_to_raw_bytes, expected);
-}
-
-// A segment of a wide VARIANT reads its column meta region once when its column metas are
-// created. The readers of the VARIANT and of its subcolumns created after that read no column
-// meta from the file, and each subcolumn meta equals the one read from the file.
-TEST_F(VariantTypedPathIndexMergeTest, SegmentServesSubcolumnMetasFromItsMetaRegion) {
-    ASSERT_TRUE(create_tablet(options(130402)).ok());
-    std::vector<std::string> jsons;
-    for (int row = 0; row < 600; ++row) {
-        std::string json = R"({"msg":"user u)" + std::to_string(row % 50) +
-                           R"( logged in","host":"web-1.corp.example.com","code":"E1")";
-        for (int k = 0; k < 8; ++k) {
-            json += R"(,"wide_)" + std::to_string((row * 8 + k) % 400) + R"(":")" +
-                    std::to_string(row) + R"(")";
-        }
-        json += "}";
-        jsons.push_back(std::move(json));
-    }
-    IndexRowsetSpec spec;
-    spec.version = 0;
-    spec.max_rows_per_segment = 100000;
-    spec.batches.push_back(IndexBatch::single_variant(std::move(jsons), 0));
-    auto written = write_rowset(spec);
-    ASSERT_TRUE(written.has_value()) << written.error();
-    std::vector<segment_v2::SegmentSharedPtr> segments;
-    ASSERT_TRUE(
-            std::static_pointer_cast<BetaRowset>(written.value())->load_segments(&segments).ok());
-    ASSERT_EQ(segments.size(), 1);
-    auto& segment = segments[0];
-
-    OlapReaderStatistics stats;
-    std::shared_ptr<SegmentFooterPB> footer;
-    ASSERT_TRUE(segment->_get_segment_footer(footer, &stats, nullptr).ok());
-    ASSERT_EQ(footer->version(), segment_v2::SEGMENT_FOOTER_VERSION_V3_EXT_COL_META);
-    segment_v2::ExternalColMetaUtil::ExternalMetaPointers ptrs;
-    ASSERT_TRUE(segment_v2::ExternalColMetaUtil::parse_external_meta_pointers(*footer, &ptrs).ok());
-
-    auto recording = std::make_shared<RecordingFileReader>(segment->_file_reader);
-    segment->_file_reader = recording;
-    ASSERT_TRUE(segment->_create_column_meta_once(&stats, nullptr).ok());
-    auto region = segment->_column_meta_accessor->meta_region();
-    ASSERT_NE(region, nullptr);
-    EXPECT_EQ(recording->reads_in(ptrs.region_start, ptrs.region_end), 1);
-    // The region never counts toward the cache charge.
-    EXPECT_LT(segment->_column_meta_bytes.load(), region->charged_bytes);
-
-    int32_t variant_uid = -1;
-    for (const auto& column : segment->_tablet_schema->columns()) {
-        if (column->is_variant_type()) {
-            variant_uid = column->unique_id();
-        }
-    }
-    ASSERT_NE(variant_uid, -1);
-    std::shared_ptr<segment_v2::ColumnReader> variant_reader;
-    ASSERT_TRUE(
-            segment->_column_reader_cache->get_column_reader(variant_uid, &variant_reader, &stats)
-                    .ok());
-    for (const std::string path : {"msg", "host", "code", "wide_3", "wide_250", "wide_399"}) {
-        std::shared_ptr<segment_v2::ColumnReader> subcolumn_reader;
-        auto st = segment->_column_reader_cache->get_path_column_reader(
-                variant_uid, PathInData(path), &subcolumn_reader, &stats);
-        ASSERT_TRUE(st.ok()) << path << ": " << st;
-        ASSERT_NE(subcolumn_reader, nullptr) << path;
-    }
-    EXPECT_EQ(recording->reads_in(ptrs.region_start, ptrs.region_end), 1);
-
-    segment_v2::VariantExternalMetaReader from_region;
-    segment_v2::VariantExternalMetaReader from_file;
-    auto holder = std::make_shared<segment_v2::ColumnMetaRegionHolder>();
-    holder->set(region);
-    ASSERT_TRUE(
-            from_region.init_from_footer(footer, recording, variant_uid, &stats, nullptr, holder)
-                    .ok());
-    ASSERT_TRUE(from_file.init_from_footer(footer, recording, variant_uid, &stats, nullptr).ok());
-    ASSERT_TRUE(from_region.available());
-    std::vector<std::string> paths = {"msg", "host", "code"};
-    for (int k = 0; k < 400; k += 7) {
-        paths.push_back("wide_" + std::to_string(k));
-    }
-    for (const auto& path : paths) {
-        ColumnMetaPB expected;
-        ColumnMetaPB actual;
-        ASSERT_TRUE(from_file.lookup_meta_by_path(path, &expected, &stats).ok()) << path;
-        const size_t before = recording->reads_in(ptrs.region_start, ptrs.region_end);
-        ASSERT_TRUE(from_region.lookup_meta_by_path(path, &actual, &stats).ok()) << path;
-        EXPECT_EQ(recording->reads_in(ptrs.region_start, ptrs.region_end), before) << path;
-        EXPECT_EQ(actual.SerializeAsString(), expected.SerializeAsString()) << path;
-    }
-}
-
-// The segment lets its column meta region go after its first iterator; the readers it created
-// keep their metas, so opening the same paths again reads nothing, and the cache charge never
-// includes the region.
-TEST_F(VariantTypedPathIndexMergeTest, ReleasedMetaRegionKeepsReadersAndIsNotCharged) {
-    ASSERT_TRUE(create_tablet(options(130403)).ok());
-    std::vector<std::string> jsons;
-    for (int row = 0; row < 600; ++row) {
-        std::string json = R"({"msg":"user u)" + std::to_string(row % 50) +
-                           R"( logged in","host":"web-1.corp.example.com","code":"E1")";
-        for (int k = 0; k < 8; ++k) {
-            json += R"(,"wide_)" + std::to_string((row * 8 + k) % 400) + R"(":")" +
-                    std::to_string(row) + R"(")";
-        }
-        json += "}";
-        jsons.push_back(std::move(json));
-    }
-    IndexRowsetSpec spec;
-    spec.version = 0;
-    spec.max_rows_per_segment = 100000;
-    spec.batches.push_back(IndexBatch::single_variant(std::move(jsons), 0));
-    auto written = write_rowset(spec);
-    ASSERT_TRUE(written.has_value()) << written.error();
-    std::vector<segment_v2::SegmentSharedPtr> segments;
-    ASSERT_TRUE(
-            std::static_pointer_cast<BetaRowset>(written.value())->load_segments(&segments).ok());
-    ASSERT_EQ(segments.size(), 1);
-    auto& segment = segments[0];
-
-    OlapReaderStatistics stats;
-    std::shared_ptr<SegmentFooterPB> footer;
-    ASSERT_TRUE(segment->_get_segment_footer(footer, &stats, nullptr).ok());
-    segment_v2::ExternalColMetaUtil::ExternalMetaPointers ptrs;
-    ASSERT_TRUE(segment_v2::ExternalColMetaUtil::parse_external_meta_pointers(*footer, &ptrs).ok());
-
-    auto recording = std::make_shared<RecordingFileReader>(segment->_file_reader);
-    segment->_file_reader = recording;
-    const int64_t regions_before = exposed("segment_column_meta_regions");
-    ASSERT_TRUE(segment->_create_column_meta_once(&stats, nullptr).ok());
-    int64_t region_bytes = 0;
-    {
-        auto region = segment->_column_meta_accessor->meta_region();
-        ASSERT_NE(region, nullptr);
-        region_bytes = region->charged_bytes;
-    }
-    EXPECT_EQ(exposed("segment_column_meta_regions") - regions_before, 1);
-    // The charge leaves the region out.
-    EXPECT_LT(segment->_column_meta_bytes.load(), region_bytes);
-
-    int32_t variant_uid = -1;
-    for (const auto& column : segment->_tablet_schema->columns()) {
-        if (column->is_variant_type()) {
-            variant_uid = column->unique_id();
-        }
-    }
-    ASSERT_NE(variant_uid, -1);
-    const std::vector<std::string> paths = {"msg", "wide_3", "wide_250"};
-    auto open_paths = [&](const std::vector<std::string>& to_open) {
-        for (const auto& path : to_open) {
-            std::shared_ptr<segment_v2::ColumnReader> reader;
-            auto st = segment->_column_reader_cache->get_path_column_reader(
-                    variant_uid, PathInData(path), &reader, &stats);
-            ASSERT_TRUE(st.ok()) << path << ": " << st;
-            ASSERT_NE(reader, nullptr) << path;
-        }
-    };
-    open_paths(paths);
-    EXPECT_EQ(recording->reads_in(ptrs.region_start, ptrs.region_end), 1);
-
-    // What new_iterator does once the first iterator is set up.
-    segment->release_column_meta_region();
-    EXPECT_EQ(segment->_column_meta_accessor->meta_region(), nullptr);
-    EXPECT_EQ(exposed("segment_column_meta_regions"), regions_before);
-
-    // A second open of the cached segment: its column metas exist, and its readers too.
-    const size_t all_reads_before = recording->reads_in(0, UINT64_MAX);
-    ASSERT_TRUE(segment->_create_column_meta_once(&stats, nullptr).ok());
-    open_paths(paths);
-    EXPECT_EQ(recording->reads_in(0, UINT64_MAX), all_reads_before);
-
-    // A path no reader holds yet reads its meta from the file, as before the region existed.
-    const size_t region_reads_before = recording->reads_in(ptrs.region_start, ptrs.region_end);
-    open_paths({"wide_77"});
-    EXPECT_EQ(recording->reads_in(ptrs.region_start, ptrs.region_end) - region_reads_before, 1);
 }
 
 // VARIANT V2 inputs where an input segment lacks a typed path entirely, where a path is all

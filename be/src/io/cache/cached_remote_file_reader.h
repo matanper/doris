@@ -96,9 +96,6 @@ public:
 
     int64_t mtime() const override { return _remote_file_reader->mtime(); }
 
-    /// Whether downloaded cache blocks already cover the whole range; a read-only lookup.
-    bool is_range_in_local_cache(size_t offset, size_t size) override;
-
     // Asynchronously prefetch a range of file cache blocks.
     // This method triggers read file cache in dryrun mode to warm up the cache
     // without actually reading the data into user buffers.

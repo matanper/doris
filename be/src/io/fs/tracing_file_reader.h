@@ -49,10 +49,6 @@ public:
 
     int64_t mtime() const override { return _inner->mtime(); }
 
-    bool is_range_in_local_cache(size_t offset, size_t size) override {
-        return _inner->is_range_in_local_cache(offset, size);
-    }
-
     FileReaderStats* stats() const { return _stats; }
     doris::io::FileReaderSPtr inner_reader() { return _inner; }
 

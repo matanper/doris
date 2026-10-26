@@ -57,13 +57,12 @@ Status VariantExternalMetaReader::_find_key_meta(const SegmentFooterPB& footer, 
     return Status::OK();
 }
 
-Status VariantExternalMetaReader::init_from_footer(
-        std::shared_ptr<const SegmentFooterPB> footer, const io::FileReaderSPtr& file_reader,
-        int32_t root_uid, OlapReaderStatistics* stats, const io::IOContext* source_io_ctx,
-        std::shared_ptr<ColumnMetaRegionHolder> meta_region) {
+Status VariantExternalMetaReader::init_from_footer(std::shared_ptr<const SegmentFooterPB> footer,
+                                                   const io::FileReaderSPtr& file_reader,
+                                                   int32_t root_uid, OlapReaderStatistics* stats,
+                                                   const io::IOContext* source_io_ctx) {
     _footer = std::move(footer);
     _file_reader = file_reader;
-    _meta_region = std::move(meta_region);
 
     const MetadataPairPB* keys_meta_pair = nullptr;
     RETURN_IF_ERROR(_find_key_meta(*_footer, root_uid, &keys_meta_pair));
@@ -136,9 +135,8 @@ Status VariantExternalMetaReader::lookup_meta_by_path(const std::string& rel_pat
 
     // 3. Derive column id from root_col_id and key ordinal, then read ColumnMetaPB.
     auto col_id = _root_col_id + 1 + ordinal;
-    const auto region = _meta_region != nullptr ? _meta_region->get() : nullptr;
     return ExternalColMetaUtil::read_col_meta(_file_reader, *_footer, _meta_ptrs, col_id, out_meta,
-                                              stats, source_io_ctx, region.get());
+                                              stats, source_io_ctx);
 }
 
 Status VariantExternalMetaReader::load_all(SubcolumnColumnMetaInfo* out_meta_tree,
@@ -150,7 +148,6 @@ Status VariantExternalMetaReader::load_all(SubcolumnColumnMetaInfo* out_meta_tre
     RETURN_IF_ERROR(key_it.seek_to_ordinal(0));
     auto total = static_cast<size_t>(_key_reader->num_values());
     size_t built = 0;
-    const auto region = _meta_region != nullptr ? _meta_region->get() : nullptr;
 
     while (built < total) {
         size_t n = total - built;
@@ -166,9 +163,8 @@ Status VariantExternalMetaReader::load_all(SubcolumnColumnMetaInfo* out_meta_tre
             auto col_id = _root_col_id + 1 + ordinal;
 
             ColumnMetaPB meta;
-            RETURN_IF_ERROR(ExternalColMetaUtil::read_col_meta(_file_reader, *_footer, _meta_ptrs,
-                                                               col_id, &meta, stats, source_io_ctx,
-                                                               region.get()));
+            RETURN_IF_ERROR(ExternalColMetaUtil::read_col_meta(
+                    _file_reader, *_footer, _meta_ptrs, col_id, &meta, stats, source_io_ctx));
 
             if (!meta.has_column_path_info()) {
                 continue;

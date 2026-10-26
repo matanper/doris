@@ -20,9 +20,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <memory>
-#include <mutex>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -56,39 +53,6 @@ namespace doris::segment_v2 {
 //   └──────────────────────────────────────────────────────────────────────┘
 //
 
-// A segment's Column Meta Region read into memory, so that its metas are parsed without further
-// reads. offsets[i] is the offset of meta i in bytes and offsets[num_columns] the end of the last.
-struct ColumnMetaRegion {
-    ColumnMetaRegion() = default;
-    ~ColumnMetaRegion();
-    ColumnMetaRegion(const ColumnMetaRegion&) = delete;
-    ColumnMetaRegion& operator=(const ColumnMetaRegion&) = delete;
-
-    std::string bytes;
-    std::vector<uint64_t> offsets;
-    // Heap held by bytes and offsets, counted in the segment_column_meta_region_bytes bvar while
-    // the region lives.
-    int64_t charged_bytes = 0;
-};
-
-// A segment's column meta region while the segment keeps it, shared by its column meta accessor
-// and VARIANT readers. Once released, they read each meta from the file again.
-class ColumnMetaRegionHolder {
-public:
-    std::shared_ptr<const ColumnMetaRegion> get() const {
-        std::lock_guard lock(_mutex);
-        return _region;
-    }
-    void set(std::shared_ptr<const ColumnMetaRegion> region) {
-        std::lock_guard lock(_mutex);
-        _region = std::move(region);
-    }
-
-private:
-    mutable std::mutex _mutex;
-    std::shared_ptr<const ColumnMetaRegion> _region;
-};
-
 // Wrapper class to expose static methods for external column meta utilities.
 class ExternalColMetaUtil {
 public:
@@ -115,24 +79,11 @@ public:
     // Read one ColumnMetaPB from external Column Meta Region; use INDEX cache lane because
     // it's small metadata. Column offsets are derived from footer.column_meta_lengths via
     // prefix sums.
-    // With a region, the meta is parsed from it and nothing is read.
     static Status read_col_meta(const io::FileReaderSPtr& file_reader,
                                 const SegmentFooterPB& footer, const ExternalMetaPointers& p,
                                 uint32_t col_id, ColumnMetaPB* out_meta,
                                 OlapReaderStatistics* stats = nullptr,
-                                const io::IOContext* source_io_ctx = nullptr,
-                                const ColumnMetaRegion* region = nullptr);
-
-    // Read the whole Column Meta Region with one read and locate each meta in it.
-    static Status read_region(const io::FileReaderSPtr& file_reader, const SegmentFooterPB& footer,
-                              const ExternalMetaPointers& p,
-                              std::shared_ptr<const ColumnMetaRegion>* out,
-                              OlapReaderStatistics* stats = nullptr,
-                              const io::IOContext* source_io_ctx = nullptr);
-
-    // Parse meta col_id from a region read by read_region.
-    static Status parse_col_meta(const ColumnMetaRegion& region, uint32_t col_id,
-                                 ColumnMetaPB* out_meta);
+                                const io::IOContext* source_io_ctx = nullptr);
 
     // Write external ColumnMetaPB contiguous region + footer pointers + column_meta_entries.
     // write_cb: a callback that appends slices to the underlying file (e.g., SegmentWriter::_write_raw_data).

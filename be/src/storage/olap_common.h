@@ -459,8 +459,6 @@ struct OlapReaderStatistics {
     int64_t segment_iterator_init_segment_prefetchers_timer_ns = 0;
 
     int64_t segment_create_column_readers_timer_ns = 0;
-    // Reading a segment's whole column meta region; not part of segment_create_column_readers_timer_ns.
-    int64_t segment_column_meta_region_read_timer_ns = 0;
     int64_t segment_load_index_timer_ns = 0;
 
     int64_t adaptive_batch_size_predict_min_rows = INT64_MAX;

@@ -306,7 +306,6 @@ private:
     RuntimeProfile::Counter* _segment_iterator_init_segment_prefetchers_timer = nullptr;
 
     RuntimeProfile::Counter* _segment_create_column_readers_timer = nullptr;
-    RuntimeProfile::Counter* _segment_column_meta_region_read_timer = nullptr;
     RuntimeProfile::Counter* _segment_load_index_timer = nullptr;
 
     // total uncompressed bytes read when scanning sparse columns in variant
