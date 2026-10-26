@@ -1340,17 +1340,6 @@ DECLARE_Int32(blocking_pipeline_executor_size);
 // block file cache
 DECLARE_Bool(enable_file_cache);
 DECLARE_mBool(enable_file_cache_write_from_s3_file_writer);
-// After a file cache block file is written, wait for its writeback and drop its pages from the
-// page cache. Cached blocks are read through the cache's own reader, and keeping every written
-// block's pages makes dirty page cache pile up against the BE's memory limit, which turns reclaim
-// into waits on writeback for every allocating thread.
-DECLARE_mBool(file_cache_drop_page_cache_after_write);
-// With file_cache_drop_page_cache_after_write, a closed block file only starts its writeback; its
-// pages are dropped later, oldest first, once the bytes written back but not yet dropped exceed
-// this bound, and the writer that crosses it waits for those oldest files. This bounds the dirty
-// and cached pages of written blocks without a writeback wait on every block close. <= 0 waits
-// for each file's writeback on its close, as before.
-DECLARE_mInt64(file_cache_page_cache_drop_pending_bytes);
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}]
@@ -1377,13 +1366,6 @@ DECLARE_mInt32(file_cache_exit_need_evict_cache_in_advance_percent);
 DECLARE_mInt32(file_cache_evict_in_advance_interval_ms);
 DECLARE_mInt64(file_cache_evict_in_advance_batch_bytes);
 DECLARE_mInt64(file_cache_evict_in_advance_recycle_keys_num_threshold);
-// Max LRU entries one eviction scan examines while holding the cache lock. A scan that hits the
-// bound stops, and a reservation it was serving fails, so the block is not cached. <= 0 means
-// unbounded.
-DECLARE_mInt64(file_cache_evict_max_scan_entries);
-// Move LRU entries an eviction scan skips because they are in use to the end of their queue, so
-// later scans do not examine them again before they are evictable.
-DECLARE_mBool(enable_file_cache_evict_rotate_in_use);
 DECLARE_mBool(enable_read_cache_file_directly);
 DECLARE_Bool(file_cache_enable_evict_from_other_queue_by_size);
 // If true, evict the ttl cache using LRU when full.
@@ -1413,9 +1395,6 @@ DECLARE_mInt32(file_cache_leak_scan_pause_ms);
 DECLARE_mInt64(file_cache_leak_grace_seconds);
 DECLARE_mInt64(file_cache_remove_block_qps_limit);
 DECLARE_mInt64(file_cache_background_gc_interval_ms);
-// Run the storage removal of blocks evicted while holding the file cache lock after that lock
-// is released, instead of inline under it.
-DECLARE_mBool(enable_file_cache_async_evict_io);
 DECLARE_mInt64(file_cache_background_block_lru_update_interval_ms);
 DECLARE_mInt64(file_cache_background_block_lru_update_qps_limit);
 DECLARE_mInt64(file_cache_background_block_lru_update_queue_max_size);
@@ -2001,15 +1980,6 @@ DECLARE_mInt64(file_cache_writer_thread_num);
 // Max queued part copies of S3FileCacheWriterThreadPool. Each holds one s3_write_buffer_size
 // buffer until it is copied.
 DECLARE_Int64(file_cache_writer_queue_size);
-// Threads and queue of S3FileCacheWriterLoadThreadPool, which copies the parts of load writers
-// into the file cache, so they never wait behind compaction copies. The pool exists only when
-// the thread num is positive at startup; a later change of it applies at the next copy. The
-// queue size is read at startup.
-DECLARE_mInt64(file_cache_writer_load_thread_num);
-DECLARE_Int64(file_cache_writer_load_queue_size);
-// Bytes of non-load parts queued for or in a file cache copy at which a further part is not
-// copied: it is already in S3, so only its cache warm-up is lost. <= 0 means no bound.
-DECLARE_mInt64(file_cache_writer_backlog_bytes);
 
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);

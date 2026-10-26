@@ -28,12 +28,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -61,26 +59,10 @@ public:
     size_t file_reader_cache_size();
 
 private:
-    // Lookups take only their key's shard lock, so cache reads do not wait on inserts and
-    // removals of other keys. The insertion order used for eviction is global and guarded by
-    // _order_mtx, which is always taken before any shard lock.
-    static constexpr size_t kShardCount = 64;
-    using OrderList = std::list<AccessKeyAndOffset>;
-    struct Entry {
-        std::shared_ptr<FileReader> reader;
-        OrderList::iterator order_it;
-    };
-    struct Shard {
-        mutable std::shared_mutex mtx;
-        std::unordered_map<AccessKeyAndOffset, Entry, KeyAndOffsetHash> readers;
-    };
-
-    Shard& _shard_of(const AccessKeyAndOffset& key);
-
-    std::array<Shard, kShardCount> _shards;
-    std::mutex _order_mtx;
-    // Newest first.
-    OrderList _order;
+    std::list<std::pair<AccessKeyAndOffset, std::shared_ptr<FileReader>>> _file_reader_list;
+    std::unordered_map<AccessKeyAndOffset, decltype(_file_reader_list.begin()), KeyAndOffsetHash>
+            _file_name_to_reader;
+    mutable std::shared_mutex _mtx;
 };
 
 class FSFileCacheStorage : public FileCacheStorage {

@@ -18,7 +18,6 @@
 #include "io/fs/local_file_writer.h"
 
 #include <butil/iobuf.h>
-#include <bvar/bvar.h>
 
 // IWYU pragma: no_include <bthread/errno.h>
 #include <errno.h> // IWYU pragma: keep
@@ -28,17 +27,12 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <vector>
-#include <mutex>
-#include <deque>
-#include <atomic>
 #include <cstring>
 #include <ostream>
 #include <utility>
 
 // IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/cast_set.h"
-#include "common/config.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/macros.h"
 #include "common/metrics/doris_metrics.h"
@@ -50,89 +44,9 @@
 #include "io/fs/path.h"
 #include "storage/data_dir.h"
 #include "util/debug_points.h"
-#include "util/stopwatch.hpp"
 
 namespace doris::io {
 #include "common/compile_check_begin.h"
-
-bvar::Adder<uint64_t> g_local_file_writer_page_cache_dropped_bytes(
-        "local_file_writer_page_cache_dropped_bytes");
-bvar::Adder<uint64_t> g_local_file_writer_page_cache_drop_failed(
-        "local_file_writer_page_cache_drop_failed");
-bvar::LatencyRecorder g_local_file_writer_page_cache_drop_wait_us(
-        "local_file_writer_page_cache_drop_wait_us");
-namespace {
-
-#if defined(__linux__)
-// Closed files whose writeback was started but whose pages were not dropped yet, oldest first.
-// Each keeps a duplicate descriptor, so a rename or an unlink after close does not lose it.
-class PendingPageCacheDrops {
-public:
-    static PendingPageCacheDrops& instance() {
-        static PendingPageCacheDrops drops;
-        return drops;
-    }
-
-    // Takes ownership of fd. Drops the oldest files, waiting for their writeback, while the
-    // pending bytes exceed limit.
-    void add(int fd, int64_t bytes, int64_t limit) {
-        std::vector<Entry> due;
-        {
-            std::lock_guard lock(_mutex);
-            _entries.push_back({.fd = fd, .bytes = bytes});
-            _bytes += bytes;
-            while (!_entries.empty() && _bytes > limit) {
-                due.push_back(_entries.front());
-                _bytes -= _entries.front().bytes;
-                _entries.pop_front();
-            }
-            _pending_bytes.store(_bytes, std::memory_order_relaxed);
-        }
-        for (const Entry& entry : due) {
-            drop(entry.fd, entry.bytes);
-            ::close(entry.fd);
-        }
-    }
-
-    int64_t pending_bytes() const { return _pending_bytes.load(std::memory_order_relaxed); }
-
-    // POSIX_FADV_DONTNEED drops only clean pages, so wait for this file's writeback first.
-    // sync_file_range writes the data without the journal commit fdatasync would wait for.
-    static void drop(int fd, int64_t bytes) {
-        MonotonicStopWatch watch;
-        watch.start();
-        if (sync_file_range(fd, 0, 0,
-                            SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
-                                    SYNC_FILE_RANGE_WAIT_AFTER) != 0 ||
-            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) {
-            g_local_file_writer_page_cache_drop_failed << 1;
-            return;
-        }
-        g_local_file_writer_page_cache_drop_wait_us << watch.elapsed_time() / 1000;
-        g_local_file_writer_page_cache_dropped_bytes << static_cast<uint64_t>(bytes);
-    }
-
-private:
-    struct Entry {
-        int fd;
-        int64_t bytes;
-    };
-
-    std::mutex _mutex;
-    std::deque<Entry> _entries;
-    int64_t _bytes = 0;
-    std::atomic<int64_t> _pending_bytes {0};
-};
-
-#endif
-} // namespace
-
-#if defined(__linux__)
-bvar::PassiveStatus<int64_t> g_local_file_writer_page_cache_drop_pending_bytes(
-        "local_file_writer_page_cache_drop_pending_bytes",
-        [](void*) { return PendingPageCacheDrops::instance().pending_bytes(); }, nullptr);
-#endif
-
 namespace {
 
 Status sync_dir(const io::Path& dirname) {
@@ -157,11 +71,8 @@ Status sync_dir(const io::Path& dirname) {
 
 } // namespace
 
-LocalFileWriter::LocalFileWriter(Path path, int fd, bool sync_data, bool drop_page_cache)
-        : _path(std::move(path)),
-          _fd(fd),
-          _sync_data(sync_data),
-          _drop_page_cache_on_close(drop_page_cache) {
+LocalFileWriter::LocalFileWriter(Path path, int fd, bool sync_data)
+        : _path(std::move(path)), _fd(fd), _sync_data(sync_data) {
     DorisMetrics::instance()->local_file_open_writing->increment(1);
     DorisMetrics::instance()->local_file_writer_total->increment(1);
 }
@@ -339,32 +250,6 @@ Status LocalFileWriter::_finalize() {
     return Status::OK();
 }
 
-// Best effort: a failure leaves the pages to normal reclaim and is only counted.
-void LocalFileWriter::_drop_page_cache() {
-#if defined(__linux__)
-    if (_bytes_appended == 0) {
-        return;
-    }
-    const auto bytes = static_cast<int64_t>(_bytes_appended);
-    const int64_t limit = config::file_cache_page_cache_drop_pending_bytes;
-    if (limit <= 0) {
-        PendingPageCacheDrops::drop(_fd, bytes);
-        return;
-    }
-    // Start this file's writeback without waiting for it; it is dropped later with the oldest.
-    if (sync_file_range(_fd, 0, 0, SYNC_FILE_RANGE_WRITE) != 0) {
-        g_local_file_writer_page_cache_drop_failed << 1;
-        return;
-    }
-    const int pending_fd = ::dup(_fd);
-    if (pending_fd < 0) {
-        PendingPageCacheDrops::drop(_fd, bytes);
-        return;
-    }
-    PendingPageCacheDrops::instance().add(pending_fd, bytes, limit);
-#endif
-}
-
 Status LocalFileWriter::_close(bool sync) {
     auto fd_reclaim_func = [&](Status st) {
         if (_fd > 0 && 0 != ::close(_fd)) {
@@ -390,10 +275,6 @@ Status LocalFileWriter::_close(bool sync) {
             _dirty = false;
         }
         RETURN_IF_ERROR(fd_reclaim_func(sync_dir(_path.parent_path())));
-    }
-
-    if (_drop_page_cache_on_close && _fd > 0) {
-        _drop_page_cache();
     }
 
     DBUG_EXECUTE_IF("LocalFileWriter.close.failed", {

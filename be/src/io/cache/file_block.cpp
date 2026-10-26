@@ -140,7 +140,6 @@ Status FileBlock::set_downloaded(std::lock_guard<std::mutex>& block_lock) {
         return Status::InternalError("Try to set empty block {} as downloaded",
                                      _block_range.to_string());
     }
-    _mgr->drain_pending_storage_remove(_key.hash, _key.offset);
     Status status = _mgr->_storage->finalize(_key, this->_block_range.size());
     if (status.ok()) [[likely]] {
         _download_state = State::DOWNLOADED;
@@ -180,9 +179,6 @@ Status FileBlock::appendv(const Slice* data, size_t data_cnt) {
         appended_size += data[idx].size;
     }
     DCHECK(appended_size != 0) << "Writing zero size is not allowed";
-    if (_downloaded_size == 0) {
-        _mgr->drain_pending_storage_remove(_key.hash, _key.offset);
-    }
     auto st = _mgr->_storage->appendv(_key, data, data_cnt);
     if (!st.ok()) {
         auto abort_st = abort_pending_cache_write(_mgr->_storage.get(), _key);
@@ -198,9 +194,6 @@ Status FileBlock::appendv(const Slice* data, size_t data_cnt) {
 Status FileBlock::append_iobuf(const butil::IOBuf& data) {
     const size_t appended_size = data.length();
     DCHECK(appended_size != 0) << "Writing zero size is not allowed";
-    if (_downloaded_size == 0) {
-        _mgr->drain_pending_storage_remove(_key.hash, _key.offset);
-    }
     auto st = _mgr->_storage->append_iobuf(_key, data);
     if (!st.ok()) {
         auto abort_st = abort_pending_cache_write(_mgr->_storage.get(), _key);

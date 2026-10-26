@@ -84,7 +84,6 @@
 namespace doris::io {
 extern bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread;
 extern bvar::Adder<uint64_t> s3_file_cache_write_dropped;
-extern bvar::Adder<uint64_t> s3_file_cache_write_dropped_over_backlog;
 extern bvar::Adder<int64_t> s3_file_buffer_allocated_bytes;
 extern bvar::Adder<uint64_t> s3_file_buffer_grow_count;
 extern bvar::Adder<uint64_t> s3_file_buffer_grow_copied_bytes;
@@ -502,7 +501,7 @@ struct CacheWriterPoolFixture {
     }
 
     // Submits one buffer and waits until its upload reports completion.
-    void upload_one(bool load = false) {
+    void upload_one() {
         std::promise<void> completed;
         auto completed_future = completed.get_future();
         FileBufferBuilder builder;
@@ -518,8 +517,7 @@ struct CacheWriterPoolFixture {
                     cache_copied = true;
                     return std::make_unique<FileBlocksHolder>(FileBlocks {});
                 })
-                .set_upload_thread_pool(_upload_pool.get())
-                .set_count_as_load_upload(load);
+                .set_upload_thread_pool(_upload_pool.get());
         std::shared_ptr<FileBuffer> buf;
         ASSERT_TRUE(builder.build(&buf).ok());
         std::string data = "part data";
@@ -544,41 +542,6 @@ private:
     bool _released = false;
 };
 } // namespace
-
-TEST_F(S3FileWriterTest, LoadCacheCopiesDoNotQueueBehindCompactionCopies) {
-    CacheWriterPoolFixture fixture(/*max_queue_size=*/8);
-    std::unique_ptr<ThreadPool> load_pool;
-    ASSERT_TRUE(ThreadPoolBuilder("TestLoadCacheWriterPool")
-                        .set_min_threads(1)
-                        .set_max_threads(1)
-                        .build(&load_pool)
-                        .ok());
-    ExecEnv::GetInstance()->set_s3_file_cache_writer_load_thread_pool(std::move(load_pool));
-    Defer reset_load_pool {[] {
-        ExecEnv::GetInstance()->set_s3_file_cache_writer_load_thread_pool(nullptr);
-    }};
-
-    // The shared cache writer pool stays blocked; a load part is still copied, by its own pool.
-    fixture.upload_one(/*load=*/true);
-    EXPECT_TRUE(fixture.uploaded);
-    ExecEnv::GetInstance()->s3_file_cache_writer_load_thread_pool()->wait();
-    EXPECT_TRUE(fixture.cache_copied);
-}
-
-TEST_F(S3FileWriterTest, NonLoadCacheCopyOverBacklogIsSkipped) {
-    const int64_t saved = config::file_cache_writer_backlog_bytes;
-    config::file_cache_writer_backlog_bytes = 1;
-    Defer restore {[&] { config::file_cache_writer_backlog_bytes = saved; }};
-    CacheWriterPoolFixture fixture(/*max_queue_size=*/8);
-    const auto skipped_before = s3_file_cache_write_dropped_over_backlog.get_value();
-
-    fixture.upload_one();
-    EXPECT_TRUE(fixture.uploaded);
-    EXPECT_EQ(s3_file_cache_write_dropped_over_backlog.get_value(), skipped_before + 1);
-    fixture.release();
-    ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool()->wait();
-    EXPECT_FALSE(fixture.cache_copied);
-}
 
 TEST_F(S3FileWriterTest, FileCacheCopyRunsOffTheUploadThread) {
     CacheWriterPoolFixture fixture(/*max_queue_size=*/8);

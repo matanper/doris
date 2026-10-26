@@ -1296,8 +1296,6 @@ DEFINE_Bool(enable_file_cache, "false");
 // Disable this for tests that need load and compaction output to bypass file cache while keeping
 // query-side file cache writes enabled.
 DEFINE_mBool(enable_file_cache_write_from_s3_file_writer, "true");
-DEFINE_mBool(file_cache_drop_page_cache_after_write, "true");
-DEFINE_mInt64(file_cache_page_cache_drop_pending_bytes, "268435456");
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: {"path": "/path/to/file_cache", "total_size":53687091200, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}
@@ -1326,8 +1324,6 @@ DEFINE_mInt32(file_cache_exit_need_evict_cache_in_advance_percent, "85");
 DEFINE_mInt32(file_cache_evict_in_advance_interval_ms, "1000");
 DEFINE_mInt64(file_cache_evict_in_advance_batch_bytes, "31457280"); // 30MB
 DEFINE_mInt64(file_cache_evict_in_advance_recycle_keys_num_threshold, "1000");
-DEFINE_mInt64(file_cache_evict_max_scan_entries, "4096");
-DEFINE_mBool(enable_file_cache_evict_rotate_in_use, "true");
 
 DEFINE_mBool(enable_read_cache_file_directly, "true");
 DEFINE_mBool(file_cache_enable_evict_from_other_queue_by_size, "true");
@@ -1361,7 +1357,6 @@ DEFINE_mInt64(file_cache_leak_grace_seconds, "3600");
 
 DEFINE_mInt64(file_cache_remove_block_qps_limit, "1000");
 DEFINE_mInt64(file_cache_background_gc_interval_ms, "100");
-DEFINE_mBool(enable_file_cache_async_evict_io, "true");
 DEFINE_mInt64(file_cache_background_block_lru_update_interval_ms, "5000");
 DEFINE_mInt64(file_cache_background_block_lru_update_qps_limit, "1000");
 DEFINE_mInt64(file_cache_background_block_lru_update_queue_max_size, "500000");
@@ -1831,9 +1826,6 @@ DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
 DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
 DEFINE_mInt64(file_cache_writer_thread_num, "32");
 DEFINE_Int64(file_cache_writer_queue_size, "256");
-DEFINE_mInt64(file_cache_writer_load_thread_num, "8");
-DEFINE_Int64(file_cache_writer_load_queue_size, "256");
-DEFINE_mInt64(file_cache_writer_backlog_bytes, "2147483648");
 
 // The min thread num for NonBlockCloseThreadPool
 DEFINE_Int64(min_nonblock_close_thread_num, "12");

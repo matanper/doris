@@ -203,13 +203,10 @@ struct FileBuffer {
     // Counts this buffer's allocation, now and as it grows, in load_upload_buffer_bytes()
     // until it is destroyed. Call before the buffer is shared.
     void count_as_load_upload();
-    // True when count_as_load_upload() was called, i.e. the buffer belongs to a load writer.
-    bool is_load_upload() const { return _is_load_upload; }
 
     // Declared first so it is destroyed last, after ~FileBuffer frees _inner_data.
     UploadBufferInflightLimiter::Permit _inflight_permit;
     BufferType _type;
-    bool _is_load_upload = false;
     std::function<FileBlocksHolderPtr()> _alloc_holder;
     size_t _offset;
     size_t _size;

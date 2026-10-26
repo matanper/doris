@@ -214,7 +214,6 @@ private:
 
 void FileBuffer::count_as_load_upload() {
     DCHECK(_type == BufferType::UPLOAD);
-    _is_load_upload = true;
     _inner_data->count_in(&g_load_upload_buffer_bytes);
 }
 
@@ -305,94 +304,26 @@ Status UploadFileBuffer::append_data(const Slice& data) {
     return Status::OK();
 }
 
-// Bytes of non-load parts queued for or in a file cache copy.
-std::atomic<int64_t> g_file_cache_copy_backlog_bytes {0};
-bvar::PassiveStatus<int64_t> s3_file_cache_write_backlog_bytes(
-        "s3_file_cache_write_backlog_bytes",
-        [](void*) { return g_file_cache_copy_backlog_bytes.load(std::memory_order_relaxed); },
-        nullptr);
-bvar::Adder<uint64_t> s3_file_cache_write_dropped_over_backlog(
-        "s3_file_cache_write_dropped_over_backlog");
-bvar::Adder<uint64_t> s3_file_cache_write_load_queue(
-        "s3_file_cache_write_off_upload_thread_load");
-
 // The part is already in S3, so a copy that cannot be queued is skipped rather than waited for.
-// Load parts go to their own pool, so they never queue behind compaction copies; other parts are
-// skipped once their backlog reaches file_cache_writer_backlog_bytes, so a compaction burst
-// cannot hold buffer memory waiting for the cache disk.
-// Resizes `pool` to `wanted` threads when the config changed at runtime. `seen` holds the
-// config value last applied, starting from the first one observed, which the pool was built with.
-static void follow_thread_num_config(ThreadPool* pool, int64_t wanted, std::atomic<int64_t>* seen) {
-    int64_t last = seen->load(std::memory_order_relaxed);
-    if (last == wanted) {
-        return;
-    }
-    if (last < 0) {
-        seen->compare_exchange_strong(last, wanted);
-        return;
-    }
-    if (wanted <= 0 || !seen->compare_exchange_strong(last, wanted)) {
-        return;
-    }
-    const int threads = static_cast<int>(wanted);
-    if (pool->min_threads() > threads) {
-        static_cast<void>(pool->set_min_threads(threads));
-    }
-    if (!pool->set_max_threads(threads).ok()) {
-        LOG(WARNING) << "failed to resize the file cache writer pool to " << threads;
-    }
-}
-
 static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
     // From here the buffer only waits for the cache copy, which the upload bounds do not
     // cover.
     buffer->set_inflight_permit({});
-    auto* env = ExecEnv::GetInstance();
-    const bool load = buffer->is_load_upload() && env->s3_file_cache_writer_load_thread_pool();
-    auto* pool = load ? env->s3_file_cache_writer_load_thread_pool()
-                      : env->s3_file_cache_writer_thread_pool();
+    auto* pool = ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool();
     if (pool == nullptr) {
         s3_file_cache_write_dropped << 1;
         return;
     }
-    static std::atomic<int64_t> load_threads_seen {-1};
-    static std::atomic<int64_t> threads_seen {-1};
-    if (load) {
-        follow_thread_num_config(pool, config::file_cache_writer_load_thread_num,
-                                 &load_threads_seen);
-    } else {
-        follow_thread_num_config(pool, config::file_cache_writer_thread_num, &threads_seen);
-    }
-    const auto bytes = static_cast<int64_t>(buffer->get_size());
-    if (!load) {
-        const int64_t limit = config::file_cache_writer_backlog_bytes;
-        const int64_t backlog =
-                g_file_cache_copy_backlog_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        if (limit > 0 && backlog + bytes > limit) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-            s3_file_cache_write_dropped_over_backlog << 1;
-            return;
-        }
-    }
     s3_file_cache_write_queued << 1;
-    auto st = pool->submit_func([buf = std::move(buffer), load, bytes]() {
+    auto st = pool->submit_func([buf = std::move(buffer)]() {
         s3_file_cache_write_queued << -1;
         static_cast<UploadFileBuffer*>(buf.get())->upload_to_local_file_cache(false);
-        if (!load) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        }
     });
     if (st.ok()) {
         s3_file_cache_write_off_upload_thread << 1;
-        if (load) {
-            s3_file_cache_write_load_queue << 1;
-        }
     } else {
         s3_file_cache_write_queued << -1;
         s3_file_cache_write_dropped << 1;
-        if (!load) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        }
     }
 }
 
