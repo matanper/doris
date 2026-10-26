@@ -36,6 +36,7 @@
 #include "runtime/memory/cache_policy.h"
 #include "storage/segment/segment_loader.h"
 #include "util/debug_points.h"
+#include "util/defer_op.h"
 #include "util/lru_cache.h"
 #include "util/stack_util.h"
 #include "util/time.h"
@@ -708,6 +709,14 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     const char* max_score_tablet_outcome = nullptr;
 
     auto weak_tablets = get_weak_tablets();
+    // Tablets the meta service reported dropped leave the tablet cache: nothing reads or
+    // compacts them any more.
+    std::vector<int64_t> dropped_tablets;
+    Defer release_dropped {[&]() {
+        for (int64_t tablet_id : dropped_tablets) {
+            erase_tablet(tablet_id);
+        }
+    }};
     std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> buf;
     buf.reserve(n + 1);
     std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> skipped_buf;
@@ -717,7 +726,15 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
         if (t == nullptr) { continue; }
         // A dropped tablet stays reachable here while anything still holds it, and its score
         // stays as high as the backlog it was dropped with.
-        if (t->is_dropped()) { continue; }
+        if (t->is_dropped()) {
+            dropped_tablets.push_back(t->tablet_id());
+            continue;
+        }
+        // The BE that owns it compacts it; compacting it here would also keep it cached.
+        if (config::enable_foreign_tablet_eviction && is_foreign_tablet(t->tablet_id())) {
+            g_foreign_tablets_skipped_for_compaction << 1;
+            continue;
+        }
 
         int64_t s = score(t.get());
         if (s <= 0) { continue; }

@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+
 #include "core/block/block.h"
 #include "storage/segment/common.h"
 #include "storage/segment/segment.h"
@@ -28,10 +31,18 @@ using BetaRowsetSharedPtr = std::shared_ptr<BetaRowset>;
 }; // namespace doris
 namespace doris::segment_v2 {
 
+// Segments a rowset reader keeps open across the segment iterators it creates. A segment the
+// segment cache evicts stays open here, so the next iterator does not open it again.
+struct PinnedSegments {
+    std::mutex mutex;
+    std::unordered_map<int64_t, SegmentSharedPtr> segments;
+};
+
 class LazyInitSegmentIterator : public RowwiseIterator {
 public:
     LazyInitSegmentIterator(BetaRowsetSharedPtr rowset, int64_t segment_id, bool should_use_cache,
-                            SchemaSPtr schema, const StorageReadOptions& opts);
+                            SchemaSPtr schema, const StorageReadOptions& opts,
+                            std::shared_ptr<PinnedSegments> pinned_segments = nullptr);
 
     ~LazyInitSegmentIterator() override = default;
 
@@ -66,5 +77,6 @@ private:
     SchemaSPtr _schema = nullptr;
     StorageReadOptions _read_options;
     RowwiseIteratorUPtr _inner_iterator;
+    std::shared_ptr<PinnedSegments> _pinned_segments;
 };
 } // namespace doris::segment_v2

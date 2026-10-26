@@ -17,6 +17,8 @@
 
 #include "storage/index/inverted/inverted_index_compaction.h"
 
+#include <cstring>
+
 #include "io/fs/local_file_system.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/inverted/inverted_index_common.h"
@@ -75,8 +77,9 @@ Status compact_column(
                   "debug point: compact_column_index_writer_close_error in index compaction");
     })
 
-    // delete temporary segment_path, only when inverted_index_ram_dir_enable is false
-    if (!config::inverted_index_ram_dir_enable) {
+    // A RAM directory has files on disk only after it moved some there.
+    if (std::strcmp(dir->getObjectName(), DorisRAMFSDirectory::getClassName()) != 0 ||
+        static_cast<DorisRAMFSDirectory*>(dir.get())->spilled()) {
         auto st = io::global_local_filesystem()->delete_directory(tmp_path.data());
         DBUG_EXECUTE_IF("compact_column_delete_tmp_path_error", {
             st = Status::Error<ErrorCode::INVERTED_INDEX_COMPACTION_ERROR>(
