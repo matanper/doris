@@ -849,6 +849,11 @@ DECLARE_mBool(enable_adaptive_write_buffer_size);
 DECLARE_mInt64(write_buffer_size_for_agg);
 
 DECLARE_mInt64(min_write_buffer_size_for_partial_update);
+// When true, a memtable flush that copies its rows into sorted order releases each input column as
+// soon as its sorted copy is built, and moves the columns without copying when the rows are already
+// in sorted order. The flush then holds one copy of the memtable plus one column instead of two
+// copies. Read when a memtable is flushed.
+DECLARE_mBool(memtable_flush_release_input_columns);
 // max parallel flush task per memtable writer
 DECLARE_mInt32(memtable_flush_running_count_limit);
 // Let each memtable writer run at least (flush pool threads / live writers) flushes at once, so
@@ -1641,6 +1646,15 @@ DECLARE_mInt32(variant_max_json_key_length);
 DECLARE_mBool(variant_throw_exeception_on_invalid_json);
 // Enable duplicate path check when parsing json into variant subcolumns/jsonb.
 DECLARE_mBool(variant_enable_duplicate_json_path_check);
+// Variant V2 segment writer: descend nested objects without re-decoding their headers and append
+// stable scalar leaves straight into the typed path column. The output is identical either way;
+// false selects the general per-value path, kept for A/B measurement and as a fallback.
+DECLARE_mBool(variant_v2_shredder_fast_path);
+// Variant V2 JSON encoder (Stream Load, Arrow, CAST): skip the second UTF-8 scan of strings the
+// JSON parser already validated, and seed object key hints from the same path in the previous row
+// instead of the same pre-order ordinal. The encoded bytes are identical either way; false selects
+// the general path, kept for A/B measurement and as a fallback. Read when an encoder is created.
+DECLARE_mBool(variant_v2_json_encoder_fast_path);
 // Controls storage-layer parse target for plain non-doc VARIANT columns:
 // 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
 DECLARE_mInt32(variant_storage_parse_mode);
@@ -1654,6 +1668,21 @@ DECLARE_mInt32(variant_nested_group_max_depth);
 // data at the same path. This simplifies compaction by always prioritizing
 // nested structure over scalar. When false, report an error on conflict.
 DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
+// When false, blocks received from another BE on the load channel (tablet_writer_add_block)
+// skip the recursive VARIANT V2 payload walk in deserialization; the sender already validated
+// every payload when it built the column, and structural checks still run. Set to true to
+// re-validate every payload on receipt.
+DECLARE_mBool(variant_v2_validate_internal_block);
+// Diagnostic: before a VARIANT subtree is rebuilt as Variant V2, check that every stored sparse
+// path and materialized subcolumn path read for it is valid UTF-8, and log the ones that are not
+// with their segment file, row and bytes.
+DECLARE_mBool(variant_v2_check_read_paths);
+// When true, the encoded buffers of a Variant V2 column are allocated exactly when an empty column
+// is filled (one Arrow batch, a tablet sink batch, a memtable flush copy), and grow by a quarter
+// instead of to the next power of two once they exceed 1 MB. A memtable accumulating a load then
+// holds about 1.1x its encoded bytes instead of up to 2x. The encoded bytes are identical either
+// way. Read on every reservation.
+DECLARE_mBool(variant_v2_bounded_column_growth);
 
 DECLARE_mBool(enable_merge_on_write_correctness_check);
 // USED FOR DEBUGING
