@@ -1002,6 +1002,12 @@ DECLARE_mBool(brpc_usercode_in_pthread);
 // is greater than 1.8G. This is to avoid the error of Request length overflow (2G).
 DECLARE_mBool(transfer_large_data_by_brpc);
 
+// Whether a tablet sink hands add-block batches for a tablet channel on this same BE directly
+// to the local LoadChannelMgr instead of serializing them into a brpc call to itself. Open,
+// cancel and eos still go through brpc. Read once per node channel when the channel is
+// initialized, so a change applies to loads started afterwards.
+DECLARE_mBool(enable_local_tablet_writer_shortcut);
+
 // max number of txns for every txn_partition_map in txn manager
 // this is a self protection to avoid too many txns saving in manager
 DECLARE_mInt64(max_runnings_transactions_per_txn_map);
@@ -1127,6 +1133,20 @@ DECLARE_mInt32(max_segment_num_per_rowset);
 // Store segment without compression if a segment is smaller than
 // segment_compression_threshold_kb.
 DECLARE_mInt32(segment_compression_threshold_kb);
+
+// Page codec for segments written by loads (memtable flush). Empty keeps the table's codec.
+// Load segments are rewritten by cumulative compaction soon after they land, so a cheaper codec
+// here saves flush CPU while compaction output keeps the table's codec. Readers take the codec
+// from each column's meta, so a tablet may mix codecs across rowsets. One of NO_COMPRESSION,
+// SNAPPY, LZ4, LZ4F, LZ4HC, ZLIB, ZSTD (case-insensitive).
+DECLARE_mString(load_segment_compression_type);
+
+// ZSTD level of ZSTD block compression (segment pages and every other ZSTD block codec user).
+DECLARE_mInt32(zstd_compression_level);
+
+// ZSTD level of the pages of load segments that are compressed with ZSTD. 0 uses
+// zstd_compression_level.
+DECLARE_mInt32(load_segment_zstd_compression_level);
 
 // Time to clean up useless JDBC connection pool cache
 DECLARE_mInt32(jdbc_connection_pool_cache_clear_time_sec);

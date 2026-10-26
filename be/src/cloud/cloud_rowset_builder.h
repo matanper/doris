@@ -41,6 +41,22 @@ public:
 
     void set_skip_writing_rowset_metadata(bool skip) { _skip_writing_rowset_metadata = skip; }
 
+    // Whether a load's empty commit, which leaves no rowset in the meta-service, also adds none
+    // to `tablet`: true when its version holes are filled with hole rowset version ranges or
+    // implicit gaps rather than one hole rowset per version. Such a commit must not count toward
+    // the tablet's version limit.
+    static bool empty_commit_adds_no_rowset(const CloudTablet& tablet);
+
+    // Adds a load's rowset to the tablet's approximate stats. `rowset` is nullptr for an empty
+    // rowset committed without a rowset writer, which counts as one rowset with no segments.
+    static void add_rowset_to_tablet_stats(CloudTablet* tablet, const Rowset* rowset);
+
+    // Records on this BE that the txn committed an empty rowset to `tablet` without writing its
+    // metadata to the meta service, so that the delete bitmap calculation (MoW) and the make
+    // visible path can tell the version apart from a missing rowset.
+    static void mark_empty_rowset(CloudStorageEngine& engine, const BaseTablet& tablet,
+                                  int64_t txn_id, int64_t txn_expiration);
+
 private:
     // Convert `_tablet` from `BaseTablet` to `CloudTablet`
     CloudTablet* cloud_tablet();
