@@ -209,15 +209,6 @@ public class DynamicPartitionScheduler extends MasterDaemon {
         }
     }
 
-    /**
-     * Bucket number for a partition whose size is estimated from the data sizes of other
-     * partitions, given in range order.
-     */
-    public static int estimateBucketsNum(List<Long> partitionsSize) {
-        long uncompressedPartitionSize = getNextPartitionSize(partitionsSize) * 5;
-        return AutoBucketUtils.getBucketsNum(uncompressedPartitionSize, Config.autobucket_min_buckets);
-    }
-
     private static Pair<Integer, Integer> getBucketsNum(DynamicPartitionProperty property, OlapTable table,
             String partitionName, String nowPartitionName, boolean executeFirstTime) {
         AutoBucketCalculator.AutoBucketContext context = new AutoBucketCalculator.AutoBucketContext(

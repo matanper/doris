@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <memory>
 #include <span>
-#include <string>
 
 #include "core/pod_array.h"
 #include "core/string_ref.h"
@@ -33,28 +32,6 @@
 namespace doris {
 
 class VariantCollectionCore;
-
-// While alive on a thread, Variant values rebuilt from persisted storage replace each invalid UTF-8
-// subsequence of a metadata key or string with U+FFFD instead of failing the read, so one stored
-// value with invalid bytes cannot fail every query that reads it. Every repair is logged with the
-// original bytes. Without a scope (loads, casts, SQL functions) invalid UTF-8 is still rejected.
-class VariantRepairInvalidUtf8Scope {
-public:
-    VariantRepairInvalidUtf8Scope() noexcept;
-    ~VariantRepairInvalidUtf8Scope();
-
-    VariantRepairInvalidUtf8Scope(const VariantRepairInvalidUtf8Scope&) = delete;
-    VariantRepairInvalidUtf8Scope& operator=(const VariantRepairInvalidUtf8Scope&) = delete;
-
-    static bool active() noexcept;
-
-private:
-    bool _previous;
-};
-
-// value with each maximal invalid UTF-8 subsequence replaced by U+FFFD (Unicode's "substitution of
-// maximal subparts"); valid input is returned unchanged.
-std::string repair_invalid_utf8(StringRef value);
 
 // Internal dictionary owner for one VariantBatchBuilder encoding unit. Rows collect temporary key
 // ids first; seal() fixes the sorted dictionary and id remap for the completed batch.

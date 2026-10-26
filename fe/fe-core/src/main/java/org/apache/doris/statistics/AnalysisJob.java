@@ -177,14 +177,13 @@ public class AnalysisJob {
         }
     }
 
-    /**
-     * Records the failure of one column's task. The other tasks keep running and their statistics are
-     * still saved, so only the failed column remains unanalyzed and the next round retries it.
-     */
-    public synchronized void taskFailed(BaseAnalysisTask task, String reason) {
-        queryingTask.remove(task);
-        analysisManager.updateTaskStatus(task.info, AnalysisState.FAILED, reason, System.currentTimeMillis());
-        markOneTaskDone();
+    public void taskFailed(BaseAnalysisTask task, String reason) {
+        try {
+            updateTaskState(AnalysisState.FAILED, reason);
+            cancel();
+        } finally {
+            deregisterJob();
+        }
     }
 
     public void cancel() {

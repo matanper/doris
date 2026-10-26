@@ -150,11 +150,6 @@ public class AnalysisManager implements Writable {
 
     private final Map<Long, AnalysisJob> idToAnalysisJob = new ConcurrentHashMap<>();
 
-    // Table id -> time the table's latest automatic analyze job ended in failure. It is separate from
-    // TableStatsMeta, which describes successfully collected statistics only. Kept in memory on the master
-    // only: a restart or master failover forgets it, which costs at most one more attempt per failing table.
-    private final Map<Long, Long> tblIdToAutoAnalyzeFailureTime = new ConcurrentHashMap<>();
-
     private final String progressDisplayTemplate = "%d Finished  |  %d Failed  |  %d In Progress  |  %d Total";
 
     public AnalysisManager() {
@@ -547,24 +542,11 @@ public class AnalysisManager implements Writable {
             if (allFinished) {
                 if (hasFailure) {
                     job.markFailed();
-                    if (JobType.SYSTEM.equals(job.jobType)) {
-                        tblIdToAutoAnalyzeFailureTime.put(job.tblId, time);
-                    }
                     if (MetricRepo.isInit) {
                         MetricRepo.COUNTER_STATISTICS_FAILED_ANALYZE_JOB.increase(1L);
                     }
-                    // The columns that finished have saved their statistics; record them as analyzed so
-                    // that a later round only analyzes the failed columns again.
-                    try {
-                        if (retainFinishedColumns(job, analysisJobIdToTaskMap.get(info.jobId).values())) {
-                            updateTableStats(job);
-                        }
-                    } catch (Throwable e) {
-                        LOG.warn("Failed to update Table statistics in job: {}", info.toString(), e);
-                    }
                 } else {
                     job.markFinished();
-                    tblIdToAutoAnalyzeFailureTime.remove(job.tblId);
                     if (MetricRepo.isInit) {
                         MetricRepo.COUNTER_STATISTICS_SUCCEED_ANALYZE_JOB.increase(1L);
                     }
@@ -578,48 +560,6 @@ public class AnalysisManager implements Writable {
                 analysisJobIdToTaskMap.remove(job.jobId);
             }
         }
-    }
-
-    /**
-     * Removes the columns of failed tasks from the job's columns.
-     *
-     * @return whether any column of the job finished
-     */
-    @VisibleForTesting
-    static boolean retainFinishedColumns(AnalysisInfo job, Collection<BaseAnalysisTask> tasks) {
-        if (job.jobColumns == null) {
-            return false;
-        }
-        Set<String> failedColumns = new HashSet<>();
-        for (BaseAnalysisTask task : tasks) {
-            if (task.info.state.equals(AnalysisState.FAILED)) {
-                failedColumns.add(task.info.colName);
-            }
-        }
-        job.jobColumns.removeIf(column -> failedColumns.contains(column.second));
-        return !job.jobColumns.isEmpty();
-    }
-
-    /**
-     * Whether automatic analyze of the table is suppressed because its latest automatic analyze job failed
-     * less than {@link Config#auto_analyze_failure_backoff_in_millis} ago.
-     */
-    public boolean isInAutoAnalyzeFailureBackoff(long tblId) {
-        Long failureTime = tblIdToAutoAnalyzeFailureTime.get(tblId);
-        if (failureTime == null) {
-            return false;
-        }
-        long backoff = Config.auto_analyze_failure_backoff_in_millis;
-        if (backoff <= 0 || System.currentTimeMillis() - failureTime >= backoff) {
-            tblIdToAutoAnalyzeFailureTime.remove(tblId, failureTime);
-            return false;
-        }
-        return true;
-    }
-
-    @VisibleForTesting
-    public Long getAutoAnalyzeFailureTime(long tblId) {
-        return tblIdToAutoAnalyzeFailureTime.get(tblId);
     }
 
     @VisibleForTesting

@@ -1017,31 +1017,6 @@ TEST(VariantAssemblerLegacyTest, HierarchicalFailuresAreAtomicAndAssemblerCanBeR
     EXPECT_EQ(json_at(assembled_values(output), 0), R"({"a":43})");
 }
 
-TEST(VariantAssemblerLegacyTest, InvalidUtf8SparseKeysAndStringsAreRepairedOnRead) {
-    const auto assemble_sparse = [](const MapEntries& entries) {
-        VariantAssemblerOptions options;
-        options.storage_map_kind = StorageMapKind::SPARSE;
-        auto assembler = create_assembler(std::move(options));
-        auto storage = map_column(entries);
-        VariantAssemblerBatchView batch;
-        batch.num_rows = 1;
-        batch.storage_map = storage.get();
-        ColumnNullable::MutablePtr output;
-        const Status status = assembler->assemble(batch, &output);
-        EXPECT_TRUE(status.ok()) << status;
-        return status.ok() ? json_at(assembled_values(output), 0) : std::string();
-    };
-    const std::string one = fixed_storage_cell<int32_t>(FieldType::OLAP_FIELD_TYPE_INT, 1);
-    const std::string r = "\xEF\xBF\xBD";
-    const std::string repaired = assemble_sparse(
-            {{"a.b\xFF", one}, {"a.c", string_storage_cell("v\xC3")}, {"a.d", one}});
-    const std::string expected = assemble_sparse(
-            {{"a.b" + r, one}, {"a.c", string_storage_cell("v" + r)}, {"a.d", one}});
-    EXPECT_FALSE(expected.empty());
-    EXPECT_EQ(repaired, expected);
-    EXPECT_FALSE(VariantRepairInvalidUtf8Scope::active());
-}
-
 TEST(VariantAssemblerLegacyTest, DepthBoundaries) {
     {
         VariantAssemblerOptions options;

@@ -137,8 +137,6 @@ public class PartitionExprUtil {
 
         for (List<TNullableStringLiteral> partitionValueList : partitionValues) {
             PartitionKeyDesc partitionKeyDesc = null;
-            Long rangeStart = null;
-            Long rangeEnd = null;
             String partitionName = "p";
             ArrayList<String> curPartitionValues = new ArrayList<>();
             for (TNullableStringLiteral tStringLiteral : partitionValueList) {
@@ -168,8 +166,6 @@ public class PartitionExprUtil {
                         beginDateTime.getHour(), beginDateTime.getMinute(), beginDateTime.getSecond());
                 DateLiteral endDateTime = getRangeEnd(beginDateTime, intervalInfo);
                 partitionKeyDesc = createPartitionKeyDescWithRange(beginDateTime, endDateTime, partitionColumnType);
-                rangeStart = AutoBucketCalculator.keyOrdinal(beginDateTime);
-                rangeEnd = AutoBucketCalculator.keyOrdinal(endDateTime);
             } else if (partitionType == PartitionType.LIST) {
                 List<List<PartitionValue>> listValues = new ArrayList<>();
                 List<PartitionValue> inValues = new ArrayList<>();
@@ -200,7 +196,7 @@ public class PartitionExprUtil {
                 // Use unified auto bucket calculator
                 AutoBucketCalculator.AutoBucketContext context = new AutoBucketCalculator.AutoBucketContext(
                         olapTable, partitionName, partitionName, false,
-                        defaultDistributionInfo.getBucketNum(), rangeStart, rangeEnd);
+                        defaultDistributionInfo.getBucketNum());
 
                 int bucketsNum = AutoBucketCalculator.calculateAutoBucketsWithBoundsCheck(context);
 

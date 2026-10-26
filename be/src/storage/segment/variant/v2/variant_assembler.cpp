@@ -702,7 +702,6 @@ VariantAssembler::VariantAssembler(
 Status VariantAssembler::assemble(const VariantAssemblerBatchView& batch,
                                   ColumnNullable::MutablePtr* output) const {
     DORIS_CHECK(output != nullptr);
-    const VariantRepairInvalidUtf8Scope repair_invalid_utf8;
     try {
         ColumnNullable::MutablePtr result;
         const Status status = assemble_hierarchical(_storage_map_kind, _has_root, _requested,
