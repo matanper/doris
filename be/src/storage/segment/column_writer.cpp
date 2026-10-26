@@ -31,6 +31,7 @@
 #include "core/types.h"
 #include "io/fs/file_writer.h"
 #include "storage/index/bloom_filter/bloom_filter_index_writer.h"
+#include "storage/index/index_finish_batch.h"
 #include "storage/index/inverted/inverted_index_writer.h"
 #include "storage/index/ordinal_page_index.h"
 #include "storage/index/zone_map/zone_map_index.h"
@@ -789,7 +790,7 @@ Status ScalarColumnWriter::write_zone_map() {
 Status ScalarColumnWriter::write_inverted_index() {
     if (_opts.need_inverted_index) {
         for (const auto& builder : _inverted_index_builders) {
-            RETURN_IF_ERROR(builder->finish());
+            RETURN_IF_ERROR(IndexFinishBatch::finish_index(builder.get()));
         }
     }
     return Status::OK();
@@ -1068,7 +1069,7 @@ Status ArrayColumnWriter::init() {
 
 Status ArrayColumnWriter::write_inverted_index() {
     if (_opts.need_inverted_index) {
-        return _inverted_index_writer->finish();
+        return IndexFinishBatch::finish_index(_inverted_index_writer.get());
     }
     return Status::OK();
 }
@@ -1333,7 +1334,7 @@ Status MapColumnWriter::finish_current_page() {
 
 Status MapColumnWriter::write_inverted_index() {
     if (_opts.need_inverted_index) {
-        return _index_builder->finish();
+        return IndexFinishBatch::finish_index(_index_builder.get());
     }
     return Status::OK();
 }

@@ -31,6 +31,9 @@
 namespace doris::io {
 
 inline static constexpr size_t REMOTE_FS_OBJECTS_CACHE_DEFAULT_ELEMENTS = 100 * 1024;
+// A top-level directory of a file cache path that is not the cache's: index_tmp_file_dirs may
+// put index temporary files in <file cache path>/index_tmp. Every walk of a cache path skips it.
+inline static constexpr const char* FILE_CACHE_INDEX_TMP_DIR_NAME = "index_tmp";
 inline static constexpr size_t FILE_CACHE_MAX_FILE_BLOCK_SIZE = 1 * 1024 * 1024;
 inline static constexpr size_t DEFAULT_NORMAL_PERCENT = 40;
 inline static constexpr size_t DEFAULT_DISPOSABLE_PERCENT = 5;

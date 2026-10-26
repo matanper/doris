@@ -1513,6 +1513,27 @@ DECLARE_mInt32(cumu_compaction_thread_nice);
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory
 DECLARE_mBool(inverted_index_ram_dir_enable);
+// How many of a segment's index writers finish at once, when the segment is flushed or a
+// compaction writes it: they share IndexFinishPool, and the writing thread works too. <= 1
+// finishes them one by one on the writing thread.
+DECLARE_mInt32(index_finish_parallelism);
+// Max threads of IndexFinishPool, shared by all segment writers; 0 means the number of cores.
+DECLARE_mInt32(index_finish_thread_num);
+// How many value columns of a load-flushed segment are converted, appended and finished at once,
+// on SegmentWritePool and the flushing thread; their data is still written in column order. <= 1
+// appends them one by one. Compactions always write their columns one by one.
+DECLARE_mInt32(segment_column_write_parallelism);
+// Max threads of SegmentWritePool; 0 means the number of cores.
+DECLARE_mInt32(segment_write_thread_num);
+// How many subcolumns of a VARIANT column are converted and appended at once when a load flushes
+// a segment, on SegmentWritePool and the writing thread; their data is still written in path
+// order. <= 1 appends them one by one. Compactions always write subcolumns one by one.
+DECLARE_mInt32(variant_subcolumn_write_parallelism);
+// Least input, in bytes, that one task of a parallel segment write (a run of value columns, or of
+// VARIANT subcolumns, appended one after another) is given. Smaller inputs are appended by the
+// writing thread itself, so small blocks and small subcolumns run no pool tasks; it also bounds
+// how many threads finish a segment's indexes.
+DECLARE_mInt64(segment_write_task_min_bytes);
 // wheather index by RAM directory when base compaction
 DECLARE_mBool(inverted_index_ram_dir_enable_when_base_compaction);
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a
@@ -1861,6 +1882,21 @@ DECLARE_mInt32(aws_client_request_timeout_ms);
 
 // write as inverted index tmp directory
 DECLARE_String(tmp_file_dir);
+// Comma-separated absolute dirs for index writers' and index compaction's temporary files,
+// round-robin, instead of <storage_root_path>/<tmp_file_dir>. Each is emptied at startup, so the
+// BE refuses to start on a dir that equals or contains a storage_root_path, equals, contains or
+// lies inside a file_cache_path (except exactly <file_cache_path>/index_tmp) or the log or conf
+// dir, or is a mount point, and on a dir it cannot write. Empty: the store paths' tmp dirs.
+DECLARE_String(index_tmp_file_dirs);
+// An index_tmp_file_dirs dir whose file system has less free space than this is passed over;
+// when all are, a store path's tmp dir is used (bvar index_tmp_file_dir_fallback). <= 0: no
+// check.
+DECLARE_mInt64(index_tmp_file_dir_min_free_bytes);
+// A top-level entry of an index tmp dir that no live writer owns and under which nothing changed
+// for this long is what a failed or cancelled writer left, and is removed. <= 0: never.
+DECLARE_mInt32(index_tmp_orphan_max_age_minutes);
+// How often the index tmp dirs are swept for such entries.
+DECLARE_mInt32(index_tmp_orphan_sweep_interval_seconds);
 
 // the directory for storing the trino-connector plugins.
 DECLARE_String(trino_connector_plugin_dir);

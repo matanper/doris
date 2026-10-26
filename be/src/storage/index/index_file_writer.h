@@ -52,7 +52,9 @@ public:
                     int64_t seg_id, InvertedIndexStorageFormatPB storage_format,
                     io::FileWriterPtr file_writer = nullptr, bool can_use_ram_dir = true,
                     int64_t tablet_id = -1);
-    virtual ~IndexFileWriter() = default;
+    // Registers the writer's tmp dir prefix with IndexTmpRegistry for its lifetime. A writer
+    // destroyed without a successful close deletes the index dirs it left in its tmp dir.
+    virtual ~IndexFileWriter();
 
     MOCK_FUNCTION Result<std::shared_ptr<DorisFSDirectory>> open(const TabletIndex* index_meta);
     Status delete_index(const TabletIndex* index_meta);
@@ -109,6 +111,10 @@ private:
 
     // only once
     bool _closed = false;
+    // Set once begin_close() deleted the index dirs in the tmp dir.
+    bool _tmp_dirs_deleted = false;
+    // "<rowset>_<segment>_", registered with IndexTmpRegistry while the writer lives.
+    std::string _tmp_prefix;
     bool _can_use_ram_dir = true;
 
     IndexStorageFormatPtr _index_storage_format;

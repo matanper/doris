@@ -1166,6 +1166,10 @@ DEFINE_mInt32(cold_data_compaction_interval_sec, "1800");
 DEFINE_mInt32(cold_data_compaction_score_threshold, "100");
 
 DEFINE_String(tmp_file_dir, "tmp");
+DEFINE_String(index_tmp_file_dirs, "");
+DEFINE_mInt64(index_tmp_file_dir_min_free_bytes, "21474836480");
+DEFINE_mInt32(index_tmp_orphan_max_age_minutes, "60");
+DEFINE_mInt32(index_tmp_orphan_sweep_interval_seconds, "300");
 
 DEFINE_Int32(min_s3_file_system_thread_num, "16");
 DEFINE_Int32(max_s3_file_system_thread_num, "64");
@@ -1454,6 +1458,12 @@ DEFINE_Validator(cumu_compaction_thread_nice,
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory
 DEFINE_mBool(inverted_index_ram_dir_enable, "true");
+DEFINE_mInt32(index_finish_parallelism, "8");
+DEFINE_mInt32(index_finish_thread_num, "0");
+DEFINE_mInt32(segment_column_write_parallelism, "8");
+DEFINE_mInt32(segment_write_thread_num, "0");
+DEFINE_mInt32(variant_subcolumn_write_parallelism, "8");
+DEFINE_mInt64(segment_write_task_min_bytes, "1048576");
 // wheather index by RAM directory when base compaction
 DEFINE_mBool(inverted_index_ram_dir_enable_when_base_compaction, "true");
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a
