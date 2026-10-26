@@ -324,6 +324,8 @@ Status OlapScanLocalState::_init_profile() {
 
     _segment_create_column_readers_timer =
             ADD_TIMER(_scanner_profile, "SegmentCreateColumnReadersTimer");
+    _segment_column_meta_region_read_timer =
+            ADD_TIMER(_scanner_profile, "SegmentColumnMetaRegionReadTimer");
     _segment_load_index_timer = ADD_TIMER(_scanner_profile, "SegmentLoadIndexTimer");
 
     _index_filter_profile = std::make_unique<RuntimeProfile>("IndexFilter");
