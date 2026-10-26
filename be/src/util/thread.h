@@ -75,11 +75,6 @@ public:
     static void set_thread_nice_value();
 #endif
 
-    // Sets the calling thread's nice value to `nice` when it differs from the value this call
-    // last set on the thread. Returns false when the kernel refused, e.g. a lower value without
-    // CAP_SYS_NICE.
-    static bool set_self_nice(int nice);
-
     ~Thread();
 
     // Blocks until this thread finishes execution. Once this method returns, the thread

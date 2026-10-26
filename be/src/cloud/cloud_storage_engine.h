@@ -224,13 +224,8 @@ private:
     Status _adjust_compaction_thread_num();
     Status _submit_base_compaction_task(const CloudTabletSPtr& tablet, int trigger_method = 0);
     Status _submit_cumulative_compaction_task(const CloudTabletSPtr& tablet,
-                                              int trigger_method = 0,
-                                              CompactionFinishCallback on_finish = nullptr);
-    Status _submit_full_compaction_task(const CloudTabletSPtr& tablet, int trigger_method = 0,
-                                        CompactionFinishCallback on_finish = nullptr);
-    // True when max_parallel_cumu_compactions_per_tablet cumulative compactions are submitted on
-    // the tablet. Requires _compaction_mtx.
-    bool parallel_cumu_compaction_limit_reached(int64_t tablet_id) const;
+                                              int trigger_method = 0);
+    Status _submit_full_compaction_task(const CloudTabletSPtr& tablet, int trigger_method = 0);
     Status _request_tablet_global_compaction_lock(ReaderType compaction_type,
                                                   const CloudTabletSPtr& tablet,
                                                   std::shared_ptr<CloudCompactionMixin> compaction);

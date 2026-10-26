@@ -17,7 +17,6 @@
 
 #include "cloud/cloud_storage_engine.h"
 
-#include <bvar/bvar.h>
 #include <bvar/reducer.h>
 #include <gen_cpp/PlanNodes_types.h>
 #include <gen_cpp/cloud.pb.h>
@@ -29,7 +28,6 @@
 
 #include <algorithm>
 #include <memory>
-#include <utility>
 #include <variant>
 
 #include "cloud/cloud_base_compaction.h"
@@ -66,7 +64,6 @@
 #include "storage/compaction_task_tracker.h"
 #include "storage/storage_policy.h"
 #include "util/parse_util.h"
-#include "util/stopwatch.hpp"
 #include "util/time.h"
 
 namespace doris {
@@ -530,13 +527,6 @@ Status CloudStorageEngine::_adjust_compaction_thread_num() {
     return Status::OK();
 }
 
-namespace {
-// The compaction producer thread: how long a round of picking and submitting tablets takes, and
-// how long preparing one cumulative compaction takes on it.
-bvar::LatencyRecorder g_compaction_producer_round_ms("compaction_producer_round_ms");
-bvar::LatencyRecorder g_cumu_compaction_prepare_us("cumu_compaction_prepare_us");
-} // namespace
-
 void CloudStorageEngine::_compaction_tasks_producer_callback() {
     LOG(INFO) << "try to start compaction producer process!";
 
@@ -616,7 +606,6 @@ void CloudStorageEngine::_compaction_tasks_producer_callback() {
         int64_t end_time = UnixMillis();
         DorisMetrics::instance()->compaction_producer_callback_a_round_time->set_value(end_time -
                                                                                        cur_time);
-        g_compaction_producer_round_ms << end_time - cur_time;
     } while (!_stop_background_threads_latch.wait_for(std::chrono::milliseconds(interval)));
 }
 
@@ -723,15 +712,9 @@ std::vector<CloudTabletSPtr> CloudStorageEngine::_generate_cloud_compaction_task
                    t->tablet_state() != TABLET_RUNNING;
         };
     } else if (config::enable_parallel_cumu_compaction) {
-        filter_out = [&tablet_preparing_cumu_compaction, &submitted_cumu_compactions,
-                      &submitted_full_compactions,
+        filter_out = [&tablet_preparing_cumu_compaction,
                       &submitted_index_change_cumu_compactions](CloudTablet* t) {
-            const int32_t limit = config::max_parallel_cumu_compactions_per_tablet;
-            auto submitted = submitted_cumu_compactions.find(t->tablet_id());
-            const bool at_limit = limit > 0 && submitted != submitted_cumu_compactions.end() &&
-                                  std::cmp_greater_equal(submitted->second.size(), limit);
-            return at_limit || tablet_preparing_cumu_compaction.contains(t->tablet_id()) ||
-                   submitted_full_compactions.contains(t->tablet_id()) ||
+            return tablet_preparing_cumu_compaction.contains(t->tablet_id()) ||
                    submitted_index_change_cumu_compactions.contains(t->tablet_id()) ||
                    (t->tablet_state() != TABLET_RUNNING &&
                     (!config::enable_new_tablet_do_compaction || t->alter_version() == -1));
@@ -988,16 +971,6 @@ Status CloudStorageEngine::_submit_base_compaction_task(const CloudTabletSPtr& t
     return st;
 }
 
-bool CloudStorageEngine::parallel_cumu_compaction_limit_reached(int64_t tablet_id) const {
-    const int32_t limit = config::max_parallel_cumu_compactions_per_tablet;
-    if (limit <= 0) {
-        return false;
-    }
-    auto it = _submitted_cumu_compactions.find(tablet_id);
-    return it != _submitted_cumu_compactions.end() &&
-           std::cmp_greater_equal(it->second.size(), limit);
-}
-
 Status CloudStorageEngine::_submit_cumulative_compaction_task(const CloudTabletSPtr& tablet,
                                                               int trigger_method,
                                                               CompactionFinishCallback on_finish) {
@@ -1009,12 +982,6 @@ Status CloudStorageEngine::_submit_cumulative_compaction_task(const CloudTabletS
             return Status::AlreadyExist("other cumu compaction is submitted, tablet_id={}",
                                         tablet->tablet_id());
         }
-        if (config::enable_parallel_cumu_compaction &&
-            parallel_cumu_compaction_limit_reached(tablet->tablet_id())) {
-            return Status::AlreadyExist("{} cumu compactions are submitted, tablet_id={}",
-                                        config::max_parallel_cumu_compactions_per_tablet,
-                                        tablet->tablet_id());
-        }
         auto [_, success] = _tablet_preparing_cumu_compaction.insert(tablet->tablet_id());
         if (!success) {
             return Status::AlreadyExist("other cumu compaction is preparing, tablet_id={}",
@@ -1022,10 +989,7 @@ Status CloudStorageEngine::_submit_cumulative_compaction_task(const CloudTabletS
         }
     }
     auto compaction = std::make_shared<CloudCumulativeCompaction>(*this, tablet);
-    MonotonicStopWatch prepare_watch;
-    prepare_watch.start();
     auto st = compaction->prepare_compact();
-    g_cumu_compaction_prepare_us << prepare_watch.elapsed_time() / 1000;
     if (!st.ok()) {
         long now = duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())

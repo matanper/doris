@@ -60,7 +60,7 @@ namespace doris {
 using namespace ErrorCode;
 
 BetaRowsetReader::BetaRowsetReader(BetaRowsetSharedPtr rowset)
-        : _read_context(nullptr), _rowset(std::move(rowset)) {
+        : _read_context(nullptr), _rowset(std::move(rowset)), _stats(&_owned_stats) {
     _rowset->acquire();
 }
 
@@ -86,12 +86,17 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                                                std::vector<RowwiseIteratorUPtr>* out_iters,
                                                bool use_cache) {
     _read_context = read_context;
-    // A query passes the statistics of its scanner, which the reader then counts into. Compaction
-    // and schema change pass none, and the reader counts into statistics of its own.
+    // The segment iterator is created with its own statistics,
+    // and the member variable '_stats'  is initialized by '_stats(&owned_stats)'.
+    // The choice of statistics used depends on the workload of the rowset reader.
+    // For instance, if it's for query, the get_segment_iterators function
+    // will receive one valid read_context with corresponding valid statistics,
+    // and we will use those statistics.
+    // However, for compaction or schema change workloads,
+    // the read_context passed to the function will have null statistics,
+    // and in such cases we will try to use the beta rowset reader's own statistics.
     if (_read_context->stats != nullptr) {
         _stats = _read_context->stats;
-    } else if (_stats == nullptr) {
-        _stats = _owned_stats_or_create();
     }
     SCOPED_RAW_TIMER(&_stats->rowset_reader_get_segment_iterators_timer_ns);
 

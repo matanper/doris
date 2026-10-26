@@ -27,11 +27,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <roaring/roaring.hh>
 #include <list>
 #include <map>
 #include <optional>
@@ -66,7 +65,7 @@
 #include "storage/compaction/cumulative_compaction.h"
 #include "storage/compaction/cumulative_compaction_policy.h"
 #include "storage/compaction/cumulative_compaction_time_series_policy.h"
-#include "storage/compaction/index_compaction_preload.h"
+#include "storage/compaction/variant_subcolumn_index_compaction.h"
 #include "storage/compaction_task_tracker.h"
 #include "storage/data_dir.h"
 #include "storage/index/index_file_reader.h"
@@ -93,7 +92,6 @@
 #include "storage/task/engine_checksum_task.h"
 #include "storage/txn/txn_manager.h"
 #include "storage/utils.h"
-#include "util/defer_op.h"
 #include "util/pretty_printer.h"
 #include "util/time.h"
 #include "util/trace.h"
@@ -282,54 +280,7 @@ int64_t Compaction::merge_way_num() {
     return way_num;
 }
 
-void Compaction::preload_input_segment_files(bool async) {
-    std::vector<IndexFilePreloadTarget> targets;
-    for (const auto& rowset : _input_rowsets) {
-        auto fs = rowset->rowset_meta()->fs();
-        if (fs == nullptr) {
-            continue;
-        }
-        for (int64_t seg_id = 0; seg_id < rowset->num_segments(); ++seg_id) {
-            auto path = rowset->segment_path(seg_id);
-            if (!path.has_value()) {
-                continue;
-            }
-            const int64_t file_size =
-                    rowset->rowset_meta()->segment_file_size(cast_set<int>(seg_id));
-            targets.push_back({.fs = fs,
-                               .path = std::move(path.value()),
-                               .file_size = file_size > 0 ? file_size : -1,
-                               .tablet_id = _tablet->tablet_id()});
-        }
-    }
-    if (config::enable_compaction_memory_preload) {
-        std::vector<IndexFilePreloadTarget> rest;
-        _memory_preload = start_memory_preload_index_files(targets, &rest);
-        targets = std::move(rest);
-        if (targets.empty() || !config::enable_compaction_data_preload) {
-            return;
-        }
-    }
-    if (async) {
-        _input_preload = start_preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
-    } else {
-        preload_index_files(targets, PreloadCacheQueue::DISPOSABLE);
-    }
-}
-
 Status Compaction::merge_input_rowsets() {
-    // The preload is only of use to the merge; what it has not started by then is skipped.
-    Defer cancel_preload {[this]() {
-        _input_preload.reset();
-        _memory_preload.reset();
-    }};
-    if (config::enable_compaction_data_preload || config::enable_compaction_memory_preload) {
-        // Vertical compaction reads every input segment once per column group, starting each
-        // pass with small reads of each segment one after another; reading each segment file
-        // once up front turns their cache misses into a few large remote reads. Started without
-        // waiting, the merge reads each block once it arrives, the first column groups' first.
-        preload_input_segment_files(config::enable_compaction_async_data_preload);
-    }
     std::vector<RowsetReaderSharedPtr> input_rs_readers;
     input_rs_readers.reserve(_input_rowsets.size());
     for (auto& rowset : _input_rowsets) {
@@ -789,256 +740,12 @@ Status CompactionMixin::execute_compact_impl(int64_t permits) {
     return Status::OK();
 }
 
-// Typed VARIANT subcolumns whose indexes a compaction merged, and those it rebuilt because some
-// input lacked them, with enable_variant_typed_path_index_compaction.
-bvar::Adder<uint64_t> g_variant_index_merge_paths("compaction_variant_index_merge_paths");
-bvar::Adder<uint64_t> g_variant_index_rebuild_paths("compaction_variant_index_rebuild_paths");
-// Why a typed subcolumn was rebuilt rather than merged: an input rowset marked to skip index
-// compaction of the VARIANT, an input schema whose index differs or is missing, an input
-// segment without the index, an index without its base files; and scans of the inputs that
-// stopped on an error, which leave every candidate of that compaction to be rebuilt.
-bvar::Adder<uint64_t> g_variant_index_rebuild_skip_marked(
-        "compaction_variant_index_rebuild_skip_marked");
-bvar::Adder<uint64_t> g_variant_index_rebuild_props_mismatch(
-        "compaction_variant_index_rebuild_props_mismatch");
-bvar::Adder<uint64_t> g_variant_index_rebuild_missing_in_segment(
-        "compaction_variant_index_rebuild_missing_in_segment");
-bvar::Adder<uint64_t> g_variant_index_rebuild_incomplete_dir(
-        "compaction_variant_index_rebuild_incomplete_dir");
-bvar::Adder<uint64_t> g_variant_index_scan_aborted("compaction_variant_index_scan_aborted");
-// An input rowset whose inverted index storage format differs from the output's: its segments'
-// index files cannot be read as the merge reads them.
-bvar::Adder<uint64_t> g_variant_index_rebuild_props_format_mismatch(
-        "compaction_variant_index_rebuild_props_format_mismatch");
-// Input index properties a merge accepted although they differ from the output's: the raw
-// properties of the defined entry, or the entry the first-by-id lookup returns, a per-subcolumn
-// copy. One count per input rowset and index; each distinct difference is logged once.
-bvar::Adder<uint64_t> g_variant_index_props_equal_after_normalize(
-        "compaction_variant_index_props_equal_after_normalize");
-bvar::Adder<uint64_t> g_variant_index_props_normalize_logged(
-        "compaction_variant_index_props_normalize_logged");
-
-// The distinct differences already logged, process-wide. Full, it logs nothing more.
-static bool first_normalized_difference(const std::string& key) {
-    static constexpr size_t kMaxEntries = 10000;
-    static std::mutex mutex;
-    static std::unordered_set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.size() >= kMaxEntries) {
-        return false;
-    }
-    return seen.insert(key).second;
-}
-
-// The VARIANT subcolumn of `schema` whose full path is `path`, or nullptr.
-static const TabletColumn* find_extracted_column(const TabletSchema& schema,
-                                                 const std::string& path) {
-    for (const auto& column : schema.columns()) {
-        if (column->is_extracted_column() && column->path_info_ptr() != nullptr &&
-            column->path_info_ptr()->get_path() == path) {
-            return column.get();
-        }
-    }
-    return nullptr;
-}
-
-// Properties of the index `index_id` in `schema`, if it has one.
-// Properties of the index `index_id` as the schema defines it: the entry without an index suffix.
-// Schemas with VARIANT subcolumns also hold per-subcolumn copies of the parent's indexes under the
-// same id, some of them stripped of their parser, which do not describe the index.
-static std::optional<std::map<std::string, std::string>> defined_index_properties(
-        const TabletSchema& schema, int64_t index_id) {
-    for (const auto* index : schema.inverted_indexes()) {
-        if (index->index_id() == index_id && index->get_index_suffix().empty()) {
-            return index->properties();
-        }
-    }
-    return std::nullopt;
-}
-
-// What of an index's properties decides the terms, positions and files it writes; defaults
-// stand for missing keys, so a missing key equals its default spelled out. lower_case acts only
-// through an analyzer: an index without a parser or analyzer writes each value as one term, as
-// is, and its reader looks the query value up as is, so its lower_case is left out.
-static auto index_content_settings(const std::map<std::string, std::string>& properties) {
-    const auto find = [&](const char* key) {
-        auto it = properties.find(key);
-        return it == properties.end() ? std::string() : it->second;
-    };
-    const bool analyzed = inverted_index::InvertedIndexAnalyzer::should_analyzer(properties);
-    return std::make_tuple(
-            static_cast<int>(get_inverted_index_parser_type_from_string(
-                    get_parser_string_from_properties(properties))),
-            get_parser_mode_string_from_properties(properties),
-            get_parser_phrase_support_string_from_properties(properties),
-            analyzed ? get_parser_lowercase_from_properties<true>(properties) : std::string(),
-            get_parser_char_filter_map_from_properties(properties),
-            get_parser_ignore_above_value_from_properties(properties),
-            get_parser_stopwords_from_properties(properties),
-            get_parser_dict_compression_from_properties(properties),
-            get_analyzer_name_from_properties(properties), find("field_pattern"));
-}
-
-// The first key whose raw value differs, for the log of a rejected path.
-static std::string first_property_difference(const std::map<std::string, std::string>& expected,
-                                             const std::map<std::string, std::string>& actual) {
-    std::set<std::string> keys;
-    for (const auto& [key, value] : expected) {
-        keys.insert(key);
-    }
-    for (const auto& [key, value] : actual) {
-        keys.insert(key);
-    }
-    for (const auto& key : keys) {
-        auto e = expected.find(key);
-        auto a = actual.find(key);
-        const std::string ev = e == expected.end() ? "<missing>" : e->second;
-        const std::string av = a == actual.end() ? "<missing>" : a->second;
-        if (ev != av) {
-            return fmt::format("{}: expected={} actual={}", key, ev, av);
-        }
-    }
-    return "none";
-}
-
-// Keys that index_content_settings reads.
-static bool is_content_key(const std::string& key) {
-    static const std::set<std::string> keys {INVERTED_INDEX_PARSER_KEY,
-                                             INVERTED_INDEX_PARSER_KEY_ALIAS,
-                                             INVERTED_INDEX_PARSER_MODE_KEY,
-                                             INVERTED_INDEX_PARSER_PHRASE_SUPPORT_KEY,
-                                             INVERTED_INDEX_PARSER_LOWERCASE_KEY,
-                                             INVERTED_INDEX_PARSER_CHAR_FILTER_TYPE,
-                                             INVERTED_INDEX_PARSER_CHAR_FILTER_PATTERN,
-                                             INVERTED_INDEX_PARSER_CHAR_FILTER_REPLACEMENT,
-                                             INVERTED_INDEX_PARSER_IGNORE_ABOVE_KEY,
-                                             INVERTED_INDEX_PARSER_STOPWORDS_KEY,
-                                             INVERTED_INDEX_PARSER_DICT_COMPRESSION_KEY,
-                                             INVERTED_INDEX_ANALYZER_NAME_KEY,
-                                             INVERTED_INDEX_NORMALIZER_NAME_KEY,
-                                             INVERTED_INDEX_PARSER_FIELD_PATTERN_KEY};
-    return keys.contains(key);
-}
-
-struct PropertyDifference {
-    std::string key;
-    std::string expected;
-    std::string actual;
-    // "none": the entries hold the same properties; "default": one side lacks the key;
-    // "spelling": both have it and the values differ only in ASCII case or surrounding spaces;
-    // "value": the values differ otherwise.
-    const char* how;
-};
-
-// Every key whose raw value differs between the two property maps.
-static std::vector<PropertyDifference> property_differences(
-        const std::map<std::string, std::string>& expected,
-        const std::map<std::string, std::string>& actual) {
-    const auto canonical = [](std::string value) {
-        const auto first = value.find_first_not_of(" \t");
-        const auto last = value.find_last_not_of(" \t");
-        value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        return value;
-    };
-    std::set<std::string> keys;
-    for (const auto& [key, value] : expected) {
-        keys.insert(key);
-    }
-    for (const auto& [key, value] : actual) {
-        keys.insert(key);
-    }
-    std::vector<PropertyDifference> differences;
-    for (const auto& key : keys) {
-        auto e = expected.find(key);
-        auto a = actual.find(key);
-        if (e != expected.end() && a != actual.end() && e->second == a->second) {
-            continue;
-        }
-        const char* how = "default";
-        if (e != expected.end() && a != actual.end()) {
-            how = canonical(e->second) == canonical(a->second) ? "spelling" : "value";
-        }
-        differences.push_back({.key = key,
-                               .expected = e == expected.end() ? "<missing>" : e->second,
-                               .actual = a == actual.end() ? "<missing>" : a->second,
-                               .how = how});
-    }
-    return differences;
-}
-
-// The first entry with `index_id`, which the lookup by id alone returns: the defined index or a
-// per-subcolumn copy of it.
-static const TabletIndex* first_index_with_id(const TabletSchema& schema, int64_t index_id) {
-    for (const auto* index : schema.inverted_indexes()) {
-        if (index->index_id() == index_id) {
-            return index;
-        }
-    }
-    return nullptr;
-}
-
-static std::optional<std::map<std::string, std::string>> index_properties(
-        const TabletSchema& schema, int64_t index_id) {
-    for (const auto* index : schema.inverted_indexes()) {
-        if (index->index_id() == index_id) {
-            return index->properties();
-        }
-    }
-    return std::nullopt;
-}
-
-// Marks as null, in every destination index, the documents that come from source segments
-// without the index. A typed VARIANT path that never appeared in a segment is NULL for all of
-// its rows in the output, as a rebuild of the index would record them.
-static Status add_absent_source_nulls(
-        const std::vector<lucene::store::Directory*>& dest_dirs,
-        const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& trans_vec,
-        const std::vector<size_t>& absent_sources) {
-    std::vector<roaring::Roaring> nulls(dest_dirs.size());
-    for (size_t src : absent_sources) {
-        for (const auto& [dest, doc] : trans_vec[src]) {
-            if (dest != UINT32_MAX && doc != UINT32_MAX && dest < nulls.size()) {
-                nulls[dest].add(doc);
-            }
-        }
-    }
-    const char* name = lucene::index::IndexWriter::NULL_BITMAP_FILE_NAME;
-    for (size_t dest = 0; dest < dest_dirs.size(); ++dest) {
-        if (nulls[dest].isEmpty()) {
-            continue;
-        }
-        auto* dir = dest_dirs[dest];
-        if (dir->fileExists(name)) {
-            std::unique_ptr<lucene::store::IndexInput> in(dir->openInput(name));
-            std::string buf(static_cast<size_t>(in->length()), '\0');
-            if (!buf.empty()) {
-                in->readBytes(reinterpret_cast<uint8_t*>(buf.data()),
-                              static_cast<int32_t>(buf.size()));
-                auto written = segment_v2::read_native_roaring(buf.data(), buf.size());
-                if (!written.has_value()) {
-                    return Status::Corruption(
-                            "merged index null bitmap of destination {} unreadable: {} bytes, "
-                            "first_bytes={}",
-                            dest, buf.size(), segment_v2::hex_prefix(buf));
-                }
-                nulls[dest] |= *written;
-            }
-            in->close();
-            in.reset();
-            dir->deleteFile(name);
-        }
-        nulls[dest].runOptimize();
-        std::string buf(nulls[dest].getSizeInBytes(false), '\0');
-        nulls[dest].write(buf.data(), false);
-        std::unique_ptr<lucene::store::IndexOutput> out(dir->createOutput(name));
-        out->writeBytes(reinterpret_cast<const uint8_t*>(buf.data()),
-                        static_cast<int32_t>(buf.size()));
-        out->close();
-    }
-    return Status::OK();
-}
+namespace {
+bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_merged(
+        "variant_subcolumn_index_compaction_merged");
+bvar::Adder<uint64_t> g_variant_subcolumn_index_compaction_rebuilt(
+        "variant_subcolumn_index_compaction_rebuilt");
+} // namespace
 
 Status Compaction::do_inverted_index_compaction() {
     const auto& ctx = _output_rs_writer->context();
@@ -1162,37 +869,6 @@ Status Compaction::do_inverted_index_compaction() {
     std::unordered_map<RowsetId, Rowset*> rs_id_to_rowset_map;
     for (auto&& rs : _input_rowsets) {
         rs_id_to_rowset_map.emplace(rs->rowset_id(), rs.get());
-    }
-
-    if (config::enable_index_compaction_preload &&
-        _cur_tablet_schema->get_inverted_index_storage_format() >=
-                InvertedIndexStorageFormatPB::V2) {
-        // The merges below read every source index file in many small pieces; reading each file
-        // once up front turns them into a few large remote reads.
-        std::vector<IndexFilePreloadTarget> targets;
-        for (const auto& m : src_seg_to_id_map) {
-            const auto& [rowset_id, seg_id] = m.first;
-            auto it = rs_id_to_rowset_map.find(rowset_id);
-            if (it == rs_id_to_rowset_map.end()) {
-                continue;
-            }
-            auto* rowset = it->second;
-            auto fs = rowset->rowset_meta()->fs();
-            auto seg_path = rowset->segment_path(seg_id);
-            if (fs == nullptr || !seg_path.has_value()) {
-                continue;
-            }
-            const auto file_info = rowset->rowset_meta()->inverted_index_file_info(seg_id);
-            const int64_t file_size = file_info.has_index_size() && file_info.index_size() > 0
-                                              ? file_info.index_size()
-                                              : -1;
-            auto prefix = InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value());
-            targets.push_back({.fs = fs,
-                               .path = InvertedIndexDescriptor::get_index_file_path_v2(prefix),
-                               .file_size = file_size,
-                               .tablet_id = _tablet->tablet_id()});
-        }
-        preload_index_files(targets);
     }
 
     // src index dirs
@@ -1958,6 +1634,93 @@ void Compaction::construct_index_compaction_columns(RowsetWriterContext& ctx) {
             ctx.columns_to_do_index_compaction.insert(col_unique_id);
         }
     }
+    construct_variant_subcolumn_index_compaction(ctx);
+}
+
+void Compaction::construct_variant_subcolumn_index_compaction(RowsetWriterContext& ctx) {
+    if (!config::enable_variant_subcolumn_index_compaction) {
+        return;
+    }
+    std::vector<VariantSubcolumnIndexCandidate> candidates;
+    std::set<int32_t> variant_uids;
+    for (const auto& column : _cur_tablet_schema->columns()) {
+        if (!column->is_extracted_column() || column->path_info_ptr() == nullptr ||
+            column->path_info_ptr()->has_nested_part() || !field_is_slice_type(column->type())) {
+            continue;
+        }
+        const int32_t variant_uid = column->parent_unique_id();
+        if (!_cur_tablet_schema->has_column_unique_id(variant_uid)) {
+            continue;
+        }
+        const auto& parent = _cur_tablet_schema->column_by_uid(variant_uid);
+        if (!parent.is_variant_type() || parent.variant_enable_nested_group() ||
+            parent.variant_enable_doc_mode()) {
+            continue;
+        }
+        auto indexes = _cur_tablet_schema->inverted_indexs(*column);
+        if (indexes.empty()) {
+            continue;
+        }
+        candidates.push_back({.variant_uid = variant_uid,
+                              .path = column->path_info_ptr()->copy_pop_front().get_path(),
+                              .type = column->type(),
+                              .indexes = std::move(indexes)});
+        variant_uids.insert(variant_uid);
+    }
+    if (candidates.empty()) {
+        return;
+    }
+
+    std::vector<TabletSchemaSPtr> input_schemas;
+    std::set<int32_t> skipped_variant_uids;
+    std::map<int32_t, std::vector<VariantSegmentPaths>> input_segments;
+    for (const auto& rowset : _input_rowsets) {
+        input_schemas.push_back(rowset->tablet_schema());
+        for (const int32_t variant_uid : variant_uids) {
+            if (rowset->is_skip_index_compaction(variant_uid)) {
+                skipped_variant_uids.insert(variant_uid);
+            }
+        }
+        if (auto st = collect_variant_segment_paths(rowset, variant_uids, &input_segments);
+            !st.ok()) {
+            LOG(WARNING) << "tablet[" << _tablet->tablet_id() << "] rowset[" << rowset->rowset_id()
+                         << "] cannot read variant sub-columns, will rebuild their indexes: " << st;
+            return;
+        }
+    }
+    auto selection = select_variant_subcolumn_indexes(
+            candidates, input_schemas, input_segments, skipped_variant_uids,
+            [this](int32_t variant_uid, const TabletIndex& index) {
+                return std::all_of(_input_rowsets.begin(), _input_rowsets.end(),
+                                   [&](const RowsetSharedPtr& rowset) {
+                                       return check_rowset_has_index_file(
+                                               static_cast<BetaRowset*>(rowset.get()), &index,
+                                               variant_uid, _tablet, _cur_tablet_schema);
+                                   });
+            });
+    g_variant_subcolumn_index_compaction_rebuilt << selection.rebuild;
+    ctx.variant_subcolumn_indexes_to_compact = std::move(selection.merge);
+}
+
+Status Compaction::check_variant_subcolumn_index_outputs(
+        const RowsetWriterContext& ctx, const std::vector<const IndexFileWriter*>& dest_writers,
+        const std::function<void(int64_t, int64_t)>& error_handler) {
+    // A merged index is only valid for a segment that wrote the path as a string sub-column and
+    // left this index to compaction; the writer built no index for it, so any other output
+    // fails this compaction.
+    for (const auto& entry : ctx.variant_subcolumn_indexes_to_compact) {
+        for (const auto* dest_writer : dest_writers) {
+            if (!ctx.variant_subcolumn_index_writes->contains(dest_writer, entry.index->index_id(),
+                                                              entry.index->get_index_suffix())) {
+                error_handler(entry.index->index_id(), entry.variant_uid);
+                return Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(
+                        "tablet {} output does not store variant path {} as a string "
+                        "sub-column in every segment",
+                        _tablet->tablet_id(), entry.path);
+            }
+        }
+    }
+    return Status::OK();
 }
 
 Status CompactionMixin::update_delete_bitmap() {

@@ -19,11 +19,9 @@
 
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
-#include <sys/resource.h>
 
 #include <ostream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "common/logging.h"
@@ -113,26 +111,5 @@ TEST_F(ThreadTest, ThreadStartBenchmark) {
         t->join();
     }
 }
-
-#ifndef __APPLE__
-// A thread raises its own nice value, and a repeated value costs no system call.
-TEST_F(ThreadTest, SetSelfNice) {
-    int seen = -100;
-    bool raised = false;
-    bool repeated = false;
-    std::thread worker([&]() {
-        raised = Thread::set_self_nice(7);
-        errno = 0;
-        seen = getpriority(PRIO_PROCESS, 0);
-        repeated = Thread::set_self_nice(7);
-    });
-    worker.join();
-    EXPECT_TRUE(raised);
-    EXPECT_EQ(seen, 7);
-    EXPECT_TRUE(repeated);
-    // Other threads keep their own value.
-    EXPECT_EQ(getpriority(PRIO_PROCESS, 0), 0);
-}
-#endif
 
 } // namespace doris

@@ -77,9 +77,6 @@ public:
 
     // Return the total number of filtered rows, will be used for validation of schema change
     int64_t filtered_rows() override {
-        if (_stats == nullptr) {
-            return 0; // never read
-        }
         return _stats->rows_del_filtered + _stats->rows_del_by_bitmap +
                _stats->rows_conditions_filtered + _stats->rows_vec_del_cond_filtered +
                _stats->rows_vec_cond_filtered + _stats->rows_short_circuit_cond_filtered;
@@ -99,12 +96,7 @@ public:
 
     void set_topn_limit(size_t topn_limit) override { _topn_limit = topn_limit; }
 
-    OlapReaderStatistics* get_stats() {
-        if (_stats == nullptr) {
-            _stats = _owned_stats_or_create();
-        }
-        return _stats;
-    }
+    OlapReaderStatistics* get_stats() { return _stats; }
 
 private:
     template <typename T>
@@ -170,18 +162,7 @@ private:
     RowsetReaderContext* _read_context = nullptr;
     BetaRowsetSharedPtr _rowset;
 
-    // The reader's own statistics, for reads whose context has none (compaction, schema change).
-    // Queries count into their scanner's statistics, so a query's reader never creates these: a
-    // scan clones one reader per rowset per scanner up front, and they would otherwise take most
-    // of each reader's size.
-    OlapReaderStatistics* _owned_stats_or_create() {
-        if (_owned_stats == nullptr) {
-            _owned_stats = std::make_unique<OlapReaderStatistics>();
-        }
-        return _owned_stats.get();
-    }
-    std::unique_ptr<OlapReaderStatistics> _owned_stats;
-    // Set by get_segment_iterators(), to the context's statistics or the reader's own.
+    OlapReaderStatistics _owned_stats;
     OlapReaderStatistics* _stats = nullptr;
 
     std::unique_ptr<RowwiseIterator> _iterator;
