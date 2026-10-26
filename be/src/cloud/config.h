@@ -162,6 +162,35 @@ DECLARE_mInt64(get_delete_bitmap_bytes_threshold);
 // Skip writing empty rowset metadata to meta service
 DECLARE_mBool(skip_writing_empty_rowset_metadata);
 
+// Fill a run of consecutive versions that a non-MoW tablet has no rowset for (version holes,
+// e.g. versions whose loads wrote other tablets of the partition) with one empty hole rowset
+// covering the whole run, extending the tablet's trailing hole rowset as new versions arrive,
+// instead of creating one empty hole rowset per version.
+DECLARE_mBool(enable_hole_rowset_version_range);
+// Maximum number of versions a single hole rowset may cover when
+// enable_hole_rowset_version_range is true.
+DECLARE_mInt64(hole_rowset_max_versions);
+
+// Intermediate versions v of hole rowset ranges [s, e] among the last this many versions of a
+// tablet get their prefix rowset [s, v] when the range is created. A reader of any other
+// intermediate version gets its prefix when it asks for it.
+DECLARE_mInt64(hole_rowset_eager_prefix_versions);
+// Drop a tablet's trailing hole rowset when a longer one replaces it, instead of keeping it on
+// the stale path. Its versions stay readable through the new range and on-demand prefixes.
+DECLARE_mBool(hole_rowset_drop_extended_tail);
+// Keep a run of versions that a tablet using hole rowset version ranges has no rowset for, and
+// that a get_rowset response confirms empty (no lazy-commit txn pending), as a version graph
+// edge only, with no hole rowset or rowset meta. Readers and compaction get a transient empty
+// rowset for it. Turning it off replaces the remaining gaps with hole rowsets on each tablet's
+// next sync.
+DECLARE_mBool(enable_implicit_version_gaps);
+
+// When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
+// no rows in a load without building a rowset writer for it, as long as the tablet is cached on
+// this BE. Only the per-tablet BE bookkeeping of the load (empty rowset markers, approximate
+// stats) is kept.
+DECLARE_mBool(skip_rowset_writer_for_empty_tablet);
+
 // enable large txn lazy commit in meta-service `commit_txn`
 DECLARE_mBool(enable_cloud_txn_lazy_commit);
 

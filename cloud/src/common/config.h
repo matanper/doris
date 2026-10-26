@@ -488,6 +488,9 @@ CONF_Bool(enable_instance_update_watcher, "true");
 
 CONF_mBool(advance_txn_lazy_commit_during_reads, "true");
 CONF_mBool(wait_txn_lazy_commit_during_reads, "true");
+// Reject a compaction commit whose input version range holds more rowset meta keys than the job
+// declares as inputs: removing the range would delete a rowset the compaction never read.
+CONF_mBool(enable_compaction_commit_range_check, "true");
 
 // Whether to enable recycler. If false, the recycler will skip scanning instances to pending queue.
 CONF_mBool(enable_recycler, "true");

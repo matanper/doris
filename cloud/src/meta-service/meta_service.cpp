@@ -123,7 +123,9 @@ std::string get_instance_id(const std::shared_ptr<ResourceManager>& rc_mgr,
         if (config::enable_check_instance_id) {
             InstanceInfoPB instance;
             auto [code, msg] = rc_mgr->get_instance(nullptr, id, &instance);
-            { TEST_SYNC_POINT_CALLBACK("is_instance_id_registered", &code); }
+            {
+                TEST_SYNC_POINT_CALLBACK("is_instance_id_registered", &code);
+            }
             if (code == TxnErrorCode::TXN_KEY_NOT_FOUND) {
                 LOG(WARNING)
                         << "use degraded format cloud_unique_id, but instance is not registered, "
@@ -3320,6 +3322,9 @@ void MetaServiceImpl::get_rowset(::google::protobuf::RpcController* controller,
                     continue;
                 }
             }
+            // Reaching here with no pending txn means the partition version and the rowset keys
+            // below are read in one transaction with every committed txn already applied.
+            response->set_lazy_commit_resolved(first_txn_id < 0);
         }
 
         // TODO(plat1ko): Judge if tablet has been dropped (in dropped index/partition)
