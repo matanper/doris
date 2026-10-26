@@ -809,6 +809,17 @@ DECLARE_mString(jeprofile_dir);
 DECLARE_mBool(enable_je_purge_dirty_pages);
 // Jemalloc `arenas.dirty_decay_ms`, equal to `dirty_decay_ms` in JEMALLOC_CONF in be.conf.
 DECLARE_mInt32(je_dirty_decay_ms);
+// Jemalloc `dirty_decay_ms` of every arena while process memory exceeds the soft mem limit.
+// 0 purges each freed extent immediately on the freeing thread: madvise, TLB shootdown and a
+// re-fault on reuse, serialized on the arena's decay mutex, which stalls threads in free()
+// under heavy load. A positive value keeps purging off the freeing threads: jemalloc background
+// threads purge by decay, and the daemon also forces an `arena.<all>.decay` every
+// `memory_gc_sleep_time_ms`.
+DECLARE_mInt32(je_dirty_decay_ms_over_soft_limit);
+// Allocate RowsetMeta and Rowset objects, and the blocks of the file cache, from a jemalloc arena
+// of their own, apart from the short-lived objects of the same sizes that loads, compactions and
+// scans churn through, so those slabs empty out and are returned. Read once, on first use.
+DECLARE_Bool(enable_rowset_metadata_arena);
 
 // to forward compatibility, will be removed later
 DECLARE_mBool(enable_token_check);
@@ -1464,10 +1475,15 @@ DECLARE_Int32(inverted_index_read_buffer_size);
 DECLARE_Int32(max_depth_in_bkd_tree);
 // index compaction
 DECLARE_mBool(inverted_index_compaction_enable);
-// Merge the inverted indexes of VARIANT string sub-columns during compaction instead of
-// rebuilding them, when every input segment materializes the sub-column.
-DECLARE_mBool(enable_variant_subcolumn_index_compaction);
-DECLARE_mBool(enable_index_compaction_preload);
+// Index compaction also merges the inverted indexes of VARIANT typed subcolumns (field_pattern
+// indexes on typed paths) when every input segment has them, instead of the segment writers
+// tokenizing every value again.
+DECLARE_mBool(enable_variant_typed_path_index_compaction);
+DECLARE_mBool(enable_compaction_release_input_segments);
+// A compaction keeps each input segment it opened for the rest of the task, so that reading
+// the inputs once per column group opens every segment once.
+DECLARE_mBool(enable_compaction_pin_input_segments);
+DECLARE_mBool(enable_compaction_data_preload);
 DECLARE_mInt64(index_compaction_preload_chunk_bytes);
 // 0 sizes the pool from the compaction slots: max(64, 2 * compaction_task_num_per_fast_disk), since
 // its threads mostly wait on remote reads.
@@ -1520,6 +1536,10 @@ DECLARE_mInt32(variant_subcolumn_write_parallelism);
 DECLARE_mInt64(segment_write_task_min_bytes);
 // wheather index by RAM directory when base compaction
 DECLARE_mBool(inverted_index_ram_dir_enable_when_base_compaction);
+// Upper bound of the memory all index RAM directories together may hold, as bytes or as a
+// percentage of mem_limit. Past it, index files that are being written move to local disk, and
+// directories write their new files there. -1 means no bound.
+DECLARE_mString(inverted_index_ram_dir_max_memory);
 // use num_broadcast_buffer blocks as buffer to do broadcast
 DECLARE_Int32(num_broadcast_buffer);
 
@@ -1555,6 +1575,8 @@ DECLARE_mBool(enable_shrink_memory);
 DECLARE_Int32(segment_cache_capacity);
 DECLARE_Int32(segment_cache_fd_percentage);
 DECLARE_Int32(segment_cache_memory_percentage);
+DECLARE_mDouble(segment_cache_recharge_ratio);
+DECLARE_mInt64(segment_cache_recharge_min_bytes);
 DECLARE_Bool(enable_segment_cache_prune);
 
 DECLARE_mInt32(estimated_mem_per_column_reader);

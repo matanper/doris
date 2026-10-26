@@ -17,6 +17,9 @@
 
 #include "storage/segment/column_reader_cache.h"
 
+#include <algorithm>
+
+#include "runtime/memory/untracked_heap_account.h"
 #include "storage/segment/column_meta_accessor.h"
 #include "storage/segment/segment.h"
 #include "storage/segment/variant/variant_column_reader.h"
@@ -61,26 +64,45 @@ std::shared_ptr<ColumnReader> ColumnReaderCache::_lookup(const ColumnReaderCache
 }
 
 void ColumnReaderCache::_insert_locked_nocheck(const ColumnReaderCacheKey& key,
-                                               const std::shared_ptr<ColumnReader>& reader) {
+                                               const std::shared_ptr<ColumnReader>& reader,
+                                               int64_t bytes) {
     // If capacity exceeded, remove least recently used (tail)
     if (_cache_map.size() >= config::max_segment_partial_column_cache_size) {
         g_segment_column_reader_cache_count << -1;
         g_segment_column_cache_evict_count << 1;
         auto last_it = _lru_list.end();
         --last_it;
+        _node_bytes -= last_it->bytes;
         _cache_map.erase(last_it->key);
         _lru_list.pop_back();
     }
     g_segment_column_reader_cache_count << 1;
-    _lru_list.push_front(CacheNode {
-            .key = key, .reader = reader, .last_access = std::chrono::steady_clock::now()});
+    _lru_list.push_front(CacheNode {.key = key,
+                                    .reader = reader,
+                                    .last_access = std::chrono::steady_clock::now(),
+                                    .bytes = bytes});
+    _node_bytes += bytes;
     _cache_map[key] = _lru_list.begin();
 }
 
 void ColumnReaderCache::_insert_direct(const ColumnReaderCacheKey& key,
-                                       const std::shared_ptr<ColumnReader>& column_reader) {
+                                       const std::shared_ptr<ColumnReader>& column_reader,
+                                       int64_t bytes) {
     std::lock_guard<std::mutex> lock(_cache_mutex);
-    _insert_locked_nocheck(key, column_reader);
+    _insert_locked_nocheck(key, column_reader, bytes);
+}
+
+int64_t ColumnReaderCache::retained_bytes() {
+    std::lock_guard<std::mutex> lock(_cache_mutex);
+    int64_t bytes = _node_bytes;
+    for (const auto& node : _lru_list) {
+        // Only a whole column's reader can be a VARIANT reader; path readers are its leaves.
+        if (node.key.second.empty() && node.reader != nullptr &&
+            node.reader->get_meta_type() == FieldType::OLAP_FIELD_TYPE_VARIANT) {
+            bytes += static_cast<VariantColumnReader*>(node.reader.get())->external_meta_bytes();
+        }
+    }
+    return bytes;
 }
 
 std::map<int32_t, std::shared_ptr<ColumnReader>> ColumnReaderCache::get_available_readers(
@@ -126,6 +148,7 @@ Status ColumnReaderCache::get_column_reader(int32_t col_uid,
                               .tablet_schema = _tablet_schema};
 
     std::shared_ptr<ColumnReader> reader;
+    const int64_t allocated_before = thread_net_allocated_bytes();
     if ((FieldType)meta.type() == FieldType::OLAP_FIELD_TYPE_VARIANT) {
         // Variant root columns require VariantColumnReader, which encapsulates
         // subcolumn layout, sparse columns and external meta.
@@ -140,7 +163,8 @@ Status ColumnReaderCache::get_column_reader(int32_t col_uid,
         RETURN_IF_ERROR(ColumnReader::create(opts, meta, _num_rows, _file_reader, &reader));
     }
 
-    _insert_direct({col_uid, {}}, reader);
+    _insert_direct({col_uid, {}}, reader,
+                   std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before));
     *column_reader = std::move(reader);
     return Status::OK();
 }
@@ -185,6 +209,7 @@ Status ColumnReaderCache::get_path_column_reader(int32_t col_uid, PathInData rel
     // inline vs external meta details.
     std::shared_ptr<ColumnReader> path_reader;
     auto* vreader = static_cast<VariantColumnReader*>(variant_column_reader.get());
+    const int64_t allocated_before = thread_net_allocated_bytes();
     Status st = vreader->create_path_reader(relative_path, opts, _accessor, *footer_pb_shared,
                                             _file_reader, _num_rows, &path_reader, stats,
                                             source_io_ctx);
@@ -195,7 +220,8 @@ Status ColumnReaderCache::get_path_column_reader(int32_t col_uid, PathInData rel
     RETURN_IF_ERROR(st);
 
     // Cache and return
-    _insert_direct({col_uid, relative_path}, path_reader);
+    _insert_direct({col_uid, relative_path}, path_reader,
+                   std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before));
     *column_reader = std::move(path_reader);
     return Status::OK();
 }

@@ -77,9 +77,12 @@ public:
     // Holding all opened segments of a rowset.
     class CacheValue : public LRUCacheValueBase {
     public:
-        CacheValue(segment_v2::SegmentSharedPtr segment_) : segment(std::move(segment_)) {}
+        CacheValue(segment_v2::SegmentSharedPtr segment_);
+        ~CacheValue() override;
 
         const segment_v2::SegmentSharedPtr segment;
+        // The charge this entry was inserted with.
+        int64_t charge = 0;
     };
 
     SegmentCache(size_t memory_bytes_limit, size_t segment_num_limit)
@@ -100,6 +103,10 @@ public:
     void insert(const SegmentCache::CacheKey& key, CacheValue& value, SegmentCacheHandle* handle);
 
     void erase(const SegmentCache::CacheKey& key);
+
+    // True when a cached segment that holds `real_bytes` should be re-inserted in place of an
+    // entry charged with `charge`.
+    static bool needs_recharge(int64_t real_bytes, int64_t charge);
 };
 
 class SegmentLoader {

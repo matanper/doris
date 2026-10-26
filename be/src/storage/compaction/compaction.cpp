@@ -84,6 +84,7 @@
 #include "storage/rowset/rowset_meta.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
+#include "storage/segment/segment_loader.h"
 #include "storage/storage_engine.h"
 #include "storage/storage_policy.h"
 #include "storage/tablet/tablet.h"
@@ -183,12 +184,27 @@ Compaction::Compaction(BaseTabletSPtr tablet, const std::string& label)
 
 Compaction::~Compaction() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
+    if (config::enable_compaction_release_input_segments) {
+        release_input_segments(_input_rowsets);
+    }
     _output_rs_writer.reset();
     _tablet.reset();
     _input_rowsets.clear();
     _output_rowset.reset();
     _cur_tablet_schema.reset();
     _rowid_conversion.reset();
+}
+
+void Compaction::release_input_segments(const std::vector<RowsetSharedPtr>& input_rowsets) {
+    auto* loader = SegmentLoader::instance();
+    if (loader == nullptr) {
+        return;
+    }
+    for (const auto& rowset : input_rowsets) {
+        if (rowset != nullptr) {
+            loader->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        }
+    }
 }
 
 std::string Compaction::input_version_range_str() const {
@@ -499,7 +515,7 @@ Status CompactionMixin::do_compact_ordered_rowsets() {
                                 input_segment_rows.end());
     }
     // build output rowset
-    RowsetMetaSharedPtr rowset_meta = std::make_shared<RowsetMeta>();
+    RowsetMetaSharedPtr rowset_meta = RowsetMeta::create_shared();
     rowset_meta->set_num_rows(_input_row_num);
     rowset_meta->set_total_disk_size(_input_rowsets_data_size + _input_rowsets_index_size);
     rowset_meta->set_data_disk_size(_input_rowsets_data_size);
@@ -1357,6 +1373,13 @@ Status Compaction::do_inverted_index_compaction() {
             if (!st.ok()) {
                 error_handler(index_meta->index_id(), column_uniq_id);
                 return Status::Error<INVERTED_INDEX_COMPACTION_ERROR>(st.msg());
+            }
+            // The index file writers keep every merged index until the compaction finishes, so a
+            // merged index kept in memory would stay there for all the indexes merged after it.
+            for (auto* dir : dest_index_dirs) {
+                if (std::strcmp(dir->getObjectName(), DorisRAMFSDirectory::getClassName()) == 0) {
+                    static_cast<DorisRAMFSDirectory*>(dir)->move_files_to_disk();
+                }
             }
         } catch (CLuceneError& e) {
             error_handler(index_meta->index_id(), column_uniq_id);

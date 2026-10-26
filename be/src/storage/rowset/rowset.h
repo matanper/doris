@@ -119,6 +119,9 @@ private:
 
 class Rowset : public std::enable_shared_from_this<Rowset>, public MetadataAdder<Rowset> {
 public:
+    // Rowsets live as long as their RowsetMeta, so they share its arena, see MetadataArena.
+    DORIS_METADATA_ARENA_OPERATORS
+
     // Open all segment files in this rowset and load necessary metadata.
     // - `use_cache` : whether to use fd cache, only applicable to alpha rowset now
     //

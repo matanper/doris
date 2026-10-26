@@ -241,8 +241,10 @@ Status IndexFileWriter::begin_close() {
         RETURN_IF_ERROR(_index_storage_format->write());
         for (const auto& entry : _indices_dirs) {
             const auto& dir = entry.second;
-            // delete index path, which contains separated inverted index files
-            if (std::strcmp(dir->getObjectName(), "DorisFSDirectory") == 0) {
+            // delete index path, which contains separated inverted index files; a RAM directory
+            // deletes only the files it moved to disk
+            if (std::strcmp(dir->getObjectName(), "DorisFSDirectory") == 0 ||
+                std::strcmp(dir->getObjectName(), DorisRAMFSDirectory::getClassName()) == 0) {
                 auto* compound_dir = static_cast<DorisFSDirectory*>(dir.get());
                 compound_dir->deleteDirectory();
             }

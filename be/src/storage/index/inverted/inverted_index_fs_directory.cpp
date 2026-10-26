@@ -23,10 +23,14 @@
 #include "common/status.h"
 #include "io/fs/file_reader.h"
 #include "io/fs/file_writer.h"
+#include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/thread_context.h"
 #include "storage/index/inverted/inverted_index_common.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/tablet/tablet_schema.h"
 #include "util/debug_points.h"
+#include "util/mem_info.h"
+#include "util/parse_util.h"
 #include "util/slice.h"
 
 #ifdef _CL_HAVE_IO_H
@@ -51,12 +55,14 @@
 #include <CLucene/store/RAMDirectory.h>
 #include <CLucene/util/Misc.h>
 #include <assert.h>
+#include <bvar/reducer.h>
 #include <errno.h> // IWYU pragma: keep
 #include <glog/logging.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 
+#include <atomic>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
@@ -733,13 +739,237 @@ std::string DorisFSDirectory::toString() const {
     return std::string("DorisFSDirectory@") + this->directory;
 }
 
+namespace {
+
+bvar::Adder<int64_t> g_ram_dir_bytes("inverted_index_ram_dir", "bytes");
+std::atomic<int64_t> g_ram_dir_total_bytes {0};
+
+// A RAMOutputStream that reports each buffer its file gains to the directory, and moves the file
+// to local disk when the RAM directories reach their memory bound. RAMOutputStream allocates a
+// buffer only when a write reaches the end of the last one, so comparing the file's buffer count
+// after each write catches every allocation.
+class DorisRAMOutputStream final : public lucene::store::RAMOutputStream {
+public:
+    DorisRAMOutputStream(lucene::store::RAMFile* f, DorisRAMFSDirectory* dir)
+            : lucene::store::RAMOutputStream(f), _dir(dir) {}
+
+    ~DorisRAMOutputStream() override { _CLDELETE(_disk); }
+
+    void writeByte(uint8_t b) override {
+        if (_disk != nullptr) {
+            _disk->writeByte(b);
+            return;
+        }
+        lucene::store::RAMOutputStream::writeByte(b);
+        account();
+    }
+    void writeBytes(const uint8_t* b, int32_t len) override { writeBytes(b, len, 0); }
+    void writeBytes(const uint8_t* b, int32_t len, int32_t offset) override {
+        if (_disk != nullptr) {
+            _disk->writeBytes(b + offset, len);
+            return;
+        }
+        lucene::store::RAMOutputStream::writeBytes(b, len, offset);
+        account();
+    }
+    void seek(const int64_t pos) override {
+        if (_disk != nullptr) {
+            _disk->seek(pos);
+            return;
+        }
+        lucene::store::RAMOutputStream::seek(pos);
+        account();
+    }
+    int64_t getFilePointer() const override {
+        return _disk != nullptr ? _disk->getFilePointer()
+                                : lucene::store::RAMOutputStream::getFilePointer();
+    }
+    int64_t length() const override {
+        return _disk != nullptr ? _disk->length() : lucene::store::RAMOutputStream::length();
+    }
+    void flush() override {
+        if (_disk != nullptr) {
+            _disk->flush();
+            return;
+        }
+        lucene::store::RAMOutputStream::flush();
+    }
+    void close() override {
+        if (_disk != nullptr) {
+            _disk->close();
+            return;
+        }
+        lucene::store::RAMOutputStream::close();
+    }
+
+private:
+    void account() {
+        int32_t buffers = file->numBuffers();
+        if (buffers <= _accounted_buffers) {
+            return;
+        }
+        _dir->add_buffer_bytes(file, int64_t(buffers - _accounted_buffers) * BUFFER_SIZE);
+        // Checking the bound parses the config, so a file checks it once per 16 buffers.
+        bool check = buffers / 16 != _accounted_buffers / 16;
+        _accounted_buffers = buffers;
+        if (!check || DorisRAMFSDirectory::has_memory_budget()) {
+            return;
+        }
+        // The disk stream only appends, so a file moves only while it is written at its end.
+        lucene::store::RAMOutputStream::flush();
+        if (lucene::store::RAMOutputStream::getFilePointer() != file->getLength()) {
+            return;
+        }
+        _disk = _dir->spill_output(file);
+        if (_disk != nullptr) {
+            file = nullptr;
+        }
+    }
+
+    DorisRAMFSDirectory* _dir;
+    int32_t _accounted_buffers = 0;
+    lucene::store::IndexOutput* _disk = nullptr;
+};
+
+} // namespace
+
+int64_t DorisRAMFSDirectory::total_bytes() {
+    return g_ram_dir_total_bytes.load(std::memory_order_relaxed);
+}
+
+bool DorisRAMFSDirectory::has_memory_budget() {
+    bool is_percent = false;
+    int64_t limit = ParseUtil::parse_mem_spec(config::inverted_index_ram_dir_max_memory,
+                                              MemInfo::mem_limit(), MemInfo::physical_mem(),
+                                              &is_percent);
+    // parse_mem_spec reports "-1" as 0 and an invalid value as -1; both leave the bound off.
+    return limit <= 0 || total_bytes() < limit;
+}
+
+void DorisRAMFSDirectory::add_buffer_bytes(lucene::store::RAMFile* file, int64_t bytes) {
+    {
+        SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+        // RAMFile maintains sizeInBytes only for files of a RAMDirectory; this directory keeps
+        // it so that dropping a file releases exactly what its buffers added.
+        file->sizeInBytes += bytes;
+        sizeInBytes += bytes;
+    }
+    g_ram_dir_total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    g_ram_dir_bytes << bytes;
+    if (_mem_tracker) {
+        _mem_tracker->consume(bytes);
+    }
+}
+
+void DorisRAMFSDirectory::release_file_bytes(lucene::store::RAMFile* file) {
+    int64_t bytes = file->sizeInBytes;
+    if (bytes == 0) {
+        return;
+    }
+    file->sizeInBytes = 0;
+    sizeInBytes -= bytes;
+    g_ram_dir_total_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    g_ram_dir_bytes << -bytes;
+    if (_mem_tracker) {
+        _mem_tracker->release(bytes);
+    }
+}
+
+lucene::store::IndexOutput* DorisRAMFSDirectory::spill_output(lucene::store::RAMFile* file) {
+    std::lock_guard<std::mutex> wlock(_this_lock);
+    auto itr = filesMap->begin();
+    while (itr != filesMap->end() && itr->second != file) {
+        ++itr;
+    }
+    if (itr == filesMap->end()) {
+        return nullptr;
+    }
+    std::string name = itr->first;
+    prepare_disk();
+    lucene::store::IndexOutput* out = DorisFSDirectory::createOutput(name.c_str());
+    int64_t remaining = file->getLength();
+    for (int32_t i = 0; remaining > 0; ++i) {
+        auto len = static_cast<int32_t>(
+                std::min<int64_t>(remaining, lucene::store::RAMOutputStream::BUFFER_SIZE));
+        out->writeBytes(file->getBuffer(i), len);
+        remaining -= len;
+    }
+    {
+        SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+        release_file_bytes(file);
+        filesMap->removeitr(itr);
+    }
+    _disk_files.insert(name);
+    VLOG_DEBUG << "RAM directories reached inverted_index_ram_dir_max_memory, moved " << name
+               << " of " << directory << " to local disk";
+    return out;
+}
+
+void DorisRAMFSDirectory::move_files_to_disk() {
+    std::lock_guard<std::mutex> wlock(_this_lock);
+    if (filesMap->empty()) {
+        return;
+    }
+    prepare_disk();
+    for (auto& [name, file] : *filesMap) {
+        std::unique_ptr<lucene::store::IndexOutput> out(DorisFSDirectory::createOutput(name));
+        int64_t remaining = file->getLength();
+        for (int32_t i = 0; remaining > 0; ++i) {
+            auto len = static_cast<int32_t>(
+                    std::min<int64_t>(remaining, lucene::store::RAMOutputStream::BUFFER_SIZE));
+            out->writeBytes(file->getBuffer(i), len);
+            remaining -= len;
+        }
+        out->close();
+        _disk_files.insert(name);
+    }
+    SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+    for (auto& [name, file] : *filesMap) {
+        release_file_bytes(file);
+    }
+    filesMap->clear();
+}
+
+bool DorisRAMFSDirectory::spilled() const {
+    std::lock_guard<std::mutex> wlock(_this_lock);
+    return _spilled;
+}
+
+void DorisRAMFSDirectory::prepare_disk() {
+    if (_spilled) {
+        return;
+    }
+    bool exists = false;
+    auto st = _fs->exists(directory, &exists);
+    LOG_AND_THROW_IF_ERROR(st, "Get directory exists IO error");
+    if (!exists) {
+        st = _fs->create_directory(directory);
+        LOG_AND_THROW_IF_ERROR(st, "Get directory create directory IO error");
+    }
+    _spilled = true;
+}
+
+bool DorisRAMFSDirectory::on_disk(const char* name) const {
+    return _spilled && _disk_files.contains(name);
+}
+
 DorisRAMFSDirectory::DorisRAMFSDirectory() {
     filesMap = _CLNEW FileMap(true, true);
     this->sizeInBytes = 0;
+    // The buffers belong to the task that writes the index, such as a compaction or a load.
+    if (doris::pthread_context_ptr_init || bthread_self() != 0) {
+        _mem_tracker = thread_context()->thread_mem_tracker_mgr->limiter_mem_tracker_sptr();
+    }
 }
 
 DorisRAMFSDirectory::~DorisRAMFSDirectory() {
     std::lock_guard<std::mutex> wlock(_this_lock);
+    {
+        SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+        for (auto& [name, file] : *filesMap) {
+            release_file_bytes(file);
+        }
+    }
     filesMap->clear();
     _CLDELETE(lockFactory);
     _CLDELETE(filesMap);
@@ -760,17 +990,21 @@ bool DorisRAMFSDirectory::list(std::vector<std::string>* names) const {
         names->emplace_back(itr->first);
         ++itr;
     }
+    names->insert(names->end(), _disk_files.begin(), _disk_files.end());
     return true;
 }
 
 bool DorisRAMFSDirectory::fileExists(const char* name) const {
     std::lock_guard<std::mutex> wlock(_this_lock);
-    return filesMap->exists(name);
+    return filesMap->exists(name) || on_disk(name);
 }
 
 int64_t DorisRAMFSDirectory::fileModified(const char* name) const {
     std::lock_guard<std::mutex> wlock(_this_lock);
     auto* f = filesMap->get(name);
+    if (f == nullptr && on_disk(name)) {
+        return DorisFSDirectory::fileModified(name);
+    }
     DBUG_EXECUTE_IF("DorisRAMFSDirectory::fileModified_file_not_found", { f = nullptr; })
     if (f == nullptr) {
         _CLTHROWA(CL_ERR_IO, fmt::format("NOT FOUND File {}.", name).c_str());
@@ -783,6 +1017,10 @@ void DorisRAMFSDirectory::touchFile(const char* name) {
     {
         std::lock_guard<std::mutex> wlock(_this_lock);
         file = filesMap->get(name);
+        if (file == nullptr && on_disk(name)) {
+            DorisFSDirectory::touchFile(name);
+            return;
+        }
         DBUG_EXECUTE_IF("DorisRAMFSDirectory::touchFile_file_not_found", { file = nullptr; })
         if (file == nullptr) {
             _CLTHROWA(CL_ERR_IO, fmt::format("NOT FOUND File {}.", name).c_str());
@@ -803,6 +1041,9 @@ void DorisRAMFSDirectory::touchFile(const char* name) {
 int64_t DorisRAMFSDirectory::fileLength(const char* name) const {
     std::lock_guard<std::mutex> wlock(_this_lock);
     auto* f = filesMap->get(name);
+    if (f == nullptr && on_disk(name)) {
+        return DorisFSDirectory::fileLength(name);
+    }
     DBUG_EXECUTE_IF("DorisRAMFSDirectory::fileLength_file_not_found", { f = nullptr; })
     if (f == nullptr) {
         _CLTHROWA(CL_ERR_IO, fmt::format("NOT FOUND File {}.", name).c_str());
@@ -814,6 +1055,9 @@ bool DorisRAMFSDirectory::openInput(const char* name, lucene::store::IndexInput*
                                     CLuceneError& error, int32_t bufferSize) {
     std::lock_guard<std::mutex> wlock(_this_lock);
     auto* file = filesMap->get(name);
+    if (file == nullptr && on_disk(name)) {
+        return DorisFSDirectory::openInput(name, ret, error, bufferSize);
+    }
     DBUG_EXECUTE_IF("DorisRAMFSDirectory::openInput_file_not_found", { file = nullptr; })
     if (file == nullptr) {
         error.set(CL_ERR_IO,
@@ -835,20 +1079,44 @@ bool DorisRAMFSDirectory::doDeleteFile(const char* name) {
     auto itr = filesMap->find(name);
     if (itr != filesMap->end()) {
         SCOPED_LOCK_MUTEX(this->THIS_LOCK);
-        sizeInBytes -= itr->second->sizeInBytes;
+        release_file_bytes(itr->second);
         filesMap->removeitr(itr);
+    } else if (on_disk(name)) {
+        _disk_files.erase(name);
+        return DorisFSDirectory::doDeleteFile(name);
     }
     return true;
 }
 
 bool DorisRAMFSDirectory::deleteDirectory() {
-    // do nothing, RAM dir do not have actual files
+    // Only files moved to local disk have a path to delete.
+    if (spilled()) {
+        return DorisFSDirectory::deleteDirectory();
+    }
     return true;
 }
 
 void DorisRAMFSDirectory::renameFile(const char* from, const char* to) {
-    std::lock_guard<std::mutex> wlock(_this_lock);
+    std::unique_lock<std::mutex> wlock(_this_lock);
     auto itr = filesMap->find(from);
+    if (itr == filesMap->end() && on_disk(from)) {
+        if (filesMap->exists(to)) {
+            auto to_itr = filesMap->find(to);
+            SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+            release_file_bytes(to_itr->second);
+            filesMap->removeitr(to_itr);
+        }
+        _disk_files.erase(from);
+        _disk_files.insert(to);
+        // DorisFSDirectory::renameFile takes _this_lock itself.
+        wlock.unlock();
+        DorisFSDirectory::renameFile(from, to);
+        return;
+    }
+    if (on_disk(to)) {
+        _disk_files.erase(to);
+        DorisFSDirectory::doDeleteFile(to);
+    }
 
     /* DSR:CL_BUG_LEAK:
     ** If a file named $to already existed, its old value was leaked.
@@ -858,7 +1126,7 @@ void DorisRAMFSDirectory::renameFile(const char* from, const char* to) {
     if (filesMap->exists(to)) {
         auto itr1 = filesMap->find(to);
         SCOPED_LOCK_MUTEX(this->THIS_LOCK);
-        sizeInBytes -= itr1->second->sizeInBytes;
+        release_file_bytes(itr1->second);
         filesMap->removeitr(itr1);
     }
     DBUG_EXECUTE_IF("DorisRAMFSDirectory::renameFile_itr_filesMap_end", { itr = filesMap->end(); })
@@ -881,6 +1149,20 @@ lucene::store::IndexOutput* DorisRAMFSDirectory::createOutput(const char* name) 
     ** to $files. */
     std::lock_guard<std::mutex> wlock(_this_lock);
 
+    // After the directory moved a file to disk, or while the RAM directories are at their memory
+    // bound, new files go to disk.
+    if (_spilled || !has_memory_budget()) {
+        auto old = filesMap->find(name);
+        if (old != filesMap->end()) {
+            SCOPED_LOCK_MUTEX(this->THIS_LOCK);
+            release_file_bytes(old->second);
+            filesMap->removeitr(old);
+        }
+        prepare_disk();
+        _disk_files.insert(name);
+        return DorisFSDirectory::createOutput(name);
+    }
+
     // get the actual pointer to the output name
     const char* n = nullptr;
     auto itr = filesMap->find(name);
@@ -890,7 +1172,7 @@ lucene::store::IndexOutput* DorisRAMFSDirectory::createOutput(const char* name) 
         n = itr->first;
         lucene::store::RAMFile* rf = itr->second;
         SCOPED_LOCK_MUTEX(this->THIS_LOCK);
-        sizeInBytes -= rf->sizeInBytes;
+        release_file_bytes(rf);
         _CLDELETE(rf);
     } else {
         n = STRDUP_AtoA(name);
@@ -899,7 +1181,7 @@ lucene::store::IndexOutput* DorisRAMFSDirectory::createOutput(const char* name) 
     auto* file = _CLNEW lucene::store::RAMFile();
     (*filesMap)[n] = file;
 
-    return _CLNEW lucene::store::RAMOutputStream(file);
+    return _CLNEW DorisRAMOutputStream(file, this);
 }
 
 std::string DorisRAMFSDirectory::toString() const {
@@ -928,7 +1210,8 @@ DorisFSDirectory* DorisFSDirectoryFactory::getDirectory(const io::FileSystemSPtr
     // Write by RAM directory
     // 1. only write separated index files, which is can_use_ram_dir = true.
     // 2. config::inverted_index_ram_dir_enable = true
-    if (config::inverted_index_ram_dir_enable && can_use_ram_dir) {
+    if (config::inverted_index_ram_dir_enable && can_use_ram_dir &&
+        DorisRAMFSDirectory::has_memory_budget()) {
         dir = _CLNEW DorisRAMFSDirectory();
     } else {
         bool exists = false;

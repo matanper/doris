@@ -19,6 +19,7 @@
 #include <gen_cpp/Descriptors_types.h>
 #include <gen_cpp/Types_types.h>
 #include <gen_cpp/internal_service.pb.h>
+#include <bvar/bvar.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
 #include <stdlib.h>
@@ -51,7 +52,11 @@
 #include "storage/options.h"
 #include "storage/rowset/beta_rowset.h"
 #include "storage/schema.h"
+#include "storage/segment/column_reader_cache.h"
+#include "storage/segment/lazy_init_segment_iterator.h"
 #include "storage/segment/segment.h"
+#include "storage/cache/page_cache.h"
+#include "storage/compaction/compaction.h"
 #include "storage/segment/segment_loader.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
@@ -374,6 +379,184 @@ TEST_F(SegmentCacheTest, vec_sequence_col) {
     // get the value from sequence column
     auto seq_v = read_block.get_by_position(4).column->get_int(0);
     ASSERT_EQ(100, seq_v);
+
+    // A compaction that read the rowset drops its segments from the segment cache when it ends,
+    // and the cache counts them by the kind of reader that loaded them.
+    {
+        auto loaded_by_compaction = []() {
+            return std::stoll(bvar::Variable::describe_exposed(
+                    "segment_cache_loaded_segments_by_compaction"));
+        };
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        const int64_t before = loaded_by_compaction();
+        io::IOContext io_ctx;
+        io_ctx.reader_type = ReaderType::READER_CUMULATIVE_COMPACTION;
+        {
+            SegmentCacheHandle compaction_handle;
+            ASSERT_TRUE(SegmentLoader::instance()
+                                ->load_segments(rowset_ptr, &compaction_handle, true, false,
+                                                nullptr, &io_ctx)
+                                .ok());
+            EXPECT_EQ(loaded_by_compaction(), before + 1);
+            Compaction::release_input_segments({rowset});
+            SegmentCacheHandle probe;
+            EXPECT_FALSE(SegmentLoader::instance()->_segment_cache->lookup(
+                    SegmentCache::CacheKey(rowset->rowset_id(), 0), &probe));
+            // Still held by the reader.
+            EXPECT_EQ(loaded_by_compaction(), before + 1);
+        }
+        segments.clear();
+        iter.reset();
+        EXPECT_EQ(loaded_by_compaction(), before);
+    }
+
+    // The cache charges a segment with the bytes it really holds, re-charges it on a hit once
+    // that has grown past the charge, and evicts by that charge.
+    {
+        auto charged = []() {
+            return std::stoll(bvar::Variable::describe_exposed("segment_cache_charged_bytes"));
+        };
+        // The suite's segment loader is too small to cache anything; give it room.
+        auto* lru = SegmentLoader::instance()->_segment_cache->_cache.get();
+        const size_t old_capacity = lru->get_capacity();
+        lru->set_capacity(64 << 20);
+        const double old_ratio = config::segment_cache_recharge_ratio;
+        const int64_t old_min_bytes = config::segment_cache_recharge_min_bytes;
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        const int64_t base = charged();
+
+        segment_v2::SegmentSharedPtr seg;
+        int64_t first_charge = 0;
+        {
+            SegmentCacheHandle first;
+            ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &first, true).ok());
+            seg = first.get_segments()[0];
+            first_charge = seg->cache_charge();
+            EXPECT_GE(seg->real_mem_usage(), seg->meta_mem_usage());
+            EXPECT_EQ(first_charge, std::max<int64_t>(seg->real_mem_usage(), 1));
+            EXPECT_EQ(charged(), base + first_charge);
+
+            // Reading parses the column meta and creates the column readers.
+            OlapReaderStatistics seg_stats;
+            StorageReadOptions seg_opts;
+            seg_opts.stats = &seg_stats;
+            seg_opts.tablet_schema = rowset->tablet_schema();
+            std::unique_ptr<RowwiseIterator> seg_iter;
+            ASSERT_TRUE(seg->new_iterator(schema, seg_opts, &seg_iter).ok());
+            auto seg_block = rowset->tablet_schema()->create_block();
+            ASSERT_TRUE(seg_iter->next_batch(&seg_block).ok());
+            EXPECT_GT(seg->_column_meta_bytes.load(), 0);
+            EXPECT_GT(seg->_column_reader_cache->retained_bytes(), 0);
+            EXPECT_GT(seg->real_mem_usage(), first_charge);
+            EXPECT_EQ(seg->real_mem_usage(), seg->meta_mem_usage() +
+                                                     seg->_column_meta_bytes.load() +
+                                                     seg->_column_reader_cache->retained_bytes());
+
+            // Growth inside the default slack is not re-charged.
+            config::segment_cache_recharge_ratio = 1.0;
+            config::segment_cache_recharge_min_bytes = seg->real_mem_usage();
+            {
+                SegmentCacheHandle hit;
+                ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &hit, true).ok());
+                EXPECT_EQ(hit.get_segments()[0].get(), seg.get());
+            }
+            EXPECT_EQ(seg->cache_charge(), first_charge);
+            EXPECT_EQ(charged(), base + first_charge);
+
+            // Past it, the hit re-inserts the segment with its real bytes.
+            config::segment_cache_recharge_min_bytes = 0;
+            {
+                SegmentCacheHandle hit;
+                ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &hit, true).ok());
+                EXPECT_EQ(hit.get_segments()[0].get(), seg.get());
+            }
+            EXPECT_EQ(seg->cache_charge(), seg->real_mem_usage());
+            // A handle keeps the segment, not the cache entry, so the replaced entry is gone.
+            EXPECT_EQ(charged(), base + seg->cache_charge());
+        }
+        EXPECT_EQ(charged(), base + seg->cache_charge());
+        config::segment_cache_recharge_ratio = old_ratio;
+        config::segment_cache_recharge_min_bytes = old_min_bytes;
+
+        // A per-shard cap that fits the open-time charge but not the real one evicts the segment.
+        const size_t per_shard = first_charge + 512;
+        ASSERT_GT(seg->cache_charge(), static_cast<int64_t>(per_shard));
+        lru->set_capacity(per_shard * 64);
+        SegmentCacheHandle probe;
+        EXPECT_FALSE(SegmentLoader::instance()->_segment_cache->lookup(
+                SegmentCache::CacheKey(rowset->rowset_id(), 0), &probe));
+        EXPECT_EQ(charged(), base);
+        lru->set_capacity(old_capacity);
+    }
+
+    // Segment iterators that share a reader's pins open each segment once, even when the cache
+    // drops it between them, as a compaction's column groups do.
+    {
+        auto counter = [](const char* name) {
+            return std::stoll(bvar::Variable::describe_exposed(name));
+        };
+        StorageReadOptions pin_opts;
+        OlapReaderStatistics pin_stats;
+        pin_opts.stats = &pin_stats;
+        pin_opts.tablet_schema = rowset->tablet_schema();
+        pin_opts.io_ctx.reader_type = ReaderType::READER_CUMULATIVE_COMPACTION;
+        auto read_one = [&](std::shared_ptr<segment_v2::PinnedSegments> pins) {
+            SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+            segment_v2::LazyInitSegmentIterator it(rowset_ptr, 0, true, schema, pin_opts,
+                                                   std::move(pins));
+            ASSERT_TRUE(it.init(pin_opts).ok());
+            auto pin_block = rowset->tablet_schema()->create_block();
+            ASSERT_TRUE(it.next_batch(&pin_block).ok());
+            EXPECT_EQ(1, pin_block.rows());
+        };
+        const int64_t loads = counter("segment_loads_by_compaction");
+        const int64_t lookups = counter("segment_cache_lookups_by_compaction");
+        const int64_t reuses = counter("segment_pinned_reuses");
+
+        auto pins = std::make_shared<segment_v2::PinnedSegments>();
+        read_one(pins);
+        read_one(pins);
+        read_one(pins);
+        EXPECT_EQ(counter("segment_loads_by_compaction"), loads + 1);
+        EXPECT_EQ(counter("segment_cache_lookups_by_compaction"), lookups + 1);
+        EXPECT_EQ(counter("segment_pinned_reuses"), reuses + 2);
+        ASSERT_EQ(pins->segments.size(), 1);
+
+        // Without pins every iterator opens the segment again.
+        read_one(nullptr);
+        read_one(nullptr);
+        EXPECT_EQ(counter("segment_loads_by_compaction"), loads + 3);
+        EXPECT_EQ(counter("segment_pinned_reuses"), reuses + 2);
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+    }
+
+    // Erasing a rowset's segments can drop their cached footers too.
+    {
+        auto* lru = SegmentLoader::instance()->_segment_cache->_cache.get();
+        const size_t old_capacity = lru->get_capacity();
+        lru->set_capacity(64 << 20);
+        auto* footer_cache = ExecEnv::GetInstance()->get_storage_page_cache();
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        SegmentCacheHandle cached;
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &cached, true).ok());
+        auto seg = cached.get_segments()[0];
+        std::shared_ptr<segment_v2::SegmentFooterPB> footer;
+        ASSERT_TRUE(seg->_get_segment_footer(footer, nullptr).ok());
+        const auto footer_key = seg->get_segment_footer_cache_key();
+        PageCacheHandle page;
+        EXPECT_TRUE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE));
+
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        EXPECT_TRUE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE))
+                << "kept unless asked";
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &cached, true).ok());
+        SegmentCacheHandle again;
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &again, true).ok());
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments(),
+                                                  true);
+        EXPECT_FALSE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE));
+        lru->set_capacity(old_capacity);
+    }
 
     res = engine_ref->tablet_manager()->drop_tablet(request.tablet_id, request.replica_id, false);
     ASSERT_TRUE(res.ok());
