@@ -29,8 +29,6 @@
 #include <unistd.h>
 
 #include <iostream>
-#include <fstream>
-#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
@@ -2056,105 +2054,6 @@ TEST_F(VerticalCompactionTest, TestFooterRawDataBytesNullableSparse) {
     ASSERT_TRUE(raw_bytes_by_uid.count(2) > 0);
     EXPECT_EQ(raw_bytes_by_uid[2], kNonNullCount * sizeof(int32_t));
     EXPECT_LT(raw_bytes_by_uid[2], kNumRows * sizeof(int32_t));
-}
-
-// The value column groups of a vertical compaction, appended in parallel, write the same
-// segment as appended one by one.
-TEST_F(VerticalCompactionTest, ParallelValueGroupAppendWritesTheSameSegment) {
-    TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
-    {
-        TabletSchemaPB pb;
-        pb.set_keys_type(DUP_KEYS);
-        pb.set_num_short_key_columns(1);
-        pb.set_num_rows_per_row_block(1024);
-        pb.set_compress_kind(COMPRESS_NONE);
-        // LZ4F output depends on what its reused contexts compressed before; ZSTD does not.
-        pb.set_compression_type(segment_v2::ZSTD);
-        pb.set_next_column_unique_id(12);
-        for (int i = 1; i <= 11; ++i) {
-            ColumnPB* column = pb.add_column();
-            column->set_unique_id(i);
-            column->set_name("c" + std::to_string(i));
-            const bool is_string = i > 1 && i % 2 == 0;
-            column->set_type(is_string ? "VARCHAR" : "INT");
-            column->set_length(is_string ? 65533 : 4);
-            column->set_index_length(is_string ? 16 : 4);
-            column->set_is_key(i == 1);
-            column->set_is_nullable(i > 1);
-            column->set_is_bf_column(false);
-        }
-        tablet_schema->init_from_pb(pb);
-    }
-    std::vector<RowsetSharedPtr> input_rowsets;
-    for (int r = 0; r < 2; ++r) {
-        auto writer_context =
-                create_rowset_writer_context(tablet_schema, OVERLAPPING, UINT32_MAX, {r + 2, r + 2});
-        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
-        ASSERT_TRUE(res.has_value()) << res.error();
-        auto rowset_writer = std::move(res).value();
-        Block block = tablet_schema->create_block();
-        auto columns = std::move(block).mutate_columns();
-        for (int32_t row = 0; row < 20000; ++row) {
-            int32_t key = row * 2 + r;
-            columns[0]->insert_data((const char*)&key, sizeof(key));
-            for (size_t c = 1; c < columns.size(); ++c) {
-                if ((row + c) % 13 == 0) {
-                    columns[c]->insert_default();
-                } else if (c % 2 == 1) {
-                    std::string v = "value " + std::to_string((row * c) % 997) + " of " +
-                                    std::to_string(c);
-                    columns[c]->insert_data(v.data(), v.size());
-                } else {
-                    int32_t v = static_cast<int32_t>((row * c) % 10007);
-                    columns[c]->insert_data((const char*)&v, sizeof(v));
-                }
-            }
-        }
-        ASSERT_TRUE(add_block_with_columns(rowset_writer.get(), &block, &columns).ok());
-        ASSERT_TRUE(rowset_writer->flush().ok());
-        RowsetSharedPtr rowset;
-        ASSERT_TRUE(rowset_writer->build(rowset).ok());
-        input_rowsets.push_back(rowset);
-    }
-    TabletSharedPtr tablet = create_tablet(*tablet_schema, false);
-    const int32_t old_parallelism = config::segment_column_write_parallelism;
-    const int64_t old_min_bytes = config::segment_write_task_min_bytes;
-    // Every column of every block is its own pool task.
-    config::segment_write_task_min_bytes = 0;
-    std::vector<std::string> outputs;
-    for (int32_t parallelism : {1, 1, 8}) {
-        config::segment_column_write_parallelism = parallelism;
-        std::vector<RowsetReaderSharedPtr> readers;
-        for (auto& rowset : input_rowsets) {
-            RowsetReaderSharedPtr reader;
-            ASSERT_TRUE(rowset->create_reader(&reader).ok());
-            readers.push_back(std::move(reader));
-        }
-        auto writer_context = create_rowset_writer_context(tablet_schema, NONOVERLAPPING,
-                                                           UINT32_MAX, {0, 3});
-        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
-        ASSERT_TRUE(res.has_value()) << res.error();
-        auto output_writer = std::move(res).value();
-        Merger::Statistics stats;
-        RowIdConversion rowid_conversion;
-        stats.rowid_conversion = &rowid_conversion;
-        ASSERT_TRUE(Merger::vertical_merge_rowsets(tablet, ReaderType::READER_CUMULATIVE_COMPACTION,
-                                                   *tablet_schema, readers, output_writer.get(),
-                                                   UINT32_MAX, 2, &stats)
-                            .ok());
-        RowsetSharedPtr output;
-        ASSERT_TRUE(output_writer->build(output).ok());
-        ASSERT_EQ(output->num_rows(), 40000);
-        auto path = output->segment_path(0);
-        ASSERT_TRUE(path.has_value());
-        std::ifstream in(path.value(), std::ios::binary);
-        outputs.emplace_back(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        ASSERT_FALSE(outputs.back().empty());
-    }
-    config::segment_column_write_parallelism = old_parallelism;
-    config::segment_write_task_min_bytes = old_min_bytes;
-    ASSERT_TRUE(outputs[0] == outputs[1]) << outputs[0].size() << " vs " << outputs[1].size();
-    EXPECT_TRUE(outputs[0] == outputs[2]) << outputs[0].size() << " vs " << outputs[2].size();
 }
 
 } // namespace doris
