@@ -122,6 +122,16 @@ DECLARE_Int32(arrow_flight_sql_port);
 // Validate Arrow input buffers in opted-in Arrow readers before converting them to Doris columns.
 DECLARE_Bool(enable_arrow_input_validation);
 
+// Read an Arrow stream load one record batch at a time and return blocks of at most
+// arrow_stream_load_block_rows rows, instead of decoding the whole stream into one block.
+DECLARE_mBool(enable_arrow_stream_load_streaming_read);
+// Row cap of one block from the Arrow stream load reader. <= 0 uses the load's batch_size.
+DECLARE_mInt32(arrow_stream_load_block_rows);
+// Decompress an Arrow stream load's IPC buffers on the scanner thread itself. Arrow's default
+// fans every record batch's buffer decompression out to its single process-wide CPU pool, whose
+// one mutex and condition variable serialize hundreds of concurrent loads.
+DECLARE_mBool(arrow_stream_load_decompress_inline);
+
 // port for cdc client scan oltp cdc data
 DECLARE_Int32(cdc_client_port);
 
@@ -1640,6 +1650,11 @@ DECLARE_mBool(variant_enable_duplicate_json_path_check);
 // stable scalar leaves straight into the typed path column. The output is identical either way;
 // false selects the general per-value path, kept for A/B measurement and as a fallback.
 DECLARE_mBool(variant_v2_shredder_fast_path);
+// Variant V2 JSON encoder (Stream Load, Arrow, CAST): skip the second UTF-8 scan of strings the
+// JSON parser already validated, and seed object key hints from the same path in the previous row
+// instead of the same pre-order ordinal. The encoded bytes are identical either way; false selects
+// the general path, kept for A/B measurement and as a fallback. Read when an encoder is created.
+DECLARE_mBool(variant_v2_json_encoder_fast_path);
 // Controls storage-layer parse target for plain non-doc VARIANT columns:
 // 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
 DECLARE_mInt32(variant_storage_parse_mode);
