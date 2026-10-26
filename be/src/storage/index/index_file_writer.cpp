@@ -33,7 +33,6 @@
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/inverted/inverted_index_reader.h"
-#include "storage/index/index_writer.h"
 #include "storage/tablet/tablet_schema.h"
 
 namespace doris::segment_v2 {
@@ -54,8 +53,6 @@ IndexFileWriter::IndexFileWriter(io::FileSystemSPtr fs, std::string index_path_p
           _tablet_id(tablet_id) {
     auto tmp_file_dir = ExecEnv::GetInstance()->get_tmp_file_dirs()->get_tmp_file_dir();
     _tmp_dir = tmp_file_dir.native();
-    _tmp_prefix = fmt::format("{}_{}_", _rowset_id, _seg_id);
-    IndexTmpRegistry::instance().add(_tmp_prefix);
     if (_storage_format == InvertedIndexStorageFormatPB::V1) {
         _index_storage_format = std::make_unique<IndexStorageFormatV1>(this);
     } else {
@@ -83,22 +80,6 @@ Status IndexFileWriter::_insert_directory_into_map(int64_t index_id,
         return Status::InternalError("IndexFileWriter::open attempted to insert a duplicate dir");
     }
     return Status::OK();
-}
-
-IndexFileWriter::~IndexFileWriter() {
-    if (!_tmp_dirs_deleted) {
-        // A writer that never closed successfully, as when its load or compaction failed or was
-        // cancelled, leaves its index dirs in the tmp dir; nothing else would remove them.
-        for (const auto& [key, dir] : _indices_dirs) {
-            const auto path = InvertedIndexDescriptor::get_temporary_index_path(
-                    _tmp_dir, _rowset_id, _seg_id, key.first, key.second);
-            auto st = _local_fs->delete_directory(path);
-            if (!st.ok() && !st.is<ErrorCode::NOT_FOUND>()) {
-                LOG(WARNING) << "failed to delete index tmp dir " << path << ": " << st;
-            }
-        }
-    }
-    IndexTmpRegistry::instance().remove(_tmp_prefix);
 }
 
 Result<std::shared_ptr<DorisFSDirectory>> IndexFileWriter::open(const TabletIndex* index_meta) {
@@ -249,7 +230,6 @@ Status IndexFileWriter::begin_close() {
                 compound_dir->deleteDirectory();
             }
         }
-        _tmp_dirs_deleted = true;
     } catch (CLuceneError& err) {
         if (_storage_format == InvertedIndexStorageFormatPB::V1) {
             return Status::Error<ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(

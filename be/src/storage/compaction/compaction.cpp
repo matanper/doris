@@ -16,10 +16,6 @@
 // under the License.
 
 #include "storage/compaction/compaction.h"
-#include "storage/index/index_writer.h"
-#include "storage/index/inverted/analyzer/analyzer.h"
-#include "storage/index/inverted/index_bitmap_util.h"
-#include "storage/index/inverted/inverted_index_parser.h"
 
 #include <bvar/bvar.h>
 #include <fmt/format.h>
@@ -1285,11 +1281,6 @@ Status Compaction::do_inverted_index_compaction() {
     // use tmp file dir to store index files
     auto tmp_file_dir = ExecEnv::GetInstance()->get_tmp_file_dirs()->get_tmp_file_dir();
     auto index_tmp_path = tmp_file_dir / dest_rowset_id.to_string();
-    ScopedIndexTmpPrefix index_tmp_prefix(dest_rowset_id.to_string());
-    // The merge workspace is deleted on success by compact_column; a failed merge leaves it.
-    Defer delete_index_tmp_path {[&index_tmp_path]() {
-        static_cast<void>(io::global_local_filesystem()->delete_directory(index_tmp_path));
-    }};
     LOG(INFO) << "start index compaction"
               << ". tablet=" << _tablet->tablet_id() << ", source index size=" << src_segment_num
               << ", destination index size=" << dest_segment_num << ".";

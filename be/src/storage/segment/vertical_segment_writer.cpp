@@ -55,8 +55,6 @@
 #include "service/point_query_executor.h"
 #include "storage/data_dir.h"
 #include "storage/index/index_file_writer.h"
-#include "storage/index/index_finish_batch.h"
-#include "storage/segment/segment_write_tasks.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/primary_key_index.h"
@@ -1516,13 +1514,10 @@ Status VerticalSegmentWriter::_write_zone_map() {
 }
 
 Status VerticalSegmentWriter::_write_inverted_index() {
-    IndexFinishBatch batch(_opts.write_type == DataWriteType::TYPE_COMPACTION
-                                   ? IndexFinishLane::COMPACTION
-                                   : IndexFinishLane::LOAD);
     for (auto& column_writer : _column_writers) {
         RETURN_IF_ERROR(column_writer->write_inverted_index());
     }
-    return batch.run();
+    return Status::OK();
 }
 
 Status VerticalSegmentWriter::_write_ann_index() {

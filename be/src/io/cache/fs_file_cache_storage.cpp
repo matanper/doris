@@ -61,13 +61,6 @@
 
 namespace doris::io {
 
-namespace {
-// The directory index_tmp_file_dirs may put inside a cache path; no walk of the cache touches it.
-bool is_index_tmp_dir(const std::filesystem::path& path) {
-    return path.filename().native() == FILE_CACHE_INDEX_TMP_DIR_NAME;
-}
-} // namespace
-
 #ifdef BE_TEST
 namespace {
 FSFileCacheStorage::InodeEstimationTestHooks* g_inode_estimation_hooks = nullptr;
@@ -593,7 +586,7 @@ void FSFileCacheStorage::remove_old_version_directories() {
     for (; path_itr != file_list.end(); ++path_itr) {
         if (std::filesystem::is_directory(*path_itr)) {
             std::string cache_key = path_itr->filename().native();
-            if (cache_key.size() > KEY_PREFIX_LENGTH && !is_index_tmp_dir(*path_itr)) {
+            if (cache_key.size() > KEY_PREFIX_LENGTH) {
                 // try our best to delete, not care the return
                 (void)fs->delete_directory(*path_itr);
             }
@@ -939,9 +932,8 @@ void FSFileCacheStorage::load_cache_info_into_memory_from_fs(BlockFileCache* mgr
             // skip version file
             continue;
         }
-        if (key_prefix_it->path().filename().native() == META_DIR_NAME ||
-            is_index_tmp_dir(key_prefix_it->path())) {
-            // skip rocksdb dir and the index tmp dir
+        if (key_prefix_it->path().filename().native() == META_DIR_NAME) {
+            // skip rocksdb dir
             continue;
         }
         if (key_prefix_it->path().filename().native().size() != KEY_PREFIX_LENGTH) {
@@ -981,9 +973,6 @@ Status FSFileCacheStorage::get_file_cache_infos(std::vector<FileCacheInfo>& info
     for (; key_prefix_it != std::filesystem::directory_iterator(); ++key_prefix_it) {
         if (!key_prefix_it->is_directory()) {
             // skip version file
-            continue;
-        }
-        if (is_index_tmp_dir(key_prefix_it->path())) {
             continue;
         }
         if (key_prefix_it->path().filename().native().size() != KEY_PREFIX_LENGTH) {
@@ -1142,7 +1131,7 @@ void FSFileCacheStorage::load_cache_info_into_memory(BlockFileCache* mgr) const 
 
         for (; it != std::filesystem::directory_iterator(); ++it) {
             auto name = it->path().filename().native();
-            if (name == META_DIR_NAME || name == "version" || name == FILE_CACHE_INDEX_TMP_DIR_NAME) {
+            if (name == META_DIR_NAME || name == "version") {
                 continue;
             }
             return false;
@@ -1241,7 +1230,6 @@ Status FSFileCacheStorage::clear(std::string& msg) {
     for (; key_it != std::filesystem::directory_iterator(); ++key_it) {
         if (!key_it->is_directory()) continue; // all file cache data is in sub-directories
         if (key_it->path().filename().native() == META_DIR_NAME) continue;
-        if (is_index_tmp_dir(key_it->path())) continue;
         ++total;
         std::string cache_key = key_it->path().string();
         auto st = global_local_filesystem()->delete_directory(cache_key);
@@ -1395,7 +1383,7 @@ bool FSFileCacheStorage::is_cache_prefix_directory(
         return false;
     }
     auto name = entry.path().filename().native();
-    if (name == META_DIR_NAME || name.empty() || is_index_tmp_dir(entry.path())) {
+    if (name == META_DIR_NAME || name.empty()) {
         return false;
     }
     if (name.size() != KEY_PREFIX_LENGTH) {
@@ -1763,7 +1751,6 @@ void FSFileCacheStorage::cleanup_leaked_files(BlockFileCache* mgr, size_t metada
                 SCOPED_RAW_TIMER(&loop_once_ns);
                 std::string prefix_name = prefix_it->path().filename().native();
                 if (!prefix_it->is_directory() || prefix_name == META_DIR_NAME ||
-                    is_index_tmp_dir(prefix_it->path()) ||
                     prefix_name.size() != KEY_PREFIX_LENGTH) {
                     continue;
                 }
