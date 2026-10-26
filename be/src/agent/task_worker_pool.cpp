@@ -1654,6 +1654,20 @@ void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
               << ", compaction_type=" << compaction_req.type
               << ", tablet_id=" << compaction_req.tablet_id;
 
+    bool report_finish = compaction_req.__isset.report_finish && compaction_req.report_finish;
+    auto report = [report_finish, task_type = req.task_type,
+                   signature = req.signature](const Status& status) {
+        if (!report_finish) {
+            return;
+        }
+        TFinishTaskRequest finish_task_request;
+        finish_task_request.__set_backend(BackendOptions::get_local_backend());
+        finish_task_request.__set_task_type(task_type);
+        finish_task_request.__set_signature(signature);
+        finish_task_request.__set_task_status(status.to_thrift());
+        finish_task(finish_task_request);
+    };
+
     CompactionType compaction_type;
     if (compaction_req.type == "base") {
         compaction_type = CompactionType::BASE_COMPACTION;
@@ -1664,6 +1678,7 @@ void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
     } else {
         LOG(WARNING) << "unknown cloud compaction type: " << compaction_req.type
                      << ", tablet_id=" << compaction_req.tablet_id;
+        report(Status::InvalidArgument("unknown compaction type {}", compaction_req.type));
         return;
     }
 
@@ -1675,11 +1690,13 @@ void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
     if (!tablet_res.has_value()) {
         LOG(WARNING) << "failed to get cloud tablet. tablet_id=" << compaction_req.tablet_id
                      << ", error=" << tablet_res.error();
+        report(tablet_res.error());
         return;
     }
     CloudTabletSPtr tablet = std::move(tablet_res).value();
     if (tablet == nullptr) {
         LOG(WARNING) << "cloud tablet not found. tablet_id=" << compaction_req.tablet_id;
+        report(Status::NotFound("tablet {} not found", compaction_req.tablet_id));
         return;
     }
 
@@ -1697,11 +1714,22 @@ void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
         break;
     }
 
+    // Full and cumulative compactions report when the task ends; a base compaction when it is
+    // submitted.
+    const bool reports_at_end = compaction_type == CompactionType::FULL_COMPACTION ||
+                                compaction_type == CompactionType::CUMULATIVE_COMPACTION;
+    CloudStorageEngine::CompactionFinishCallback on_finish;
+    if (report_finish && reports_at_end) {
+        on_finish = report;
+    }
     Status status = engine.submit_compaction_task(tablet, compaction_type,
-                                                  /*trigger_method=*/1);
+                                                  /*trigger_method=*/1, on_finish);
     if (!status.ok()) {
         LOG(WARNING) << "failed to submit cloud compaction task. tablet_id=" << tablet->tablet_id()
                      << ", type=" << compaction_req.type << ", error=" << status;
+        report(status);
+    } else if (!reports_at_end) {
+        report(status);
     }
 }
 

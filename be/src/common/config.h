@@ -536,6 +536,9 @@ DECLARE_mBool(enable_vertical_compaction);
 DECLARE_mBool(enable_ordered_data_compaction);
 // In vertical compaction, column number for every group
 DECLARE_mInt32(vertical_compaction_num_columns_per_group);
+// In vertical compaction of value column groups, copy rows from interleaved inputs by gathering
+// each column once per output block instead of one range copy per run of same-source rows.
+DECLARE_mBool(enable_vertical_compaction_gather_copy);
 // In vertical compaction, max memory usage for row_source_buffer
 DECLARE_Int32(vertical_compaction_max_row_source_memory_mb);
 // In vertical compaction, max dest segment file size
@@ -1043,6 +1046,13 @@ DECLARE_mInt32(max_tablet_version_num);
 
 DECLARE_mInt32(time_series_max_tablet_version_num);
 
+// Time-series cumulative compaction: merge an eligible run of consecutive empty rowsets
+// before considering data compaction. An empty-run merge reads no data and takes
+// milliseconds, while a data compaction holds the tablet for the time it takes to rewrite
+// its input, so under sustained ingest that leaves an empty rowset on most tablets per load
+// the tablet's rowset count otherwise grows at the load rate.
+DECLARE_mBool(time_series_compaction_prefer_empty_rowsets);
+
 // the max sleep time when meeting high pressure load task
 DECLARE_mInt64(max_load_back_pressure_version_wait_time_ms);
 // the threshold of rowset number gap that triggers back pressure
@@ -1391,6 +1401,7 @@ DECLARE_mInt64(cache_lock_held_long_tail_threshold_us);
 // If your file cache is ample enough to accommodate all the data in your database,
 // enable this option; otherwise, it is recommended to leave it disabled.
 DECLARE_mBool(enable_file_cache_keep_base_compaction_output);
+DECLARE_mBool(enable_file_cache_keep_full_compaction_output);
 DECLARE_mBool(enable_file_cache_adaptive_write);
 DECLARE_mDouble(file_cache_keep_base_compaction_output_min_hit_ratio);
 DECLARE_mDouble(file_cache_meta_store_vs_file_system_diff_num_threshold);

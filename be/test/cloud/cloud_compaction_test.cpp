@@ -28,12 +28,16 @@
 
 #include "cloud/cloud_base_compaction.h"
 #include "cloud/cloud_cluster_info.h"
+#include "cloud/cloud_rowset_builder.h"
+#include "cloud/cloud_cumulative_compaction.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_tablet.h"
 #include "cloud/cloud_tablet_mgr.h"
 #include "cloud/config.h"
 #include "cpp/sync_point.h"
 #include "json2pb/json_to_pb.h"
+#include "runtime/runtime_profile.h"
+#include "storage/compaction/cumulative_compaction_time_series_policy.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
@@ -221,6 +225,109 @@ static RowsetSharedPtr create_rowset(Version version, int num_segments, bool ove
     if (!st.ok()) {
         return nullptr;
     }
+    return rowset;
+}
+
+static RowsetSharedPtr create_prepared_rowset(int num_segments, int data_size) {
+    auto rs_meta = std::make_shared<RowsetMeta>();
+    rs_meta->set_rowset_type(BETA_ROWSET);
+    rs_meta->set_rowset_state(PREPARED);
+    rs_meta->set_num_segments(num_segments);
+    rs_meta->set_segments_overlap(OVERLAPPING);
+    rs_meta->set_total_disk_size(data_size);
+    RowsetSharedPtr rowset;
+    Status st = RowsetFactory::create_rowset(nullptr, "", rs_meta, &rowset);
+    if (!st.ok()) {
+        return nullptr;
+    }
+    return rowset;
+}
+
+TEST_F(CloudCompactionTest, update_tablet_stats_counts_zero_segment_rowset) {
+    auto tablet = std::make_shared<CloudTablet>(_engine, _tablet_meta);
+    {
+        std::unique_lock lock(tablet->get_header_lock());
+        tablet->reset_approximate_stats(0, 0, 0, 0);
+    }
+
+    RuntimeProfile profile("CloudCompactionTest");
+    CloudRowsetBuilder builder(_engine, WriteRequest {}, &profile);
+
+    auto empty_rowset = create_prepared_rowset(0, 0);
+    ASSERT_NE(empty_rowset, nullptr);
+    ASSERT_TRUE(empty_rowset->is_pending());
+    ASSERT_FALSE(empty_rowset->rowset_meta()->has_version());
+    builder._tablet = tablet;
+    builder._rowset = empty_rowset;
+    builder.update_tablet_stats();
+    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_deltas(0), 1);
+
+    auto overlapping_rowset = create_prepared_rowset(3, 41);
+    ASSERT_NE(overlapping_rowset, nullptr);
+    ASSERT_TRUE(overlapping_rowset->is_pending());
+    ASSERT_FALSE(overlapping_rowset->rowset_meta()->has_version());
+    builder._rowset = overlapping_rowset;
+    builder.update_tablet_stats();
+    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_deltas(0), 4);
+}
+
+TEST_F(CloudCompactionTest, cumulative_global_lock_failure_keeps_thread_count_balanced) {
+    ASSERT_TRUE(ThreadPoolBuilder("CumuCompactionTaskThreadPoolTest")
+                        .set_min_threads(1)
+                        .set_max_threads(1)
+                        .build(&_engine._cumu_compaction_thread_pool)
+                        .ok());
+
+    auto tablet_meta = std::make_shared<TabletMeta>(*_tablet_meta);
+    tablet_meta->_tablet_id = 12000;
+    auto tablet = std::make_shared<CloudTablet>(_engine, tablet_meta);
+    std::vector<RowsetSharedPtr> rowsets;
+    for (int64_t version = 0; version < 6; ++version) {
+        auto rowset = create_rowset(Version(version, version), 1, false, 41);
+        ASSERT_NE(rowset, nullptr);
+        rowsets.push_back(std::move(rowset));
+    }
+    {
+        std::unique_lock lock(tablet->get_header_lock());
+        tablet->add_rowsets(rowsets, false, lock, false);
+    }
+    tablet->set_cumulative_layer_point(0);
+    tablet->_approximate_num_rowsets = rowsets.size();
+    tablet->_approximate_cumu_num_rowsets = rowsets.size();
+    tablet->_approximate_cumu_num_deltas = rowsets.size();
+    tablet->last_sync_rowsets_time_s = 1;
+
+    auto* sync_point = SyncPoint::get_instance();
+    sync_point->enable_processing();
+    sync_point->set_call_back("CloudMetaMgr::prepare_tablet_job", [](auto&& outcome) {
+        auto* response = try_any_cast<cloud::StartTabletJobResponse*>(outcome[1]);
+        response->mutable_status()->set_code(cloud::JOB_TABLET_BUSY);
+        response->mutable_status()->set_msg("injected global lock failure");
+        auto* result = try_any_cast_ret<Status>(outcome);
+        result->first = Status::InternalError("injected global lock failure");
+        result->second = true;
+    });
+    Defer clear_sync_point {[&] {
+        sync_point->clear_all_call_backs();
+        sync_point->disable_processing();
+    }};
+
+    ASSERT_EQ(_engine._cumu_compaction_thread_pool_used_threads, 0);
+    ASSERT_EQ(_engine.submit_compaction_task(tablet, CompactionType::CUMULATIVE_COMPACTION),
+              Status::OK());
+    ASSERT_TRUE(_engine._cumu_compaction_thread_pool->wait_for(std::chrono::seconds(5)));
+
+    EXPECT_EQ(_engine._cumu_compaction_thread_pool_used_threads, 0);
+    EXPECT_EQ(_engine._cumu_compaction_thread_pool_small_tasks_running, 0);
+    EXPECT_FALSE(_engine.has_cumu_compaction(tablet->tablet_id()));
+}
+
+static RowsetSharedPtr create_delete_rowset(Version version) {
+    auto rowset = create_rowset(version, 0, false, 0);
+    DORIS_CHECK(rowset != nullptr);
+    DeletePredicatePB delete_predicate;
+    delete_predicate.set_version(version.second);
+    rowset->rowset_meta()->set_delete_predicate(std::move(delete_predicate));
     return rowset;
 }
 

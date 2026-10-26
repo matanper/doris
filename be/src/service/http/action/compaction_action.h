@@ -34,6 +34,7 @@ enum class CompactionActionType {
     SHOW_INFO = 1,
     RUN_COMPACTION = 2,
     RUN_COMPACTION_STATUS = 3,
+    CANCEL_COMPACTION = 4,
 };
 
 const std::string PARAM_COMPACTION_TYPE = "compact_type";

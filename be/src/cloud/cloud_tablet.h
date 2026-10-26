@@ -277,6 +277,21 @@ public:
     void set_full_compaction_cnt(int64_t cnt) { _full_compaction_cnt = cnt; }
     void set_cumulative_layer_point(int64_t new_point);
 
+    // Wait before cumulative compaction is retried on a tablet whose job the meta service rejected
+    // as busy `busy_count` times in a row: doubles from `min_ms` per rejection, capped at `max_ms`.
+    static int64_t cumu_compaction_busy_backoff_ms(int64_t busy_count, int64_t min_ms,
+                                                   int64_t max_ms);
+    // Called when the meta service rejects a cumulative compaction job on this tablet as busy,
+    // e.g. while a full compaction holds the tablet.
+    void on_cumu_compaction_busy(int64_t now_ms);
+    void reset_cumu_compaction_busy() {
+        _cumu_compaction_busy_count = 0;
+        _cumu_compaction_busy_until_ms = 0;
+    }
+    bool in_cumu_compaction_busy_backoff(int64_t now_ms) const {
+        return now_ms < _cumu_compaction_busy_until_ms.load(std::memory_order_relaxed);
+    }
+
     int64_t last_cumu_compaction_failure_time() { return _last_cumu_compaction_failure_millis; }
     void set_last_cumu_compaction_failure_time(int64_t millis) {
         _last_cumu_compaction_failure_millis = millis;
@@ -592,6 +607,9 @@ private:
     // Number of sorted arrays (e.g. for rowset with N segments, if rowset is overlapping, delta is N, otherwise 1) after cumu point
     std::atomic<int64_t> _approximate_cumu_num_deltas {-1};
 
+    // consecutive busy rejections of cumulative compaction jobs, and the end of their backoff
+    std::atomic<int64_t> _cumu_compaction_busy_count {0};
+    std::atomic<int64_t> _cumu_compaction_busy_until_ms {0};
     // timestamp of last cumu compaction failure
     std::atomic<int64_t> _last_cumu_compaction_failure_millis;
     // timestamp of last base compaction failure
