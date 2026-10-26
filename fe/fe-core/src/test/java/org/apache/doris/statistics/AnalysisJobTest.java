@@ -18,12 +18,14 @@
 package org.apache.doris.statistics;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.Pair;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
+import mockit.Verifications;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -31,6 +33,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class AnalysisJobTest {
@@ -241,4 +245,67 @@ public class AnalysisJobTest {
         Assertions.assertEquals("a48a05f7d2f079b74481e2909a7fa79b", job.stmtExecutor.getContext().getSqlHash());
     }
 
+
+    @Test
+    public void testTaskFailedKeepsSiblingsAndSavesTheirStats(@Mocked AnalysisInfo analysisInfo,
+            @Mocked AnalysisManager analysisManager,
+            @Mocked OlapAnalysisTask failedTask,
+            @Mocked OlapAnalysisTask finishedTask) {
+        List<Integer> flushedBufSizes = new ArrayList<>();
+        AtomicInteger deregisterTimes = new AtomicInteger();
+        new MockUp<AnalysisJob>() {
+            @Mock
+            protected void flushBuffer(mockit.Invocation inv) {
+                AnalysisJob job = inv.getInvokedInstance();
+                Assertions.assertFalse(job.killed);
+                flushedBufSizes.add(job.buf.size());
+                job.buf.clear();
+            }
+
+            @Mock
+            public void deregisterJob() {
+                deregisterTimes.incrementAndGet();
+            }
+        };
+        AnalysisJob job = new AnalysisJob(analysisInfo, Arrays.asList(failedTask, finishedTask));
+        job.analysisManager = analysisManager;
+
+        job.taskFailed(failedTask, "failed to read from tablets/data/x.dat");
+        // The sibling keeps running: nothing is flushed or deregistered yet.
+        Assertions.assertTrue(flushedBufSizes.isEmpty());
+        Assertions.assertEquals(0, deregisterTimes.get());
+
+        job.appendBuf(finishedTask, Collections.singletonList(new ColStatsData()));
+        // The finished column's statistics are saved and the job ends.
+        Assertions.assertEquals(Collections.singletonList(1), flushedBufSizes);
+        Assertions.assertEquals(1, deregisterTimes.get());
+
+        new Verifications() {
+            {
+                finishedTask.cancel();
+                times = 0;
+                analysisManager.updateTaskStatus(failedTask.info, AnalysisState.FAILED, anyString, anyLong);
+                times = 1;
+            }
+        };
+    }
+
+    @Test
+    public void testRetainFinishedColumnsDropsOnlyFailedColumns(@Mocked OlapAnalysisTask failedTask,
+            @Mocked OlapAnalysisTask finishedTask) {
+        Set<Pair<String, String>> columns = new HashSet<>();
+        columns.add(Pair.of("logs", "raw"));
+        columns.add(Pair.of("logs", "org_id"));
+        AnalysisInfo job = new AnalysisInfoBuilder().setJobId(1).setJobColumns(columns).build();
+        failedTask.info = new AnalysisInfoBuilder().setColName("raw").setState(AnalysisState.FAILED).build();
+        finishedTask.info = new AnalysisInfoBuilder().setColName("org_id").setState(AnalysisState.FINISHED)
+                .build();
+
+        Assertions.assertTrue(AnalysisManager.retainFinishedColumns(job, Arrays.asList(failedTask, finishedTask)));
+        Assertions.assertEquals(Collections.singleton(Pair.of("logs", "org_id")), job.jobColumns);
+
+        finishedTask.info = new AnalysisInfoBuilder().setColName("org_id").setState(AnalysisState.FAILED).build();
+        Assertions.assertFalse(AnalysisManager.retainFinishedColumns(job, Arrays.asList(failedTask, finishedTask)));
+        Assertions.assertTrue(job.jobColumns.isEmpty());
+    }
 }

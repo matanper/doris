@@ -510,6 +510,7 @@ Status decode_v1_storage_cells(std::span<const StringRef> cells,
     DORIS_CHECK(output != nullptr);
     DORIS_CHECK(outer_nulls.empty() || outer_nulls.size() == cells.size());
     DORIS_CHECK(missing.empty() || missing.size() == cells.size());
+    const VariantRepairInvalidUtf8Scope repair_invalid_utf8;
 
     try {
         ColumnNullable::MutablePtr result;
