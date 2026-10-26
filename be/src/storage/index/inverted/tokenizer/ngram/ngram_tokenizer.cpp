@@ -140,6 +140,19 @@ std::pair<int32_t, int32_t> NGramTokenizer::to_code_points(const char* char_buff
 }
 
 void NGramTokenizer::to_chars(const std::vector<UChar32>& buffer, int32_t start, int32_t size) {
+    // The gram's code points come from U8_NEXT, so each is a valid scalar value, and encoding it
+    // directly gives the bytes ICU's UnicodeString::toUTF8String gives.
+    _utf8_buffer.resize(static_cast<size_t>(size) * U8_MAX_LENGTH);
+    auto* out = reinterpret_cast<uint8_t*>(_utf8_buffer.data());
+    int32_t length = 0;
+    for (int32_t i = start; i < start + size; i++) {
+        U8_APPEND_UNSAFE(out, length, buffer[i]);
+    }
+    _utf8_buffer.resize(static_cast<size_t>(length));
+}
+
+void NGramTokenizer::to_chars_with_icu(const std::vector<UChar32>& buffer, int32_t start,
+                                       int32_t size) {
     icu::UnicodeString unistr;
     for (int32_t i = start; i < start + size; i++) {
         unistr.append(buffer[i]);
