@@ -53,6 +53,8 @@ import org.apache.doris.thrift.TIngestBinlogRequest;
 import org.apache.doris.thrift.TIngestBinlogResult;
 import org.apache.doris.thrift.TMasterInfo;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TPublishTabletOwnershipRequest;
+import org.apache.doris.thrift.TPublishTabletOwnershipResponse;
 import org.apache.doris.thrift.TPublishTopicRequest;
 import org.apache.doris.thrift.TPublishTopicResult;
 import org.apache.doris.thrift.TPythonEnvInfo;
@@ -489,6 +491,12 @@ public class MockedBackendFactory {
         @Override
         public java.util.List<TPythonPackageInfo> getPythonPackages(String pythonVersion) throws TException {
             return java.util.Collections.emptyList();
+        }
+
+        @Override
+        public TPublishTabletOwnershipResponse publishTabletOwnership(TPublishTabletOwnershipRequest request)
+                throws TException {
+            return new TPublishTabletOwnershipResponse();
         }
     }
 

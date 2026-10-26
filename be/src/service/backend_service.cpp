@@ -1241,6 +1241,12 @@ void BaseBackendService::warm_up_tablets(TWarmUpTabletsResponse& response,
     response.__set_status(Status::NotSupported("warm_up_tablets is not implemented").to_thrift());
 }
 
+void BaseBackendService::publish_tablet_ownership(TPublishTabletOwnershipResponse& response,
+                                                  const TPublishTabletOwnershipRequest& request) {
+    response.__set_status(
+            Status::NotSupported("publish_tablet_ownership is only for cloud mode").to_thrift());
+}
+
 void BaseBackendService::get_realtime_exec_status(TGetRealtimeExecStatusResponse& response,
                                                   const TGetRealtimeExecStatusRequest& request) {
     if (!request.__isset.id) {

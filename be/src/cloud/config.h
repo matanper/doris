@@ -68,6 +68,21 @@ DECLARE_mInt32(meta_service_rpc_timeout_retry_times);
 // CloudTabletMgr config
 DECLARE_Int64(tablet_cache_capacity);
 DECLARE_Int64(tablet_cache_shards);
+// Seconds a cached tablet may go unused before the periodic cache prune drops it, e.g. a
+// tablet this BE served only while the BE it belongs to was down. 0 keeps every cached tablet
+// until the cache is full.
+DECLARE_mInt64(tablet_cache_stale_sweep_time_sec);
+// Drop a cached tablet this BE does not own, by the set of owned tablets the FE publishes, once
+// nothing has used it for foreign_tablet_idle_evict_sec. Owned tablets are never dropped this way.
+DECLARE_mBool(enable_foreign_tablet_eviction);
+DECLARE_mInt64(foreign_tablet_idle_evict_sec);
+// An unused rowset that something besides the tablet still references after this many seconds
+// counts in the unused_rowsets_stuck_* bvars and is logged once; <= 0 disables both.
+DECLARE_mInt64(unused_rowset_stuck_log_sec);
+// At most this many stuck unused rowsets are logged a minute.
+DECLARE_mInt64(unused_rowset_stuck_log_per_minute);
+// An owned set older than this disables the eviction above, e.g. while no FE publishes one.
+DECLARE_mInt64(tablet_ownership_max_age_sec);
 DECLARE_mInt32(tablet_sync_interval_s);
 // parallelism for scanner init where may issue RPCs to sync rowset meta from MS
 DECLARE_mInt32(init_scanner_sync_rowsets_parallelism);
