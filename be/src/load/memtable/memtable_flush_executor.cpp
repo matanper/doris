@@ -17,9 +17,11 @@
 
 #include "load/memtable/memtable_flush_executor.h"
 
+#include <bvar/bvar.h>
 #include <gen_cpp/olap_file.pb.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <ostream>
 
@@ -30,6 +32,7 @@
 #include "common/metrics/system_metrics.h"
 #include "common/signal_handler.h"
 #include "load/memtable/memtable.h"
+#include "util/threadpool.h"
 #include "runtime/thread_context.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/storage_engine.h"
@@ -42,6 +45,72 @@ namespace doris {
 using namespace ErrorCode;
 
 bvar::Adder<int64_t> g_flush_task_num("memtable_flush_task_num");
+
+namespace {
+std::atomic<int64_t> g_live_flush_tokens {0};
+// The max threads of the memtable flush pool, as last set.
+std::atomic<int64_t> g_flush_pool_threads {0};
+bvar::PassiveStatus<int64_t> g_live_flush_tokens_bvar(
+        "memtable_flush_live_tokens",
+        [](void*) { return g_live_flush_tokens.load(std::memory_order_relaxed); }, nullptr);
+bvar::PassiveStatus<int64_t> g_flush_running_count_limit_bvar(
+        "memtable_flush_running_count_limit_effective",
+        [](void*) { return FlushToken::flush_running_count_limit(); }, nullptr);
+// Writers waiting for a flush slot of their token, and how long each wait took.
+bvar::Adder<int64_t> g_flush_slot_waiting_writers("memtable_flush_slot_waiting_writers");
+bvar::LatencyRecorder g_flush_slot_wait_us("memtable_flush_slot_wait_us");
+} // namespace
+
+FlushToken::FlushToken(ThreadPool* thread_pool, std::shared_ptr<WorkloadGroup> wg_sptr)
+        : _flush_status(Status::OK()), _thread_pool(thread_pool), _wg_wptr(wg_sptr) {
+    g_live_flush_tokens.fetch_add(1, std::memory_order_relaxed);
+}
+
+FlushToken::~FlushToken() {
+    g_live_flush_tokens.fetch_sub(1, std::memory_order_relaxed);
+}
+
+int64_t FlushToken::flush_running_count_limit() {
+    int64_t limit = std::max<int64_t>(1, config::memtable_flush_running_count_limit);
+    if (!config::enable_adaptive_memtable_flush_running_count_limit) {
+        return limit;
+    }
+    const int64_t tokens = std::max<int64_t>(1, g_live_flush_tokens.load(std::memory_order_relaxed));
+    return std::max<int64_t>(limit, g_flush_pool_threads.load(std::memory_order_relaxed) / tokens);
+}
+
+void FlushToken::on_flush_started() {
+    _stats.flush_running_count++;
+}
+
+void FlushToken::on_flush_finished() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _stats.flush_running_count--;
+    if (_stats.flush_running_count == 0) {
+        _running_task_finish_cond.notify_one();
+    }
+    _flush_slot_cond.notify_all();
+}
+
+void FlushToken::wait_for_flush_slot(const std::function<bool()>& should_stop) {
+    if (_stats.flush_running_count.load() < flush_running_count_limit()) {
+        return;
+    }
+    MonotonicStopWatch watch;
+    watch.start();
+    g_flush_slot_waiting_writers << 1;
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        while (_stats.flush_running_count.load() >= flush_running_count_limit()) {
+            if (should_stop != nullptr && should_stop()) {
+                break;
+            }
+            _flush_slot_cond.wait_for(lock, std::chrono::milliseconds(100));
+        }
+    }
+    g_flush_slot_waiting_writers << -1;
+    g_flush_slot_wait_us << watch.elapsed_time() / 1000;
+}
 
 class MemtableFlushTask final : public Runnable {
     ENABLE_FACTORY_CREATOR(MemtableFlushTask);
@@ -225,17 +294,16 @@ void FlushToken::_flush_memtable(std::shared_ptr<MemTable> memtable_ptr, int32_t
     signal::tablet_id = memtable_ptr->tablet_id();
     // Count the task as running before registering the deferred cleanup so
     // cancel/shutdown paths keep flush_running_count symmetric on every exit.
-    _stats.flush_running_count++;
+    on_flush_started();
     Defer defer {[&]() {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _stats.flush_submit_count--;
-        if (_stats.flush_submit_count == 0) {
-            _submit_task_finish_cond.notify_one();
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _stats.flush_submit_count--;
+            if (_stats.flush_submit_count == 0) {
+                _submit_task_finish_cond.notify_one();
+            }
         }
-        _stats.flush_running_count--;
-        if (_stats.flush_running_count == 0) {
-            _running_task_finish_cond.notify_one();
-        }
+        on_flush_finished();
     }};
     DBUG_EXECUTE_IF("FlushToken.flush_memtable.wait_before_first_shutdown",
                     { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
@@ -320,6 +388,7 @@ void MemTableFlushExecutor::init(int num_disk) {
                               .set_min_threads(min_threads)
                               .set_max_threads(max_threads)
                               .build(&_flush_pool));
+    g_flush_pool_threads.store(max_threads, std::memory_order_relaxed);
 
     auto [hi_min, hi_max] = calc_flush_thread_count(
             num_cpus, _num_disk, config::high_priority_flush_thread_num_per_store);
@@ -336,6 +405,7 @@ void MemTableFlushExecutor::update_memtable_flush_threads() {
             calc_flush_thread_count(num_cpus, _num_disk, config::flush_thread_num_per_store);
     // Update max_threads first to avoid constraint violation when increasing min_threads
     static_cast<void>(_flush_pool->set_max_threads(max_threads));
+    g_flush_pool_threads.store(_flush_pool->max_threads(), std::memory_order_relaxed);
     static_cast<void>(_flush_pool->set_min_threads(min_threads));
 
     auto [hi_min, hi_max] = calc_flush_thread_count(

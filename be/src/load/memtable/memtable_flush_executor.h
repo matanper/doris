@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -63,8 +65,8 @@ class FlushToken : public std::enable_shared_from_this<FlushToken> {
     ENABLE_FACTORY_CREATOR(FlushToken);
 
 public:
-    FlushToken(ThreadPool* thread_pool, std::shared_ptr<WorkloadGroup> wg_sptr)
-            : _flush_status(Status::OK()), _thread_pool(thread_pool), _wg_wptr(wg_sptr) {}
+    FlushToken(ThreadPool* thread_pool, std::shared_ptr<WorkloadGroup> wg_sptr);
+    ~FlushToken();
 
     Status submit(std::shared_ptr<MemTable> mem_table);
 
@@ -83,6 +85,19 @@ public:
     }
 
     const MemTableStat& memtable_stat() { return _memtable_stat; }
+
+    // Returns once fewer than flush_running_count_limit() flushes of this token are running, or
+    // when `should_stop` returns true; it is checked at least every 100 ms, as is the limit.
+    void wait_for_flush_slot(const std::function<bool()>& should_stop);
+
+    // A flush of this token starts or ends running on a pool thread.
+    void on_flush_started();
+    void on_flush_finished();
+
+    // The number of flushes of one token that may run at once: memtable_flush_running_count_limit,
+    // or with enable_adaptive_memtable_flush_running_count_limit, at least the flush pool's
+    // threads divided among the live tokens, so that a few writers can use an idle pool.
+    static int64_t flush_running_count_limit();
 
 private:
     void _shutdown_flush_token() { _shutdown.store(true); }
@@ -118,6 +133,8 @@ private:
     std::mutex _mutex;
     std::condition_variable _submit_task_finish_cond;
     std::condition_variable _running_task_finish_cond;
+    // Notified whenever a running flush ends.
+    std::condition_variable _flush_slot_cond;
 
     std::weak_ptr<WorkloadGroup> _wg_wptr;
 };

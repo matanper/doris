@@ -142,7 +142,9 @@ public:
 
     void erase_segment(const SegmentCache::CacheKey& key);
 
-    void erase_segments(const RowsetId& rowset_id, int64_t num_segments);
+    // With `erase_footers`, also drops the cached footer of each segment that was cached.
+    void erase_segments(const RowsetId& rowset_id, int64_t num_segments,
+                        bool erase_footers = false);
 
     int64_t cache_mem_usage() const {
 #ifdef BE_TEST

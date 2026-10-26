@@ -656,13 +656,17 @@ Status OlapScanner::close(RuntimeState* state) {
 }
 
 void OlapScanner::update_realtime_counters() {
-    if (!_has_prepared) {
+    // The reader is read once: _release_after_eos resets _tablet_reader when the scanner reaches
+    // its end, and every use below must see the same reader as the check.
+    TabletReader* reader = _tablet_reader.get();
+    if (!_has_prepared || reader == nullptr) {
         // Counter update need prepare successfully, or it maybe core. For example, olap scanner
         // will open tablet reader during prepare, if not prepare successfully, tablet reader == nullptr.
+        // The reader is also released once the scanner reaches its end.
         return;
     }
     OlapScanLocalState* local_state = static_cast<OlapScanLocalState*>(_local_state);
-    const OlapReaderStatistics& stats = _tablet_reader->stats();
+    const OlapReaderStatistics& stats = reader->stats();
     COUNTER_UPDATE(local_state->_read_compressed_counter, stats.compressed_bytes_read);
     COUNTER_UPDATE(local_state->_read_uncompressed_counter, stats.uncompressed_bytes_read);
     COUNTER_UPDATE(local_state->_scan_bytes, stats.uncompressed_bytes_read);
@@ -707,10 +711,10 @@ void OlapScanner::update_realtime_counters() {
                 stats.file_cache_stats.bytes_write_into_cache);
     }
 
-    _tablet_reader->mutable_stats()->compressed_bytes_read = 0;
-    _tablet_reader->mutable_stats()->uncompressed_bytes_read = 0;
-    _tablet_reader->mutable_stats()->raw_rows_read = 0;
-    _tablet_reader->mutable_stats()->file_cache_stats = {};
+    reader->mutable_stats()->compressed_bytes_read = 0;
+    reader->mutable_stats()->uncompressed_bytes_read = 0;
+    reader->mutable_stats()->raw_rows_read = 0;
+    reader->mutable_stats()->file_cache_stats = {};
 }
 
 void OlapScanner::_collect_profile_before_close() {

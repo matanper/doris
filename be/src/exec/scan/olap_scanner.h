@@ -92,6 +92,9 @@ public:
 protected:
     Status _get_block_impl(RuntimeState* state, Block* block, bool* eos) override;
     void _collect_profile_before_close() override;
+    // Drops the tablet reader, and with it the rowset readers that keep the scanned rowsets, and
+    // their file cache blocks, from being removed after a compaction replaces them.
+    void _release_after_eos() override { _tablet_reader.reset(); }
 
 private:
     Status _init_tablet_reader_params(

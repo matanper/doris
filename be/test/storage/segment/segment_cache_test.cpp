@@ -55,6 +55,7 @@
 #include "storage/segment/column_reader_cache.h"
 #include "storage/segment/lazy_init_segment_iterator.h"
 #include "storage/segment/segment.h"
+#include "storage/cache/page_cache.h"
 #include "storage/compaction/compaction.h"
 #include "storage/segment/segment_loader.h"
 #include "storage/storage_engine.h"
@@ -527,6 +528,34 @@ TEST_F(SegmentCacheTest, vec_sequence_col) {
         EXPECT_EQ(counter("segment_loads_by_compaction"), loads + 3);
         EXPECT_EQ(counter("segment_pinned_reuses"), reuses + 2);
         SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+    }
+
+    // Erasing a rowset's segments can drop their cached footers too.
+    {
+        auto* lru = SegmentLoader::instance()->_segment_cache->_cache.get();
+        const size_t old_capacity = lru->get_capacity();
+        lru->set_capacity(64 << 20);
+        auto* footer_cache = ExecEnv::GetInstance()->get_storage_page_cache();
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        SegmentCacheHandle cached;
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &cached, true).ok());
+        auto seg = cached.get_segments()[0];
+        std::shared_ptr<segment_v2::SegmentFooterPB> footer;
+        ASSERT_TRUE(seg->_get_segment_footer(footer, nullptr).ok());
+        const auto footer_key = seg->get_segment_footer_cache_key();
+        PageCacheHandle page;
+        EXPECT_TRUE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE));
+
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments());
+        EXPECT_TRUE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE))
+                << "kept unless asked";
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &cached, true).ok());
+        SegmentCacheHandle again;
+        ASSERT_TRUE(SegmentLoader::instance()->load_segments(rowset_ptr, &again, true).ok());
+        SegmentLoader::instance()->erase_segments(rowset->rowset_id(), rowset->num_segments(),
+                                                  true);
+        EXPECT_FALSE(footer_cache->lookup(footer_key, &page, segment_v2::PageTypePB::INDEX_PAGE));
+        lru->set_capacity(old_capacity);
     }
 
     res = engine_ref->tablet_manager()->drop_tablet(request.tablet_id, request.replica_id, false);
