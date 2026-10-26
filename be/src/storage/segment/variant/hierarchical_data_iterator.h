@@ -109,6 +109,7 @@ private:
     size_t _rows_read = 0;
     PathInData _path;
     OlapReaderStatistics* _stats = nullptr;
+    std::string _file_path;
     ReadType _read_type = ReadType::SUBCOLUMNS_AND_SPARSE;
     std::unique_ptr<variant_v2::VariantAssembler> _variant_v2_assembler;
     HierarchicalDataIterator(const PathInData& path, ReadType read_type);

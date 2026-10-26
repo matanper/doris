@@ -54,6 +54,7 @@
 #include "absl/strings/substitute.h"
 #include "common/config.h"
 #include "common/logging.h"
+#include "common/raw_crash_dump.h"
 #include "runtime/thread_context.h"
 #include "service/http/web_page_handler.h"
 #include "util/easy_json.h"
@@ -459,6 +460,10 @@ void* Thread::supervise_thread(void* arg) {
     // lifecycle is poorly defined, we'll use a bare pointer. We
     // already incremented the reference count in StartThread.
     Thread::_tls = t;
+
+    // The failure signal handler runs on this stack when the thread's own stack is overflowed or
+    // smashed.
+    doris::signal::install_thread_alt_stack();
 
     // Create thread context, there is no need to create it when func is executed.
     ThreadLocalHandle::create_thread_local_if_not_exits();

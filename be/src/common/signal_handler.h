@@ -39,6 +39,7 @@
 #include <csignal>
 #include <ctime>
 
+#include "common/raw_crash_dump.h"
 #include "common/version_internal.h"
 #ifdef HAVE_UCONTEXT_H
 #include <ucontext.h>
@@ -406,6 +407,11 @@ void FailureSignalHandler(int signal_number, siginfo_t* signal_info, void* ucont
     // First dump time info.
     DumpTimeInfo();
     DumpSignalInfo(signal_number, signal_info);
+    // Registers and a frame-pointer walk, written without allocating, before the unwinder below,
+    // which can die on the same corrupt stack that caused the signal.
+    if (signal_number != SIGTERM) {
+        dump_raw_crash_context(STDERR_FILENO, signal_number, signal_info, ucontext);
+    }
 
     // *** TRANSITION ***
     //
@@ -454,11 +460,14 @@ inline void set_signal_is_nereids(bool is_nereids_arg) {
 }
 
 inline void InstallFailureSignalHandler() {
+    init_raw_crash_dump();
     // Build the sigaction struct.
     struct sigaction sig_action;
     memset(&sig_action, 0, sizeof(sig_action));
     sigemptyset(&sig_action.sa_mask);
-    sig_action.sa_flags |= SA_SIGINFO;
+    // SA_ONSTACK: threads with an alternate signal stack run the handler on it, so it survives
+    // an overflowed or smashed thread stack.
+    sig_action.sa_flags |= SA_SIGINFO | SA_ONSTACK;
     sig_action.sa_sigaction = &FailureSignalHandler;
 
     for (size_t i = 0; i < ARRAYSIZE_UNSAFE(kFailureSignals); ++i) {

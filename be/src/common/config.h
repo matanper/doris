@@ -1673,6 +1673,10 @@ DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
 // every payload when it built the column, and structural checks still run. Set to true to
 // re-validate every payload on receipt.
 DECLARE_mBool(variant_v2_validate_internal_block);
+// Diagnostic: before a VARIANT subtree is rebuilt as Variant V2, check that every stored sparse
+// path and materialized subcolumn path read for it is valid UTF-8, and log the ones that are not
+// with their segment file, row and bytes.
+DECLARE_mBool(variant_v2_check_read_paths);
 // When true, the encoded buffers of a Variant V2 column are allocated exactly when an empty column
 // is filled (one Arrow batch, a tablet sink batch, a memtable flush copy), and grow by a quarter
 // instead of to the next power of two once they exceed 1 MB. A memtable accumulating a load then
