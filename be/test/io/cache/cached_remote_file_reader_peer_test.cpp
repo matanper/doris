@@ -608,6 +608,68 @@ TEST_F(CachedRemoteFileReaderPeerTest, read_at_uses_peer_cache_when_available) {
     EXPECT_EQ(cache_stats.bytes_read_from_remote, 0);
 }
 
+// Each block a read fills records where its bytes came from: the peer's address for a peer
+// read, remote for a read from storage; describe_blocks reports it.
+TEST_F(CachedRemoteFileReaderPeerTest, filled_blocks_record_their_source) {
+    const std::string content = "abcdefghijklmnop";
+    const fs::path file_path =
+            create_peer_test_file("cached_remote_reader_fill_source.dat", content);
+    Defer cleanup_file {[&]() {
+        std::error_code ec;
+        fs::remove(file_path, ec);
+    }};
+    const fs::path cache_path = caches_dir / "cached_remote_reader_fill_source_cache";
+    Defer cleanup_cache {[&]() {
+        std::error_code ec;
+        fs::remove_all(cache_path, ec);
+    }};
+    clear_cached_remote_reader_factory();
+    create_peer_test_cache(cache_path, kPeerTestBlockSize);
+
+    MockPeerCacheService service(content);
+    brpc::Server server;
+    auto addr = start_peer_test_server(&server, &service);
+    Defer stop_server {[&]() { stop_peer_test_server(&server); }};
+    DebugPoints::instance()->add_with_params(
+            "PeerFileCacheReader::_fetch_from_peer_cache_blocks",
+            {{"host", "127.0.0.1"}, {"port", std::to_string(addr.port)}});
+
+    FileReaderSPtr local_reader;
+    ASSERT_TRUE(global_local_filesystem()->open_file(file_path.string(), &local_reader).ok());
+    FileReaderOptions opts;
+    opts.cache_type = FileCachePolicy::FILE_BLOCK_CACHE;
+    opts.is_doris_table = true;
+    opts.mtime = 1;
+    opts.tablet_id = kPeerTestTabletId;
+    CachedRemoteFileReader reader(local_reader, opts);
+
+    std::string buffer(4, '#');
+    size_t bytes_read = 0;
+    IOContext io_ctx;
+    FileCacheStatistics cache_stats;
+    io_ctx.file_cache_stats = &cache_stats;
+    ASSERT_TRUE(reader.read_at(0, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx).ok());
+    ASSERT_EQ(cache_stats.num_peer_io_total, 1);
+
+    auto* cache = FileCacheFactory::instance()->get_by_path(reader._cache_hash);
+    ASSERT_NE(cache, nullptr);
+    bool any_peer = false;
+    const std::string peer_desc =
+            cache->describe_blocks(reader._cache_hash, 0, buffer.size() - 1, &any_peer);
+    EXPECT_TRUE(any_peer) << peer_desc;
+    EXPECT_NE(peer_desc.find("DOWNLOADED from peer 127.0.0.1 cached"), std::string::npos)
+            << peer_desc;
+
+    config::enable_cache_read_from_peer = false;
+    const size_t tail = content.size() - 2;
+    ASSERT_TRUE(reader.read_at(tail, Slice(buffer.data(), 2), &bytes_read, &io_ctx).ok());
+    const std::string remote_desc =
+            cache->describe_blocks(reader._cache_hash, tail, content.size() - 1, &any_peer);
+    EXPECT_FALSE(any_peer) << remote_desc;
+    EXPECT_NE(remote_desc.find("from remote"), std::string::npos) << remote_desc;
+    EXPECT_EQ(cache->describe_blocks(UInt128Wrapper(), 0, 1, &any_peer), "none cached");
+}
+
 TEST_F(CachedRemoteFileReaderPeerTest, read_at_peer_dryrun_downloads_cache_without_copying_result) {
     const std::string content = "abcdefghijklmnop";
     const fs::path file_path =

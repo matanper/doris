@@ -21,6 +21,11 @@
 #include <memory>
 #include <utility>
 
+#include "io/cache/block_file_cache.h"
+#include "io/cache/block_file_cache_factory.h"
+#include "io/cache/file_cache_common.h"
+#include "io/fs/packed_file_system.h"
+#include "io/fs/packed_file_trailer.h"
 #include "runtime/memory/untracked_heap_account.h"
 #include "storage/index/inverted/inverted_index_compound_reader.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
@@ -243,6 +248,118 @@ Result<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>> IndexFileReader::
 std::string IndexFileReader::get_index_file_cache_key(const TabletIndex* index_meta) const {
     return InvertedIndexDescriptor::get_index_file_cache_key(
             _index_path_prefix, index_meta->index_id(), index_meta->get_index_suffix());
+}
+
+Status IndexFileReader::read_range_from_storage(const TabletIndex* index_meta, int64_t offset,
+                                                int64_t length, std::string* out) const {
+    if (_fs == nullptr || offset < 0 || length < 0) {
+        return Status::InvalidArgument("cannot read index file range [{}, +{}) from storage",
+                                       offset, length);
+    }
+    io::FileReaderOptions opts;
+    opts.cache_type = io::FileCachePolicy::NO_CACHE;
+    opts.tablet_id = _tablet_id;
+    io::FileReaderSPtr reader;
+    RETURN_IF_ERROR(_fs->open_file(get_index_file_path(index_meta), &reader, &opts));
+    out->resize(static_cast<size_t>(length));
+    size_t bytes_read = 0;
+    RETURN_IF_ERROR(reader->read_at(static_cast<size_t>(offset), Slice(out->data(), out->size()),
+                                    &bytes_read));
+    if (bytes_read != out->size()) {
+        return Status::Corruption("short read of index file range [{}, +{}): {} bytes", offset,
+                                  length, bytes_read);
+    }
+    return Status::OK();
+}
+
+Status IndexFileReader::packed_slice_locations(const TabletIndex* index_meta,
+                                               io::PackedSliceLocation* used,
+                                               std::string* used_source,
+                                               io::PackedSliceLocation* recorded,
+                                               bool* recorded_found) const {
+    *recorded_found = false;
+    const auto* packed_fs = dynamic_cast<const io::PackedFileSystem*>(_fs.get());
+    if (packed_fs == nullptr) {
+        return Status::Error<ErrorCode::NOT_FOUND, false>("index file system is not packed");
+    }
+    const std::string path = get_index_file_path(index_meta);
+    const char* source = nullptr;
+    if (!packed_fs->find_slice_location(io::Path(path), used, &source)) {
+        return Status::Error<ErrorCode::NOT_FOUND, false>("index file {} is not in a packed file",
+                                                          path);
+    }
+    *used_source = source;
+    cloud::PackedFileFooterPB footer;
+    uint32_t version = 0;
+    RETURN_IF_ERROR(io::read_packed_file_trailer(packed_fs->inner_fs(), used->packed_file_path,
+                                                 used->packed_file_size, &footer, &version));
+    for (const auto& slice : footer.packed_file_info().slices()) {
+        if (slice.path() == path) {
+            *recorded = *used;
+            recorded->offset = slice.offset();
+            recorded->size = slice.size();
+            *recorded_found = true;
+            break;
+        }
+    }
+    return Status::OK();
+}
+
+Status IndexFileReader::read_range_at_slice(const io::PackedSliceLocation& slice, int64_t offset,
+                                            int64_t length, std::string* out) const {
+    const auto* packed_fs = dynamic_cast<const io::PackedFileSystem*>(_fs.get());
+    if (packed_fs == nullptr || offset < 0 || length < 0 || offset + length > slice.size) {
+        return Status::InvalidArgument("cannot read [{}, +{}) of a {}-byte packed slice", offset,
+                                       length, slice.size);
+    }
+    io::FileReaderOptions opts;
+    opts.cache_type = io::FileCachePolicy::NO_CACHE;
+    if (slice.packed_file_size > 0) {
+        opts.file_size = slice.packed_file_size;
+    }
+    io::FileReaderSPtr reader;
+    RETURN_IF_ERROR(
+            packed_fs->inner_fs()->open_file(io::Path(slice.packed_file_path), &reader, &opts));
+    out->resize(static_cast<size_t>(length));
+    size_t bytes_read = 0;
+    RETURN_IF_ERROR(reader->read_at(static_cast<size_t>(slice.offset + offset),
+                                    Slice(out->data(), out->size()), &bytes_read));
+    if (bytes_read != out->size()) {
+        return Status::Corruption("short read of packed slice range [{}, +{}): {} bytes", offset,
+                                  length, bytes_read);
+    }
+    return Status::OK();
+}
+
+std::string IndexFileReader::describe_cached_blocks(const TabletIndex* index_meta, int64_t offset,
+                                                    int64_t length, bool* any_peer) const {
+    *any_peer = false;
+    auto* factory = io::FileCacheFactory::instance();
+    if (!config::enable_file_cache || factory == nullptr ||
+        factory->get_cache_instance_size() == 0 || offset < 0 || length <= 0) {
+        return "no file cache";
+    }
+    const auto hash =
+            io::BlockFileCache::hash(io::remote_file_cache_name(get_index_file_path(index_meta)));
+    auto* cache = factory->get_by_path(hash);
+    if (cache == nullptr) {
+        return "no file cache";
+    }
+    return cache->describe_blocks(hash, static_cast<size_t>(offset),
+                                  static_cast<size_t>(offset + length - 1), any_peer);
+}
+
+void IndexFileReader::evict_cached_index_file(const TabletIndex* index_meta) const {
+    auto* factory = io::FileCacheFactory::instance();
+    if (!config::enable_file_cache || factory == nullptr ||
+        factory->get_cache_instance_size() == 0) {
+        return;
+    }
+    const auto hash =
+            io::BlockFileCache::hash(io::remote_file_cache_name(get_index_file_path(index_meta)));
+    if (auto* cache = factory->get_by_path(hash); cache != nullptr) {
+        cache->remove_if_cached_async(hash);
+    }
 }
 
 std::string IndexFileReader::get_index_file_path(const TabletIndex* index_meta) const {

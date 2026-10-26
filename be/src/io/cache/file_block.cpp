@@ -17,6 +17,7 @@
 
 #include "io/cache/file_block.h"
 
+#include <arpa/inet.h>
 #include <butil/iobuf.h>
 #include <glog/logging.h>
 // IWYU pragma: no_include <bits/chrono.h>
@@ -265,6 +266,37 @@ Status FileBlock::change_cache_type_lock(FileCacheType new_type,
     _mgr->change_cache_type(_key.hash, _block_range.left, new_type, cache_lock);
     _key.meta.type = new_type;
     return Status::OK();
+}
+
+std::string FileBlock::fill_source_desc() const {
+    switch (fill_source()) {
+    case FillSource::REMOTE:
+        return "remote";
+    case FillSource::PEER:
+    case FillSource::PEER_SERVER_FILL: {
+        char ip[INET_ADDRSTRLEN] = "?";
+        const uint32_t addr = _fill_peer_ipv4.load(std::memory_order_relaxed);
+        if (addr != 0) {
+            in_addr in {};
+            in.s_addr = addr;
+            inet_ntop(AF_INET, &in, ip, sizeof(ip));
+        }
+        return std::string("peer ") + ip +
+               (fill_source() == FillSource::PEER_SERVER_FILL ? " server fill" : " cached");
+    }
+    case FillSource::FILLED_FOR_PEER:
+        return "remote, filled for a peer";
+    case FillSource::LOCAL_WRITE:
+        return "local write";
+    case FillSource::UNKNOWN:
+        break;
+    }
+    return "unrecorded";
+}
+
+uint32_t FileBlock::ipv4_of(const std::string& host) {
+    in_addr in {};
+    return inet_pton(AF_INET, host.c_str(), &in) == 1 ? in.s_addr : 0;
 }
 
 FileBlock::State FileBlock::wait() {

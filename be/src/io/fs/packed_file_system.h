@@ -42,6 +42,14 @@ public:
     PackedFileSystem(const PackedFileSystem&) = delete;
     PackedFileSystem& operator=(const PackedFileSystem&) = delete;
 
+    // Where open_file finds `file` in a packed file: the rowset meta's index map first, then this
+    // BE's packed file manager. Returns false for a file that is not packed. source names the map
+    // the location came from.
+    bool find_slice_location(const Path& file, PackedSliceLocation* location,
+                             const char** source) const;
+
+    const FileSystemSPtr& inner_fs() const { return _inner_fs; }
+
 protected:
     // Create file and wrap writer with PackedFileWriter
     Status create_file_impl(const Path& file, FileWriterPtr* writer,

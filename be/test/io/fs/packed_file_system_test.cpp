@@ -30,7 +30,10 @@
 #include "io/fs/file_reader.h"
 #include "io/fs/file_system.h"
 #include "io/fs/file_writer.h"
+#include "io/fs/local_file_system.h"
+#include "io/fs/packed_file_trailer.h"
 #include "io/fs/path.h"
+#include "util/coding.h"
 #include "util/slice.h"
 
 namespace doris::io {
@@ -486,6 +489,73 @@ TEST_F(PackedFileSystemTest, FileSizeWithoutIndexMapInitialized) {
     Status st = merge_fs.file_size(file_path, &file_size);
     // Should fail because index map is not initialized
     EXPECT_FALSE(st.ok());
+}
+
+} // namespace doris::io
+
+namespace doris::io {
+
+// open_file and find_slice_location agree: the rowset meta's location wins over this BE's packed
+// file manager, which is consulted only for files the rowset meta does not list.
+TEST_F(PackedFileSystemTest, FindSliceLocationPrefersTheRowsetMeta) {
+    std::unordered_map<std::string, PackedSliceLocation> index_map;
+    PackedSliceLocation from_meta;
+    from_meta.packed_file_path = "packed_from_meta";
+    from_meta.offset = 7;
+    from_meta.size = 11;
+    index_map["meta_file"] = from_meta;
+    PackedFileSystem packed_fs(_inner_fs, index_map, _append_info);
+
+    PackedSliceLocation found;
+    const char* source = nullptr;
+    ASSERT_TRUE(packed_fs.find_slice_location(Path("meta_file"), &found, &source));
+    EXPECT_STREQ(source, "rowset_meta");
+    EXPECT_EQ(found.packed_file_path, "packed_from_meta");
+    EXPECT_EQ(found.offset, 7);
+    EXPECT_EQ(found.size, 11);
+    EXPECT_FALSE(packed_fs.find_slice_location(Path("not_packed_file"), &found, &source));
+}
+
+// The trailer read through a file system finds every slice the packed file records.
+TEST(PackedFileTrailerTest, ReadThroughFileSystemFindsTheRecordedSlices) {
+    cloud::PackedFileFooterPB footer;
+    auto* info = footer.mutable_packed_file_info();
+    std::string body = std::string(100, 'a') + std::string(50, 'b');
+    auto* first = info->add_slices();
+    first->set_path("data/1/r_0.idx");
+    first->set_offset(0);
+    first->set_size(100);
+    auto* second = info->add_slices();
+    second->set_path("data/1/r_0.dat");
+    second->set_offset(100);
+    second->set_size(50);
+    std::string serialized;
+    ASSERT_TRUE(footer.SerializeToString(&serialized));
+    std::string content = body + serialized;
+    put_fixed32_le(&content, static_cast<uint32_t>(serialized.size()));
+    put_fixed32_le(&content, kPackedFileTrailerVersion);
+
+    auto fs = global_local_filesystem();
+    const std::string path = "./ut_dir/packed_trailer_read_test.bin";
+    static_cast<void>(fs->create_directory("./ut_dir"));
+    {
+        FileWriterPtr writer;
+        ASSERT_TRUE(fs->create_file(path, &writer).ok());
+        ASSERT_TRUE(writer->append(Slice(content)).ok());
+        ASSERT_TRUE(writer->close().ok());
+    }
+    for (int64_t size : {static_cast<int64_t>(content.size()), static_cast<int64_t>(-1)}) {
+        cloud::PackedFileFooterPB read;
+        uint32_t version = 0;
+        Status st = read_packed_file_trailer(fs, path, size, &read, &version);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(version, kPackedFileTrailerVersion);
+        ASSERT_EQ(read.packed_file_info().slices_size(), 2);
+        EXPECT_EQ(read.packed_file_info().slices(1).path(), "data/1/r_0.dat");
+        EXPECT_EQ(read.packed_file_info().slices(1).offset(), 100);
+        EXPECT_EQ(read.packed_file_info().slices(1).size(), 50);
+    }
+    static_cast<void>(fs->delete_file(path));
 }
 
 } // namespace doris::io
