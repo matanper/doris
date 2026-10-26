@@ -2895,6 +2895,25 @@ public class Config extends ConfigBase {
                     + "not guarded for correctness reasons; see the NOTE in BaseAnalysisTask."})
     public static long statistics_max_string_column_length = 1024;
 
+    @ConfField(mutable = true, description = {
+            "sample analyze 是否跳过全表 MIN/MAX 查询。sample analyze 默认对每一列额外执行一次不采样的 "
+                    + "MIN/MAX 查询以获得准确的上下界。开启后不再执行该查询：如果主 SQL 本身就扫描全表，"
+                    + "则 MIN/MAX 从主 SQL 中计算，否则 MIN/MAX 记为未知（NULL）。",
+            "Whether sample analyze skips the table-wide MIN/MAX query. By default, sample analyze runs an extra "
+                    + "unsampled MIN/MAX query per column to get exact bounds. When enabled, that query is not "
+                    + "issued: MIN/MAX are computed by the main statistics SQL when it scans the whole table anyway, "
+                    + "and are recorded as unknown (NULL) otherwise. Sampled extremes are never used as bounds."})
+    public static boolean skip_table_wide_min_max_in_sample_analyze = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "表的自动收集作业失败后，在该时间（毫秒）内不再自动收集这张表。失败不会改变已有统计信息的新鲜度。"
+                    + "失败时间只保存在 Master FE 内存中，FE 重启或切主后会丢失。≤ 0 表示关闭。",
+            "After an automatic analyze job of a table fails, the table is not auto analyzed again until this "
+                    + "many milliseconds have passed since the failure. A failure does not change the freshness "
+                    + "of existing statistics. The failure time is kept in the master FE memory only, so a "
+                    + "restart or master failover forgets it. A value <= 0 disables the backoff."})
+    public static long auto_analyze_failure_backoff_in_millis = 3600000L;
+
     @Deprecated
     @ConfField
     public static final int period_analyze_simultaneously_running_task_num = 1;
@@ -3024,6 +3043,144 @@ public class Config extends ConfigBase {
             "The new partition bucket number calculated in the auto bucket exceeds the percentage "
             + "of the previous partition's bucket number, which is considered an abnormal case alert."})
     public static double autobucket_out_of_bounds_percent_threshold = 0.5;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "自动分区按 range 创建的新分区不在最新一端时（例如导入历史数据），按时间上与它最近的有数据的分区估算分桶数，"
+                    + "而不是按最新的分区估算",
+            "When an auto range partition is created anywhere but at the newest end of the table, as when "
+                    + "historical data is loaded, estimate its buckets from the partitions with data nearest to it "
+                    + "in range instead of from the newest partitions."})
+    public static boolean autobucket_use_nearest_partitions = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "autobucket_use_nearest_partitions 生效时，只有起点与新分区相距不超过这么多个分区间隔的有数据分区参与估算；"
+                    + "没有这样的分区时使用 autobucket_min_buckets",
+            "With autobucket_use_nearest_partitions, only partitions with data starting within this many partition "
+                    + "intervals of the new partition take part in the estimate. Without any, the new partition "
+                    + "gets autobucket_min_buckets."})
+    public static int autobucket_nearest_partitions_window = 7;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "存算分离模式下，对不再有新版本写入、且 segment 数相对其大小过多的 tablet 自动发起 full compaction",
+            "In cloud mode, run a full compaction on each tablet that no longer receives new versions and has "
+                    + "many more segments than its size needs."})
+    public static boolean enable_final_compaction = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "查找需要 final compaction 的 tablet 的间隔，单位秒",
+            "Interval in seconds between scans for tablets that need a final compaction."})
+    public static long final_compaction_check_interval_second = 300;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区在这么多秒内没有新的可见版本后，其 tablet 才会被 final compaction",
+            "A partition's tablets get a final compaction only after no new version became visible in it "
+                    + "for this many seconds."})
+    public static long final_compaction_quiet_second = 7200;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 segment 数至少是其大小所需 segment 数的这么多倍时才会被 final compaction",
+            "A tablet gets a final compaction only when it has at least this many times the segments its "
+                    + "size needs at the table's output segment size."})
+    public static double final_compaction_segment_ratio = 4.0;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "segment 数少于这个值的 tablet 不做 final compaction",
+            "Tablets with fewer segments than this never get a final compaction."})
+    public static long final_compaction_min_segments = 16;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "非 time_series 表 compaction 输出 segment 的大小（MB），与 BE 的 vertical_compaction_max_segment_size 一致",
+            "Output segment size in MB of compactions on tables without the time_series policy; matches the "
+                    + "BE's vertical_compaction_max_segment_size."})
+    public static long final_compaction_default_target_mbytes = 1024;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "执行 final compaction 的计算组；为空时使用 tablet 当前所在的计算组",
+            "Compute group whose backends run final compactions. When empty, a compute group the tablet is "
+                    + "already mapped to is used."})
+    public static String final_compaction_compute_group = "";
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每个 BE 同时执行的 final compaction 数上限；BE 的 max_base_compaction_threads 不应小于它",
+            "Maximum number of final compactions running at once on one backend. The backend's "
+                    + "max_base_compaction_threads should not be lower."})
+    public static int final_compaction_max_tasks_per_be = 4;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每轮最多发起的 final compaction 数",
+            "Maximum number of final compactions dispatched in one scan."})
+    public static int final_compaction_max_dispatch_per_round = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "BE 在这么多秒内没有报告结束的 final compaction 被视为失败",
+            "A final compaction whose end the backend has not reported after this many seconds counts as "
+                    + "failed."})
+    public static long final_compaction_task_timeout_second = 14400;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 final compaction 结束（或失败）后，这么多秒内不会再次发起",
+            "After a tablet's final compaction ends or fails, it is not dispatched again for this many "
+                    + "seconds."})
+    public static long final_compaction_cooldown_second = 21600;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "存算分离模式下，对 rowset 积压多、且近期没有 cumulative compaction 的 tablet，向其所在计算组的 BE 发起 "
+                    + "cumulative compaction；BE 只对其缓存中的 tablet 自动 compaction，重启后未被访问的 tablet 依赖它",
+            "In cloud mode, send a cumulative compaction to each tablet with a rowset backlog and no recent "
+                    + "cumulative compaction, on its backend in the compute group that loads it. A backend only "
+                    + "compacts the tablets it has cached, so after a restart the tablets nothing reads or loads "
+                    + "depend on this."})
+    public static boolean enable_compaction_debt_dispatch = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "在云模式下，定期向每个 BE 发送它所拥有的 tablet 集合，BE 据此释放长时间未使用的非本 BE 拥有的 tablet。",
+            "In cloud mode, periodically send each backend the full set of tablets it owns, the ones whose "
+                    + "primary backend in its compute group it is. A backend drops a cached tablet it does not own "
+                    + "once nothing has used it for be config foreign_tablet_idle_evict_sec."})
+    public static boolean enable_cloud_tablet_ownership_publish = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "向 BE 发送其所拥有的 tablet 集合的间隔，单位秒。",
+            "Interval in seconds between publishes of the tablets each backend owns."})
+    public static long cloud_tablet_ownership_publish_interval_second = 300;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "rowset 数不少于这个值的 tablet 才算有积压",
+            "A tablet has a rowset backlog when it has at least this many rowsets."})
+    public static long compaction_debt_min_rowsets = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 在这么多秒内没有 cumulative compaction 才会被发起",
+            "A tablet is sent a cumulative compaction only when none committed on it for this many seconds."})
+    public static long compaction_debt_idle_second = 1800;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "发起 cumulative compaction 的计算组；为空时使用最近导入或 compaction 该 tablet 的计算组",
+            "Compute group whose backends get the cumulative compactions. When empty, the compute group that "
+                    + "last loaded or compacted the tablet."})
+    public static String compaction_debt_compute_group = "";
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每个 BE 同时由 FE 发起的 cumulative compaction 数上限",
+            "Maximum number of cumulative compactions this scheduler runs at once on one backend."})
+    public static int compaction_debt_max_tasks_per_be = 4;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "每轮最多发起的 cumulative compaction 数",
+            "Maximum number of cumulative compactions sent in one scan."})
+    public static int compaction_debt_max_dispatch_per_round = 64;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "BE 在这么多秒内没有报告结束的 cumulative compaction 被视为失败",
+            "A cumulative compaction whose end the backend has not reported after this many seconds counts "
+                    + "as failed."})
+    public static long compaction_debt_task_timeout_second = 3600;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "tablet 的 cumulative compaction 结束后，这么多秒内不会再次发起；BE 此时已缓存该 tablet，会继续自行 compaction",
+            "After a tablet's cumulative compaction ends, it is not sent another for this many seconds; its "
+                    + "backend has the tablet cached by then and keeps compacting it."})
+    public static long compaction_debt_cooldown_second = 900;
 
     @ConfField(description = {"(已弃用，被 arrow_flight_max_connection 替代) Arrow Flight Server 中所有用户 token 的缓存上限，"
             + "超过后 LRU 淘汰，arrow flight sql 是无状态的协议，连接通常不会主动断开，"
