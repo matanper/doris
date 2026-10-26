@@ -126,6 +126,7 @@ protected:
                                     const std::function<void(int64_t, int64_t)>& error_handler);
 
     void construct_index_compaction_columns(RowsetWriterContext& ctx);
+    void construct_variant_index_compaction_paths(RowsetWriterContext& ctx);
 
     virtual Status construct_output_rowset_writer(RowsetWriterContext& ctx) = 0;
 
