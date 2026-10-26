@@ -20,6 +20,7 @@
 
 #include "io/cache/block_file_cache_factory.h"
 
+#include <filesystem>
 #include <glog/logging.h>
 
 #include <string>
@@ -80,8 +81,21 @@ Status build_file_cache(const std::string& cache_base_path, FileCacheSettings fi
             LOG(INFO) << "path " << cache_base_path << " does not exist, create " << st.msg();
             RETURN_IF_ERROR(st);
         } else if (config::clear_file_cache) {
-            RETURN_IF_ERROR(fs->delete_directory(cache_base_path));
-            RETURN_IF_ERROR(fs->create_directory(cache_base_path));
+            // Clears the cache's entries but not the index tmp dir, which may live inside it.
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator(cache_base_path, ec)) {
+                if (entry.path().filename().native() == FILE_CACHE_INDEX_TMP_DIR_NAME) {
+                    continue;
+                }
+                if (entry.is_directory()) {
+                    RETURN_IF_ERROR(fs->delete_directory(entry.path()));
+                } else {
+                    RETURN_IF_ERROR(fs->delete_file(entry.path()));
+                }
+            }
+            if (ec) {
+                return Status::IOError("failed to list {}: {}", cache_base_path, ec.message());
+            }
         }
 
         struct statfs stat;

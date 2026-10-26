@@ -772,4 +772,32 @@ TEST_F(FSFileCacheLeakCleanerTest, is_cache_prefix_directory_filters_entries) {
     EXPECT_FALSE(storage.is_cache_prefix_directory(fs::directory_entry(base / "plain_file")));
 }
 
+// The index tmp dir that index_tmp_file_dirs may put inside a cache path survives every walk of
+// the cache: version cleanup, the scan of the directory layout, the leak scan and clear().
+TEST_F(FSFileCacheLeakCleanerTest, index_tmp_dir_survives_cache_walks) {
+    ScopedLeakCleanerConfig guard;
+    auto dir = prepare_test_dir();
+    FileCacheSettings settings = default_settings();
+    BlockFileCache mgr(dir.string(), settings);
+    FSFileCacheStorage storage;
+    setup_storage(storage, mgr, dir);
+    const fs::path index_tmp = dir / FILE_CACHE_INDEX_TMP_DIR_NAME;
+    const fs::path temp_file = index_tmp / "rowset_0_1@event%2Emessage" / "_0.frq";
+    fs::create_directories(temp_file.parent_path());
+    std::ofstream(temp_file) << "postings";
+    fs::create_directories(dir / "abc" / "0123456789abcdef0123456789abcdef_0");
+
+    EXPECT_FALSE(storage.is_cache_prefix_directory(fs::directory_entry(index_tmp)));
+    storage.remove_old_version_directories();
+    EXPECT_TRUE(fs::exists(temp_file));
+    storage.load_cache_info_into_memory_from_fs(&mgr);
+    EXPECT_TRUE(fs::exists(temp_file));
+    storage.cleanup_leaked_files(&mgr, 0);
+    EXPECT_TRUE(fs::exists(temp_file));
+    std::string msg;
+    EXPECT_TRUE(storage.clear(msg).ok()) << msg;
+    EXPECT_TRUE(fs::exists(temp_file));
+    EXPECT_FALSE(fs::exists(dir / "abc"));
+}
+
 } // namespace doris::io
