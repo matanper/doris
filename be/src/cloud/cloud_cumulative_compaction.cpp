@@ -426,7 +426,6 @@ Status CloudCumulativeCompaction::modify_rowsets() {
                 "CumulativeCompaction.modify_rowsets.trigger_abort_job_failed for tablet_id {}",
                 cloud_tablet()->tablet_id());
     });
-    RETURN_IF_ERROR(cloud_tablet()->check_gap_inputs(_input_rowsets));
     cloud::FinishTabletJobResponse resp;
     auto st = _engine.meta_mgr().commit_tablet_job(job, &resp);
     if (_tablet->keys_type() == KeysType::UNIQUE_KEYS &&
@@ -590,7 +589,7 @@ Status CloudCumulativeCompaction::advance_cumulative_point_before_pick(
         output_cumulative_point = input_cumulative_point;
         _base_compaction_cnt = cloud_tablet()->base_compaction_cnt();
         _cumulative_compaction_cnt = cloud_tablet()->cumulative_compaction_cnt();
-        cloud_tablet()->traverse_rowsets_and_gaps_unlocked(
+        cloud_tablet()->traverse_rowsets_unlocked(
                 [&candidates, input_cumulative_point,
                  min_conflict_version](const RowsetSharedPtr& rs) {
                     if (rs->start_version() >= input_cumulative_point &&
@@ -700,7 +699,7 @@ Status CloudCumulativeCompaction::pick_rowsets_to_compact() {
             int64_t range_start_version =
                     std::max(std::max(_picked_cumulative_point, start_version),
                              cloud_tablet()->alter_version() + 1);
-            cloud_tablet()->traverse_rowsets_and_gaps_unlocked(
+            cloud_tablet()->traverse_rowsets_unlocked(
                     [&candidates, range_start_version, end_version](const RowsetSharedPtr& rs) {
                         if (rs->start_version() >= range_start_version &&
                             rs->start_version() < end_version) {

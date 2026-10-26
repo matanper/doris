@@ -401,7 +401,6 @@ Status CloudBaseCompaction::modify_rowsets() {
         compaction_job->set_delete_bitmap_lock_initiator(initiator);
     }
 
-    RETURN_IF_ERROR(static_cast<CloudTablet*>(_tablet.get())->check_gap_inputs(_input_rowsets));
     cloud::FinishTabletJobResponse resp;
     auto st = _engine.meta_mgr().commit_tablet_job(job, &resp);
     if (_tablet->keys_type() == KeysType::UNIQUE_KEYS &&

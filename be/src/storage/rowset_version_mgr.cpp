@@ -127,9 +127,6 @@ static bvar::LatencyRecorder g_remote_fetch_tablet_rowsets_latency("remote_fetch
                             tablet_id(), version.first, version.second);
                 }
             }
-            if (auto rowset = on_demand_rowset_unlocked(version)) {
-                return rowset;
-            }
             return ResultError(Status::Error<CAPTURE_ROWSET_ERROR>(
                     "failed to find rowset for version={}", version.to_string()));
         };

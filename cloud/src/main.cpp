@@ -137,7 +137,7 @@ static void help() {
 
 static std::string build_info() {
     std::stringstream ss;
-    // clang-format off
+// clang-format off
 #if defined(NDEBUG)
     ss << "version:{" DORIS_CLOUD_BUILD_VERSION "-release}"
 #else
@@ -232,16 +232,6 @@ int main(int argc, char** argv) {
     LOG(INFO) << "try to start " << process_name;
     LOG(INFO) << build_info();
     std::cerr << build_info() << std::endl;
-    if (!config::advance_txn_lazy_commit_during_reads ||
-        !config::wait_txn_lazy_commit_during_reads) {
-        // get_rowset then returns a partition version that may include a lazily committed txn
-        // whose rowsets are not yet formal, and BEs fill such versions as empty holes.
-        LOG(ERROR) << "UNSAFE: advance_txn_lazy_commit_during_reads="
-                   << config::advance_txn_lazy_commit_during_reads
-                   << " wait_txn_lazy_commit_during_reads="
-                   << config::wait_txn_lazy_commit_during_reads
-                   << "; BEs may fill versions that hold data as empty version holes";
-    }
 
     // Check the local ip before starting the meta service or recycler.
     std::string ip = get_local_ip(config::priority_networks);

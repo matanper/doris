@@ -168,8 +168,6 @@ void finish_compaction_job(MetaService* meta_service, int64_t tablet_id, const s
         compaction->add_input_versions(input_version.second);
         compaction->set_check_input_versions_range(true);
         compaction->add_output_versions(input_version.second);
-        // At most one input rowset per version in the range.
-        compaction->set_num_input_rowsets(input_version.second - input_version.first + 1);
     }
     if (txn_id > 0) {
         compaction->add_txn_id(txn_id);
@@ -1085,8 +1083,7 @@ TEST(MetaServiceJobTest, CompactionJobTest) {
         compaction->set_num_output_rowsets(dist(rng));
         compaction->set_num_output_segments(dist(rng));
         compaction->set_num_input_rows(dist(rng));
-        // At least the input rowset keys the test puts in the input range.
-        compaction->set_num_input_rowsets(dist(rng) + 8);
+        compaction->set_num_input_rowsets(dist(rng));
         compaction->set_num_input_segments(dist(rng));
         compaction->set_size_input_rowsets(dist(rng));
         compaction->set_size_output_rowsets(dist(rng));
@@ -1880,8 +1877,7 @@ TEST(MetaServiceJobTest, DeleteBitmapUpdateLockCompatibilityTest) {
         compaction->set_num_output_rowsets(dist(rng));
         compaction->set_num_output_segments(dist(rng));
         compaction->set_num_input_rows(dist(rng));
-        // At least the input rowset keys the test puts in the input range.
-        compaction->set_num_input_rowsets(dist(rng) + 8);
+        compaction->set_num_input_rowsets(dist(rng));
         compaction->set_num_input_segments(dist(rng));
         compaction->set_size_input_rowsets(dist(rng));
         compaction->set_size_output_rowsets(dist(rng));
@@ -3446,8 +3442,7 @@ void testCompactionJobWithMoWTest(int lock_version) {
         compaction->set_num_output_rowsets(dist(rng));
         compaction->set_num_output_segments(dist(rng));
         compaction->set_num_input_rows(dist(rng));
-        // At least the input rowset keys the test puts in the input range.
-        compaction->set_num_input_rowsets(dist(rng) + 8);
+        compaction->set_num_input_rowsets(dist(rng));
         compaction->set_num_input_segments(dist(rng));
         compaction->set_size_input_rowsets(dist(rng));
         compaction->set_size_output_rowsets(dist(rng));
@@ -4688,111 +4683,6 @@ TEST(MetaServiceJobTest, ParallelCumuCompactionTest) {
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
 }
 
-// A compaction whose input version range holds a rowset it did not declare is rejected before
-// anything is removed, and the rowset survives; declaring it lets the same job commit.
-TEST(MetaServiceJobTest, CompactionCommitRejectsUndeclaredRowsetInInputRange) {
-    auto meta_service = get_meta_service();
-    auto sp = SyncPoint::get_instance();
-    DORIS_CLOUD_DEFER {
-        SyncPoint::get_instance()->clear_all_call_backs();
-    };
-    sp->set_call_back("get_instance_id", [&](auto&& args) {
-        auto* ret = try_any_cast_ret<std::string>(args);
-        ret->first = instance_id;
-        ret->second = true;
-    });
-    sp->enable_processing();
-
-    constexpr int64_t table_id = 1;
-    constexpr int64_t index_id = 2;
-    constexpr int64_t partition_id = 3;
-    constexpr int64_t tablet_id = 40101;
-    ASSERT_NO_FATAL_FAILURE(
-            create_tablet(meta_service.get(), table_id, index_id, partition_id, tablet_id, false));
-    std::vector<doris::RowsetMetaCloudPB> input_rowsets;
-    for (int64_t version = 2; version <= 4; ++version) {
-        input_rowsets.push_back(create_rowset(tablet_id, version, version));
-    }
-    insert_rowsets(meta_service->txn_kv().get(), table_id, index_id, partition_id, tablet_id,
-                   input_rowsets);
-
-    StartTabletJobResponse start_res;
-    start_compaction_job(meta_service.get(), tablet_id, "job", "BE1", 0, 0,
-                         TabletCompactionJobPB::CUMULATIVE, start_res, {2, 4});
-    ASSERT_EQ(start_res.status().code(), MetaServiceCode::OK);
-    auto output = create_rowset(tablet_id, 2, 4);
-    CreateRowsetResponse rowset_res;
-    prepare_rowset(meta_service.get(), output, rowset_res);
-    ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
-    commit_rowset(meta_service.get(), output, rowset_res);
-    ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
-
-    // The job read versions 2 and 4 only; version 3 landed in its range.
-    FinishTabletJobResponse finish_res;
-    finish_rowset_compaction_job(meta_service.get(), tablet_id, "job",
-                                 TabletCompactionJobPB::CUMULATIVE, output, 2, 5, finish_res);
-    ASSERT_EQ(finish_res.status().code(), MetaServiceCode::UNDEFINED_ERR);
-    EXPECT_NE(finish_res.status().msg().find("declared_input_rowsets=2 found_rowset_keys=3"),
-              std::string::npos)
-            << finish_res.status().msg();
-    std::unique_ptr<Transaction> txn;
-    ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
-    std::string value;
-    EXPECT_EQ(txn->get(meta_rowset_key({instance_id, tablet_id, 3}), &value), TxnErrorCode::TXN_OK);
-
-    finish_res.Clear();
-    finish_rowset_compaction_job(meta_service.get(), tablet_id, "job",
-                                 TabletCompactionJobPB::CUMULATIVE, output, 3, 5, finish_res);
-    ASSERT_EQ(finish_res.status().code(), MetaServiceCode::OK) << finish_res.status().msg();
-}
-
-// A compaction of hole rowsets only declares no inputs and finds no rowset meta keys in its
-// range: the range check lets it commit.
-TEST(MetaServiceJobTest, CompactionCommitOfHoleRowsetsPassesRangeCheck) {
-    auto meta_service = get_meta_service();
-    auto sp = SyncPoint::get_instance();
-    DORIS_CLOUD_DEFER {
-        SyncPoint::get_instance()->clear_all_call_backs();
-    };
-    sp->set_call_back("get_instance_id", [&](auto&& args) {
-        auto* ret = try_any_cast_ret<std::string>(args);
-        ret->first = instance_id;
-        ret->second = true;
-    });
-    sp->enable_processing();
-
-    constexpr int64_t table_id = 1;
-    constexpr int64_t index_id = 2;
-    constexpr int64_t partition_id = 3;
-    constexpr int64_t tablet_id = 40102;
-    ASSERT_NO_FATAL_FAILURE(
-            create_tablet(meta_service.get(), table_id, index_id, partition_id, tablet_id, false));
-    // Versions 3-5 are holes: the BE filled them, the meta service holds no key for them.
-    std::vector<doris::RowsetMetaCloudPB> rowsets {create_rowset(tablet_id, 2, 2),
-                                                   create_rowset(tablet_id, 6, 6)};
-    insert_rowsets(meta_service->txn_kv().get(), table_id, index_id, partition_id, tablet_id,
-                   rowsets);
-
-    StartTabletJobResponse start_res;
-    start_compaction_job(meta_service.get(), tablet_id, "holes", "BE1", 0, 0,
-                         TabletCompactionJobPB::CUMULATIVE, start_res, {3, 5});
-    ASSERT_EQ(start_res.status().code(), MetaServiceCode::OK);
-    auto output = create_rowset(tablet_id, 3, 5, 0);
-    output.set_num_segments(0);
-    CreateRowsetResponse rowset_res;
-    prepare_rowset(meta_service.get(), output, rowset_res);
-    ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
-    commit_rowset(meta_service.get(), output, rowset_res);
-    ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
-
-    const int64_t mismatches_before = g_bvar_compaction_commit_range_mismatch.get_value();
-    FinishTabletJobResponse finish_res;
-    finish_rowset_compaction_job(meta_service.get(), tablet_id, "holes",
-                                 TabletCompactionJobPB::CUMULATIVE, output, 0, 2, finish_res);
-    EXPECT_EQ(finish_res.status().code(), MetaServiceCode::OK) << finish_res.status().msg();
-    EXPECT_EQ(g_bvar_compaction_commit_range_mismatch.get_value(), mismatches_before);
-}
-
 TEST(MetaServiceJobTest, LegacyParallelCumuFinishValidatesCurrentInputRange) {
     auto meta_service = get_meta_service();
 
@@ -5620,8 +5510,7 @@ TEST(MetaServiceJobTest, IdempotentCompactionJob) {
         compaction->set_num_output_rowsets(dist(rng));
         compaction->set_num_output_segments(dist(rng));
         compaction->set_num_input_rows(dist(rng));
-        // At least the input rowset keys the test puts in the input range.
-        compaction->set_num_input_rowsets(dist(rng) + 8);
+        compaction->set_num_input_rowsets(dist(rng));
         compaction->set_num_input_segments(dist(rng));
         compaction->set_size_input_rowsets(dist(rng));
         compaction->set_size_output_rowsets(dist(rng));

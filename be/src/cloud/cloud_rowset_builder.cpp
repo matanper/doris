@@ -23,7 +23,6 @@
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_tablet.h"
 #include "cloud/cloud_tablet_mgr.h"
-#include "cloud/config.h"
 #include "storage/storage_policy.h"
 
 namespace doris {
@@ -117,17 +116,9 @@ Status CloudRowsetBuilder::check_tablet_version_count() {
     return Status::OK();
 }
 
-bool CloudRowsetBuilder::empty_commit_adds_no_rowset(const CloudTablet& tablet) {
-    return config::skip_writing_empty_rowset_metadata && tablet.can_use_hole_rowset_version_range();
-}
-
 void CloudRowsetBuilder::update_tablet_stats() {
     DCHECK(cloud_tablet());
     DCHECK(_rowset);
-    if (_skip_writing_rowset_metadata && empty_commit_adds_no_rowset(*cloud_tablet())) {
-        cloud_tablet()->write_count.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
     add_rowset_to_tablet_stats(cloud_tablet(), _rowset.get());
 }
 

@@ -165,24 +165,13 @@ public:
                                           int64_t tablet_id);
 
     // Fill version holes by creating empty rowsets for missing versions
-    // With `lazy_commit_resolved` (the get_rowset response read `max_version` with no lazy-commit
-    // txn pending), holes of a tablet that can use implicit version gaps become gaps.
     Status fill_version_holes(CloudTablet* tablet, int64_t max_version,
-                              std::unique_lock<BthreadSharedMutex>& wlock,
-                              bool lazy_commit_resolved = false);
+                              std::unique_lock<BthreadSharedMutex>& wlock);
 
     // Create an empty rowset to fill a version hole
-    Status create_empty_rowset_for_hole(const CloudTablet* tablet, int64_t version,
+    Status create_empty_rowset_for_hole(CloudTablet* tablet, int64_t version,
                                         RowsetMetaSharedPtr prev_rowset_meta,
                                         RowsetSharedPtr* rowset);
-
-    // Create an empty rowset that fills every version in `versions`. Without `rowset_id`, which
-    // a hole covering several versions requires, the rowset id is derived from
-    // (tablet_id, first version).
-    Status create_empty_rowset_for_hole(const CloudTablet* tablet, const Version& versions,
-                                        RowsetMetaSharedPtr prev_rowset_meta,
-                                        RowsetSharedPtr* rowset,
-                                        const RowsetId* rowset_id = nullptr);
 
     Status list_snapshot(std::vector<SnapshotInfoPB>& snapshots);
     Status get_snapshot_properties(SnapshotSwitchStatus& switch_status,

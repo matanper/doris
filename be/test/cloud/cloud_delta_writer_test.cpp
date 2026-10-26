@@ -189,53 +189,12 @@ TEST_F(CloudDeltaWriterTest, UntouchedTabletCommitsWithoutRowsetWriter) {
     }
     // The make-visible path still finds this txn's empty rowset for the tablet
     EXPECT_TRUE(has_committed_rs_marker(20001));
-    // Its version goes to a hole rowset range, not a rowset of its own.
-    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 0);
-    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_rowsets(0), 0);
+    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 1);
+    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_rowsets(0), 1);
     EXPECT_EQ(tablet->fetch_add_approximate_num_segments(0), 0);
     EXPECT_EQ(tablet->fetch_add_approximate_num_rows(0), 0);
     EXPECT_EQ(tablet->write_count.load(), 1);
     EXPECT_GT(tablet->last_load_time_ms, 0);
-}
-
-// With implicit version gaps an untouched tablet's version becomes part of a gap, so its version
-// count stays put: loads that write other tablets of the partition never push it to the limit.
-TEST_F(CloudDeltaWriterTest, UntouchedTabletWithImplicitGapsKeepsItsVersionCount) {
-    const bool saved_gaps = config::enable_implicit_version_gaps;
-    config::enable_implicit_version_gaps = true;
-    auto tablet = cache_tablet(20010);
-    {
-        auto writer = make_writer(20010);
-        ASSERT_TRUE(close_untouched_writer(writer.get()).ok());
-        EXPECT_TRUE(writer->committed_without_rowset_writer());
-    }
-    config::enable_implicit_version_gaps = saved_gaps;
-    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 0);
-    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_rowsets(0), 0);
-    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_deltas(0), 0);
-    EXPECT_EQ(tablet->write_count.load(), 1);
-}
-
-// A tablet that fills each version hole with its own hole rowset (MoW, or with hole rowset
-// version ranges off) still counts the empty commit, since that rowset will exist.
-TEST_F(CloudDeltaWriterTest, UntouchedTabletWithOneHolePerVersionCountsTheCommit) {
-    auto mow = cache_tablet(20011, /*mow=*/true);
-    {
-        auto writer = make_writer(20011);
-        ASSERT_TRUE(close_untouched_writer(writer.get()).ok());
-    }
-    EXPECT_EQ(mow->fetch_add_approximate_num_rowsets(0), 1);
-
-    const bool saved_ranges = config::enable_hole_rowset_version_range;
-    config::enable_hole_rowset_version_range = false;
-    auto tablet = cache_tablet(20012);
-    {
-        auto writer = make_writer(20012);
-        ASSERT_TRUE(close_untouched_writer(writer.get()).ok());
-    }
-    config::enable_hole_rowset_version_range = saved_ranges;
-    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 1);
-    EXPECT_EQ(tablet->fetch_add_approximate_cumu_num_rowsets(0), 1);
 }
 
 TEST_F(CloudDeltaWriterTest, UntouchedTabletWithoutMakeVisibleLeavesNoMarker) {
@@ -245,7 +204,7 @@ TEST_F(CloudDeltaWriterTest, UntouchedTabletWithoutMakeVisibleLeavesNoMarker) {
     ASSERT_TRUE(close_untouched_writer(writer.get()).ok());
     EXPECT_TRUE(writer->committed_without_rowset_writer());
     EXPECT_FALSE(has_committed_rs_marker(20002));
-    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 0);
+    EXPECT_EQ(tablet->fetch_add_approximate_num_rowsets(0), 1);
 }
 
 TEST_F(CloudDeltaWriterTest, MowUntouchedTabletLeavesEmptyRowsetMarker) {
@@ -335,10 +294,10 @@ TEST_F(CloudDeltaWriterTest, SameBookkeepingAsRowsetBuilder) {
     EXPECT_TRUE(has_committed_rs_marker(20006));
     EXPECT_TRUE(has_committed_rs_marker(20007));
     for (auto* t : {base_tablet.get(), fix_tablet.get()}) {
-        EXPECT_EQ(t->fetch_add_approximate_num_rowsets(0), 0) << t->tablet_id();
-        EXPECT_EQ(t->fetch_add_approximate_cumu_num_rowsets(0), 0) << t->tablet_id();
+        EXPECT_EQ(t->fetch_add_approximate_num_rowsets(0), 1) << t->tablet_id();
+        EXPECT_EQ(t->fetch_add_approximate_cumu_num_rowsets(0), 1) << t->tablet_id();
         EXPECT_EQ(t->fetch_add_approximate_num_segments(0), 0) << t->tablet_id();
-        EXPECT_EQ(t->fetch_add_approximate_cumu_num_deltas(0), 0) << t->tablet_id();
+        EXPECT_EQ(t->fetch_add_approximate_cumu_num_deltas(0), 1) << t->tablet_id();
         EXPECT_EQ(t->fetch_add_approximate_data_size(0), 0) << t->tablet_id();
         EXPECT_EQ(t->write_count.load(), 1) << t->tablet_id();
         EXPECT_GT(t->last_load_time_ms, 0) << t->tablet_id();
