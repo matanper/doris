@@ -33,6 +33,7 @@
 #include "storage/compaction/cumulative_compaction_policy.h"
 #include "storage/compaction/cumulative_compaction_time_series_policy.h"
 #include "util/debug_points.h"
+#include "util/thread.h"
 #include "util/trace.h"
 #include "util/uuid_generator.h"
 
@@ -41,6 +42,8 @@ namespace doris {
 using namespace ErrorCode;
 
 bvar::Adder<uint64_t> cumu_output_size("cumu_compaction", "output_size");
+// Tasks whose thread the kernel refused to give cumu_compaction_thread_nice.
+bvar::Adder<uint64_t> g_cumu_compaction_nice_refused("cumu_compaction_nice_refused");
 bvar::LatencyRecorder g_cu_compaction_hold_delete_bitmap_lock_time_ms(
         "cu_compaction_hold_delete_bitmap_lock_time_ms");
 
@@ -212,6 +215,10 @@ Status CloudCumulativeCompaction::execute_compact() {
         return Status::InternalError("tablet {} is dropped", _tablet->tablet_id());
     }
 
+    // Loads get the CPU before cumulative compaction when the BE is busy.
+    if (!Thread::set_self_nice(config::cumu_compaction_thread_nice)) {
+        g_cumu_compaction_nice_refused << 1;
+    }
     SCOPED_ATTACH_TASK(_mem_tracker);
 
     using namespace std::chrono;
