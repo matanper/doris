@@ -275,6 +275,16 @@ CONF_Int32(txn_store_retry_times, "4");
 CONF_Int32(txn_store_retry_base_intervals_ms, "500");
 // Whether to retry the txn conflict errors that returns by the underlying txn store.
 CONF_Bool(enable_retry_txn_conflict, "true");
+// Backoff for KV_TXN_CONFLICT retries. A conflict clears as soon as the competing transaction
+// has committed (e.g. concurrent commit_txn on one partition racing on its version key), so it
+// is retried after a short jittered pause, uniform in [ceil/2, ceil] with
+// ceil = min(txn_conflict_retry_max_intervals_ms, txn_conflict_retry_base_intervals_ms << n),
+// instead of the txn_store_retry_* backoff sized for an unavailable txn store.
+// A negative txn_conflict_retry_base_intervals_ms retries conflicts with txn_store_retry_*.
+// The total sleep must stay well under the BE meta-service rpc timeout (10s).
+CONF_mInt32(txn_conflict_retry_times, "10");
+CONF_mInt32(txn_conflict_retry_base_intervals_ms, "20");
+CONF_mInt32(txn_conflict_retry_max_intervals_ms, "500");
 
 CONF_mBool(enable_s3_rate_limiter, "false");
 // Log active S3 rate limiter every N throttled/rejected requests, 0 means no log.
@@ -349,6 +359,10 @@ CONF_Bool(delete_bitmap_enable_retry_txn_conflict, "true");
 // reserve 1MB of buffer, so setting the default value to 7MB is
 // more reasonable.
 CONF_mInt64(max_txn_commit_byte, "7340032");
+
+// true: scan txn_running_key entries and fetch transaction info via the corresponding txn_info_key.
+// false: scan txn_info_key entries directly; these usually far outnumber txn_running_key entries.
+CONF_mBool(enable_get_prepare_txn_by_coordinator_by_running_key, "true");
 
 CONF_Bool(enable_cloud_txn_lazy_commit, "true");
 CONF_Int32(txn_lazy_commit_rowsets_thresold, "1000");
