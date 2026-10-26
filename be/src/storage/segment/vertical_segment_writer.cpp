@@ -56,6 +56,7 @@
 #include "storage/data_dir.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/index/index_finish_batch.h"
+#include "storage/segment/segment_write_tasks.h"
 #include "storage/index/inverted/inverted_index_desc.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/primary_key_index.h"
@@ -482,6 +483,81 @@ Status VerticalSegmentWriter::_check_column_writer_disk_capacity(size_t cid) {
 
 Status VerticalSegmentWriter::_finalize_column_writer_and_update_meta(size_t cid) {
     RETURN_IF_ERROR(_column_writers[cid]->finish());
+    return _write_column_data_and_update_meta(cid);
+}
+
+bool VerticalSegmentWriter::_parallel_column_append_allowed() {
+    // Only load flushes append in parallel; a compaction writes its columns one by one and gets
+    // its parallelism from running alongside other compactions.
+    return config::segment_column_write_parallelism > 1 &&
+           _opts.write_type != DataWriteType::TYPE_COMPACTION &&
+           !_tablet_schema->has_sequence_col() &&
+           !_is_mow_with_cluster_key() &&
+           _tablet_schema->num_columns() > _tablet_schema->num_key_columns() + 1;
+}
+
+Status VerticalSegmentWriter::_append_value_columns_in_parallel(uint32_t first_cid,
+                                                                bool skip_row_store_column) {
+    // A VARIANT writer adds the metas of its subcolumns to the segment footer while it is
+    // finished, after its own meta and before the next column's. To keep the footer, and the
+    // footer's order, as the serial path builds them, the writers are created in column order on
+    // this thread, a VARIANT column is appended and finished here before the next writer is
+    // created, and the other columns are appended and finished meanwhile, on the pool in runs of
+    // at least segment_write_task_min_bytes of input, so a small segment runs on this thread.
+    std::vector<uint32_t> cids;
+    ChunkedSegmentWriteTasks tasks(config::segment_column_write_parallelism);
+    auto input_bytes = [this](uint32_t cid) -> size_t {
+        size_t bytes = 0;
+        for (const auto& data : _batched_blocks) {
+            if (cid < data.block->columns() && data.block->rows() > 0) {
+                bytes += data.block->get_by_position(cid).column->byte_size() * data.num_rows /
+                         data.block->rows();
+            }
+        }
+        return bytes;
+    };
+    auto append_and_finish = [this](uint32_t cid) -> Status {
+        // Each column is converted by its own convertor of _olap_data_convertor; the writers
+        // keep their pages in memory until write_data().
+        for (auto& data : _batched_blocks) {
+            RETURN_IF_ERROR(_olap_data_convertor->set_source_content_with_specifid_columns(
+                    data.block, data.row_pos, data.num_rows, std::vector<uint32_t> {cid}));
+            auto [status, column] = _olap_data_convertor->convert_column_data(cid);
+            RETURN_IF_ERROR(status);
+            RETURN_IF_ERROR(_column_writers[cid]->append(column->get_nullmap(), column->get_data(),
+                                                         data.num_rows));
+            _olap_data_convertor->clear_source_content(cid);
+        }
+        RETURN_IF_ERROR(_check_column_writer_disk_capacity(cid));
+        return _column_writers[cid]->finish();
+    };
+    Status status;
+    for (uint32_t cid = first_cid; cid < _tablet_schema->num_columns() && status.ok(); ++cid) {
+        if (skip_row_store_column && _tablet_schema->column(cid).is_row_store_column()) {
+            continue;
+        }
+        status = _create_column_writer(cid, _tablet_schema->column(cid), _tablet_schema);
+        if (!status.ok()) {
+            break;
+        }
+        cids.push_back(cid);
+        if (_tablet_schema->column(cid).is_variant_type()) {
+            status = run_catching_exceptions([&]() { return append_and_finish(cid); });
+        } else {
+            tasks.add(input_bytes(cid), [&append_and_finish, cid]() { return append_and_finish(cid); });
+        }
+    }
+    Status tasks_status = tasks.wait();
+    RETURN_IF_ERROR(status);
+    RETURN_IF_ERROR(tasks_status);
+    // The data is written to the segment file in column order.
+    for (uint32_t cid : cids) {
+        RETURN_IF_ERROR(_write_column_data_and_update_meta(cid));
+    }
+    return Status::OK();
+}
+
+Status VerticalSegmentWriter::_write_column_data_and_update_meta(size_t cid) {
     RETURN_IF_ERROR(_column_writers[cid]->write_data());
 
     auto* column_meta = _column_writers[cid]->get_column_meta();
@@ -1085,7 +1161,12 @@ Status VerticalSegmentWriter::write_batch() {
     IOlapColumnDataAccessor* seq_column = nullptr;
     // the key is cluster key column unique id
     std::map<uint32_t, IOlapColumnDataAccessor*> cid_to_column;
-    for (uint32_t cid = 0; cid < _tablet_schema->num_columns(); ++cid) {
+    // Value columns after the keys may be appended in parallel; key, sequence and cluster key
+    // columns are kept on this thread, as their converted data is used again below.
+    const auto parallel_from = cast_set<uint32_t>(_parallel_column_append_allowed()
+                                                           ? _tablet_schema->num_key_columns()
+                                                           : _tablet_schema->num_columns());
+    for (uint32_t cid = 0; cid < parallel_from; ++cid) {
         if (should_write_row_store_column && _tablet_schema->column(cid).is_row_store_column()) {
             continue;
         }
@@ -1118,6 +1199,10 @@ Status VerticalSegmentWriter::write_batch() {
         }
         RETURN_IF_ERROR(_check_column_writer_disk_capacity(cid));
         RETURN_IF_ERROR(_finalize_column_writer_and_update_meta(cid));
+    }
+    if (parallel_from < _tablet_schema->num_columns()) {
+        RETURN_IF_ERROR(_append_value_columns_in_parallel(parallel_from,
+                                                          should_write_row_store_column));
     }
 
     for (auto& data : _batched_blocks) {
@@ -1431,7 +1516,9 @@ Status VerticalSegmentWriter::_write_zone_map() {
 }
 
 Status VerticalSegmentWriter::_write_inverted_index() {
-    IndexFinishBatch batch;
+    IndexFinishBatch batch(_opts.write_type == DataWriteType::TYPE_COMPACTION
+                                   ? IndexFinishLane::COMPACTION
+                                   : IndexFinishLane::LOAD);
     for (auto& column_writer : _column_writers) {
         RETURN_IF_ERROR(column_writer->write_inverted_index());
     }

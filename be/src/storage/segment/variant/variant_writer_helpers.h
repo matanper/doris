@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 #include <string_view>
 
 #include "common/status.h"
@@ -73,6 +74,22 @@ Status create_column_writer(uint32_t cid, const TabletColumn& column,
 Status convert_and_write_column(OlapBlockDataConvertor* converter, const TabletColumn& column,
                                 DataTypePtr data_type, ColumnWriter* writer,
                                 const ColumnPtr& src_column, size_t num_rows, int column_id);
+
+// A subcolumn whose writer has been created, and whose data is still to be converted and
+// appended: all `num_rows` rows of `src_column`, or for a sparse one the values of `rowids`.
+struct PendingSubcolumnWrite {
+    TabletColumn column;
+    DataTypePtr type;
+    ColumnPtr src_column;
+    ColumnWriter* writer = nullptr;
+    bool sparse = false;
+    std::span<const uint32_t> rowids;
+};
+
+// Converts and appends the pending subcolumns, each on its own convertor, on SegmentWritePool and
+// the calling thread, at most config::variant_subcolumn_write_parallelism at once, in runs of at
+// least config::segment_write_task_min_bytes of input.
+Status write_pending_subcolumns(std::vector<PendingSubcolumnWrite>* pending, size_t num_rows);
 
 // Converts only present values. Missing logical rows are appended as NULL; ARRAY uses a one-path
 // full-column fallback because its converted representation is not fixed-width/strided.

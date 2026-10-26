@@ -1519,6 +1519,21 @@ DECLARE_mBool(inverted_index_ram_dir_enable);
 DECLARE_mInt32(index_finish_parallelism);
 // Max threads of IndexFinishPool, shared by all segment writers; 0 means the number of cores.
 DECLARE_mInt32(index_finish_thread_num);
+// How many value columns of a load-flushed segment are converted, appended and finished at once,
+// on SegmentWritePool and the flushing thread; their data is still written in column order. <= 1
+// appends them one by one. Compactions always write their columns one by one.
+DECLARE_mInt32(segment_column_write_parallelism);
+// Max threads of SegmentWritePool; 0 means the number of cores.
+DECLARE_mInt32(segment_write_thread_num);
+// How many subcolumns of a VARIANT column are converted and appended at once when a load flushes
+// a segment, on SegmentWritePool and the writing thread; their data is still written in path
+// order. <= 1 appends them one by one. Compactions always write subcolumns one by one.
+DECLARE_mInt32(variant_subcolumn_write_parallelism);
+// Least input, in bytes, that one task of a parallel segment write (a run of value columns, or of
+// VARIANT subcolumns, appended one after another) is given. Smaller inputs are appended by the
+// writing thread itself, so small blocks and small subcolumns run no pool tasks; it also bounds
+// how many threads finish a segment's indexes.
+DECLARE_mInt64(segment_write_task_min_bytes);
 // wheather index by RAM directory when base compaction
 DECLARE_mBool(inverted_index_ram_dir_enable_when_base_compaction);
 // Upper bound of the memory all index RAM directories together may hold, as bytes or as a
