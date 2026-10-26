@@ -309,6 +309,24 @@ void Thread::set_thread_nice_value() {
 }
 #endif
 
+bool Thread::set_self_nice(int nice) {
+#ifndef __APPLE__
+    // Threads start at the process's nice value, 0 in a BE.
+    static thread_local int applied = 0;
+    if (nice == applied) {
+        return true;
+    }
+    // On Linux PRIO_PROCESS with id 0 sets the calling thread.
+    if (setpriority(PRIO_PROCESS, 0, nice) != 0) {
+        return false;
+    }
+    applied = nice;
+    return true;
+#else
+    return nice == 0;
+#endif
+}
+
 void Thread::join() {
     static_cast<void>(ThreadJoiner(this).join());
 }

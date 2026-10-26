@@ -64,6 +64,9 @@ DEFINE_mInt64(cloud_dropped_tablet_probe_interval_s, "60");
 DEFINE_mInt32(compaction_timeout_seconds, "86400");
 DEFINE_mInt32(lease_compaction_interval_seconds, "20");
 DEFINE_mBool(enable_parallel_cumu_compaction, "false");
+// With enable_parallel_cumu_compaction, at most this many cumulative compactions run on one
+// tablet at a time, so the compaction threads spread over tablets; 0 means no limit.
+DEFINE_mInt32(max_parallel_cumu_compactions_per_tablet, "2");
 DEFINE_mDouble(base_compaction_thread_num_factor, "0.25");
 DEFINE_mDouble(cumu_compaction_thread_num_factor, "0.5");
 DEFINE_mInt32(check_auto_compaction_interval_seconds, "5");
