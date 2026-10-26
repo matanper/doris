@@ -103,9 +103,6 @@ public:
     const std::string& get_index_path_prefix() const { return _index_path_prefix; }
     friend IndexFileWriter;
 
-    // Heap the first init() allocated and kept: the directory entries of every index in the file.
-    int64_t retained_bytes() const { return _retained_bytes.load(std::memory_order_relaxed); }
-
 protected:
     Status _init_from(int32_t read_buffer_size, const io::IOContext* io_ctx);
     Result<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>> _open(
@@ -114,7 +111,6 @@ protected:
 
 private:
     IndicesEntriesMap _indices_entries;
-    std::atomic<int64_t> _retained_bytes {0};
     std::unique_ptr<CL_NS(store)::IndexInput> _stream = nullptr;
     const io::FileSystemSPtr _fs;
     std::string _index_path_prefix;

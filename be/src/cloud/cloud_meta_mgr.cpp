@@ -959,7 +959,7 @@ Status CloudMetaMgr::sync_tablet_rowsets_unlocked(CloudTablet* tablet,
                     continue; // Same rowset, skip it
                 }
                 RowsetMetaPB meta_pb = cloud_rowset_meta_to_doris(cloud_rs_meta_pb);
-                auto rs_meta = RowsetMeta::create_shared();
+                auto rs_meta = std::make_shared<RowsetMeta>();
                 rs_meta->init_from_pb(meta_pb);
                 RowsetSharedPtr rowset;
                 // schema is nullptr implies using RowsetMeta.tablet_schema
@@ -1538,7 +1538,7 @@ Status CloudMetaMgr::prepare_rowset(const RowsetMeta& rs_meta, const std::string
         if (existed_rs_meta != nullptr && resp.has_existed_rowset_meta()) {
             RowsetMetaPB doris_rs_meta_tmp =
                     cloud_rowset_meta_to_doris(std::move(*resp.mutable_existed_rowset_meta()));
-            *existed_rs_meta = RowsetMeta::create_shared();
+            *existed_rs_meta = std::make_shared<RowsetMeta>();
             (*existed_rs_meta)->init_from_pb(doris_rs_meta_tmp);
         }
         return Status::AlreadyExist("failed to prepare rowset: {}", resp.status().msg());
@@ -1574,7 +1574,7 @@ Status CloudMetaMgr::commit_rowset(RowsetMeta& rs_meta, const std::string& job_i
         if (existed_rs_meta != nullptr && resp.has_existed_rowset_meta()) {
             RowsetMetaPB doris_rs_meta =
                     cloud_rowset_meta_to_doris(std::move(*resp.mutable_existed_rowset_meta()));
-            *existed_rs_meta = RowsetMeta::create_shared();
+            *existed_rs_meta = std::make_shared<RowsetMeta>();
             (*existed_rs_meta)->init_from_pb(doris_rs_meta);
         }
         return Status::AlreadyExist("failed to commit rowset: {}", resp.status().msg());
@@ -2582,7 +2582,7 @@ Status CloudMetaMgr::create_empty_rowset_for_hole(const CloudTablet* tablet,
                 tablet->tablet_id(), versions.to_string(), rowset_id != nullptr);
     }
     // Create a RowsetMeta for the empty rowset
-    auto rs_meta = RowsetMeta::create_shared();
+    auto rs_meta = std::make_shared<RowsetMeta>();
 
     // A single-version hole has a deterministic rowset ID (same tablet_id + version = same
     // rowset_id). Hole rowsets of a version range (CloudTablet::add_hole_rowsets) can be

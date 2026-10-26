@@ -440,23 +440,4 @@ TEST_F(InvertedIndexFileReaderTest, TestGetAllDirectoriesError) {
     EXPECT_TRUE(result.value().empty()); // Should be empty since no init was called
 }
 
-// The directory entries a V2 index file reader parses at init are what it keeps.
-TEST_F(InvertedIndexFileReaderTest, TestRetainedBytes) {
-    std::string index_path = kTestDir + "/retained_bytes";
-    create_v2_file_with_null_bitmap(index_path + ".idx", 1, "test", true);
-
-    InvertedIndexFileInfo file_info;
-    IndexFileReader reader(io::global_local_filesystem(), index_path,
-                           InvertedIndexStorageFormatPB::V2, file_info);
-    EXPECT_EQ(reader.retained_bytes(), 0);
-    ASSERT_TRUE(reader.init(4096).ok());
-    EXPECT_GT(reader.retained_bytes(), 0);
-
-    // A reader that fails to open keeps nothing.
-    IndexFileReader missing(io::global_local_filesystem(), kTestDir + "/no_such_index",
-                            InvertedIndexStorageFormatPB::V2, file_info);
-    EXPECT_FALSE(missing.init(4096).ok());
-    EXPECT_EQ(missing.retained_bytes(), 0);
-}
-
 } // namespace doris::segment_v2

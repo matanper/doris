@@ -53,7 +53,6 @@
 #include "io/cache/inflight_write_buffer_index.h"
 #include "io/cache/mem_file_cache_storage.h"
 #include "io/cache/remote_scan_cache_write_limiter.h"
-#include "runtime/memory/metadata_arena.h"
 #include "runtime/runtime_profile.h"
 #include "util/concurrency_stats.h"
 #include "util/mem_info.h"
@@ -1287,11 +1286,7 @@ FileBlockCell* BlockFileCache::add_cell(const UInt128Wrapper& hash, const CacheC
     key.meta.type = context.cache_type;
     key.meta.expiration_time = context.expiration_time;
     key.meta.tablet_id = context.tablet_id;
-    // A cached block lives as long as its cache entry, so it goes with the other long-lived
-    // metadata rather than among the scan and load churn.
-    FileBlockCell cell(std::allocate_shared<FileBlock>(MetadataArenaAllocator<FileBlock>(), key,
-                                                       size, this, state),
-                       cache_lock);
+    FileBlockCell cell(std::make_shared<FileBlock>(key, size, this, state), cache_lock);
     Status st;
     if (context.expiration_time == 0 && context.cache_type == FileCacheType::TTL) {
         st = cell.file_block->change_cache_type_lock(FileCacheType::NORMAL, cache_lock);

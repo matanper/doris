@@ -61,18 +61,7 @@ InvertedIndexColumnWriter<field_type>::~InvertedIndexColumnWriter() {
 }
 
 template <FieldType field_type>
-const int64_t* InvertedIndexColumnWriter<field_type>::tracked_dir_bytes() const {
-    if (_dir != nullptr &&
-        std::strcmp(_dir->getObjectName(), DorisRAMFSDirectory::getClassName()) == 0) {
-        return &static_cast<DorisRAMFSDirectory*>(_dir.get())->sizeInBytes;
-    }
-    return nullptr;
-}
-
-template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::init() {
-    _heap_account = std::make_unique<UntrackedHeapAccount>();
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get());
     try {
         DBUG_EXECUTE_IF("InvertedIndexColumnWriter::init_field_type_not_supported", {
             return Status::Error<doris::ErrorCode::INVERTED_INDEX_NOT_SUPPORTED>(
@@ -96,7 +85,6 @@ Status InvertedIndexColumnWriter<field_type>::init() {
 
 template <FieldType field_type>
 void InvertedIndexColumnWriter<field_type>::close_on_error() {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     try {
         DBUG_EXECUTE_IF("InvertedIndexColumnWriter::close_on_error_throw_exception",
                         { _CLTHROWA(CL_ERR_IO, "debug point: close on error"); })
@@ -334,7 +322,6 @@ Status InvertedIndexColumnWriter<field_type>::add_null_document() {
 
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::add_nulls(uint32_t count) {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     _null_bitmap.addRange(_rid, _rid + count);
     _rid += count;
     if constexpr (field_is_slice_type(field_type)) {
@@ -356,7 +343,6 @@ Status InvertedIndexColumnWriter<field_type>::add_nulls(uint32_t count) {
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::add_array_nulls(const uint8_t* null_map,
                                                               size_t num_rows) {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     DCHECK(_rid >= num_rows);
     if (num_rows == 0 || null_map == nullptr) {
         return Status::OK();
@@ -428,7 +414,6 @@ void InvertedIndexColumnWriter<field_type>::new_field_char_value(const char* s, 
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::add_values(const std::string fn, const void* values,
                                                          size_t count) {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     if constexpr (field_is_slice_type(field_type)) {
         DBUG_EXECUTE_IF("InvertedIndexColumnWriter::add_values_field_is_nullptr",
                         { _field = nullptr; })
@@ -468,7 +453,6 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
                                                                const uint8_t* nested_null_map,
                                                                const uint8_t* offsets_ptr,
                                                                size_t count) {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     if (count == 0) {
         // no values to add inverted index
         return Status::OK();
@@ -612,7 +596,6 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
 
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::add_numeric_values(const void* values, size_t count) {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     auto p = reinterpret_cast<const CppType*>(values);
     for (size_t i = 0; i < count; ++i) {
         RETURN_IF_ERROR(add_value(*p));
@@ -665,7 +648,6 @@ void InvertedIndexColumnWriter<field_type>::write_null_bitmap(
 
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::finish() {
-    UntrackedHeapAccount::Scope heap_scope(_heap_account.get(), tracked_dir_bytes());
     if (_dir != nullptr) {
         std::unique_ptr<lucene::store::IndexOutput> null_bitmap_out = nullptr;
         std::unique_ptr<lucene::store::IndexOutput> data_out = nullptr;

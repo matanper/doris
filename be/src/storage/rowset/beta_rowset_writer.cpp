@@ -1100,7 +1100,7 @@ Status BaseBetaRowsetWriter::_build_rowset_meta(RowsetMeta* rowset_meta, bool ch
 
 Status BaseBetaRowsetWriter::_build_tmp(RowsetSharedPtr& rowset_ptr) {
     Status status;
-    std::shared_ptr<RowsetMeta> tmp_rs_meta = RowsetMeta::create_shared();
+    std::shared_ptr<RowsetMeta> tmp_rs_meta = std::make_shared<RowsetMeta>();
     tmp_rs_meta->init(_rowset_meta.get());
 
     status = _build_rowset_meta(tmp_rs_meta.get());

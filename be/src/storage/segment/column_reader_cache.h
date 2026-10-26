@@ -39,8 +39,6 @@ struct CacheNode {
     ColumnReaderCacheKey key; // key: (column uid, column path)
     std::shared_ptr<segment_v2::ColumnReader> reader;
     std::chrono::steady_clock::time_point last_access; // optional if needed
-    // Heap creating the reader allocated and kept.
-    int64_t bytes = 0;
 };
 
 // This cache is used to cache column readers for columns in segment.
@@ -72,28 +70,22 @@ public:
                                           const SubcolumnColumnMetaInfo::Node* node_hint = nullptr,
                                           const io::IOContext* io_ctx = nullptr);
 
-    // Heap held by the cached readers: what creating each one allocated, plus the external meta
-    // the cached VARIANT readers loaded since.
-    int64_t retained_bytes();
-
 private:
     // Lookup function remains similar
     std::shared_ptr<ColumnReader> _lookup(const ColumnReaderCacheKey& key);
     // Insert helper: assumes _cache_mutex already locked, will evict if needed
     void _insert_locked_nocheck(const ColumnReaderCacheKey& key,
-                                const std::shared_ptr<ColumnReader>& reader, int64_t bytes);
+                                const std::shared_ptr<ColumnReader>& reader);
 
     // Insert an already-created reader directly into cache
     void _insert_direct(const ColumnReaderCacheKey& key,
-                        const std::shared_ptr<ColumnReader>& column_reader, int64_t bytes);
+                        const std::shared_ptr<ColumnReader>& column_reader);
     // keep _lru_list and _cache_map thread safe
     std::mutex _cache_mutex;
     // Doubly-linked list to maintain LRU order
     std::list<CacheNode> _lru_list;
     // Map from key to list iterator for O(1) access
     std::unordered_map<ColumnReaderCacheKey, std::list<CacheNode>::iterator> _cache_map;
-    // Sum of `bytes` over _lru_list.
-    int64_t _node_bytes = 0;
     int _be_exec_version = BeExecVersionManager::get_newest_version();
 
     // Non-owning pointer to the segment's ColumnMetaAccessor.

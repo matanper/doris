@@ -68,18 +68,6 @@ public:
     Compaction(BaseTabletSPtr tablet, const std::string& label);
     virtual ~Compaction();
 
-    // Drops the segments of `input_rowsets` from the segment cache. Segments still in use stay
-    // alive until their readers release them.
-    static void release_input_segments(const std::vector<RowsetSharedPtr>& input_rowsets);
-
-    // Reads every input segment data file once through the file cache.
-    // Preloads the input segment files; with `async`, returns at once and keeps the preload in
-    // _input_preload until the merge ends. With config::enable_compaction_memory_preload, the
-    // files that fit are loaded into memory instead, held in _memory_preload until the merge ends.
-    void preload_input_segment_files(bool async = false);
-
-    const BaseTabletSPtr& tablet() const { return _tablet; }
-
     // Pick input rowsets satisfied to compact
     virtual Status prepare_compact() = 0;
 

@@ -32,7 +32,6 @@
 #include "common/config.h"
 #include "common/status.h"
 #include "io/fs/encrypted_fs_factory.h"
-#include "runtime/memory/metadata_arena.h"
 #include "io/fs/file_system.h"
 #include "runtime/memory/lru_cache_policy.h"
 #include "storage/metadata_adder.h"
@@ -48,15 +47,6 @@ namespace doris {
 
 class RowsetMeta : public MetadataAdder<RowsetMeta> {
 public:
-    // A BE holds a RowsetMeta for every rowset of every tablet, so they live in the rowset
-    // metadata arena, see MetadataArena.
-    DORIS_METADATA_ARENA_OPERATORS
-
-    // Allocates the object and its shared_ptr control block together in the arena.
-    static std::shared_ptr<RowsetMeta> create_shared() {
-        return std::allocate_shared<RowsetMeta>(MetadataArenaAllocator<RowsetMeta>());
-    }
-
     RowsetMeta() = default;
     ~RowsetMeta();
 

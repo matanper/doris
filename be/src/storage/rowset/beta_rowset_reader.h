@@ -40,9 +40,6 @@ class RuntimeProfile;
 class Schema;
 struct RowLocation;
 struct RowsetReaderContext;
-namespace segment_v2 {
-struct PinnedSegments;
-} // namespace segment_v2
 
 class BetaRowsetReader : public RowsetReader {
 public:
@@ -185,10 +182,6 @@ private:
     OlapReaderStatistics* _stats = nullptr;
 
     std::unique_ptr<RowwiseIterator> _iterator;
-
-    // The input segments a compaction opened through this reader, kept until the reader is
-    // destroyed at the end of the task.
-    std::shared_ptr<segment_v2::PinnedSegments> _pinned_segments;
 
     StorageReadOptions _read_options;
 

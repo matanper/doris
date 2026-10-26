@@ -377,7 +377,7 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
     rowset_meta_pb.set_tablet_schema_hash(local_tablet->tablet_meta()->schema_hash());
     rowset_meta_pb.set_txn_id(txn_id);
     rowset_meta_pb.set_rowset_state(RowsetStatePB::COMMITTED);
-    auto rowset_meta = RowsetMeta::create_shared();
+    auto rowset_meta = std::make_shared<RowsetMeta>();
     if (!rowset_meta->init_from_pb(rowset_meta_pb)) {
         LOG(WARNING) << "failed to init rowset meta from " << get_rowset_meta_url;
         status = Status::InternalError("failed to init rowset meta");

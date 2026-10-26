@@ -54,7 +54,6 @@
 #include "io/fs/file_system.h"
 #include "io/io_common.h"
 #include "runtime/exec_env.h"
-#include "runtime/memory/untracked_heap_account.h"
 #include "runtime/query_context.h"
 #include "runtime/runtime_predicate.h"
 #include "runtime/runtime_state.h"
@@ -306,57 +305,7 @@ Segment::Segment(uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr table
           _tablet_schema(std::move(tablet_schema)),
           _idx_file_info(std::move(idx_file_info)) {}
 
-namespace {
-// Live segments by the kind of reader that inserted them into the segment cache.
-bvar::Adder<int64_t> g_segment_cache_loaded_by_query("segment_cache_loaded_segments_by_query");
-bvar::Adder<int64_t> g_segment_cache_loaded_by_compaction(
-        "segment_cache_loaded_segments_by_compaction");
-bvar::Adder<int64_t> g_segment_cache_loaded_by_other("segment_cache_loaded_segments_by_other");
-} // namespace
-
-void Segment::set_cache_loader(ReaderType reader_type) {
-    if (_cache_loader_counter != nullptr) {
-        return;
-    }
-    switch (reader_type) {
-    case ReaderType::READER_QUERY:
-        _cache_loader_counter = &g_segment_cache_loaded_by_query;
-        break;
-    case ReaderType::READER_BASE_COMPACTION:
-    case ReaderType::READER_CUMULATIVE_COMPACTION:
-    case ReaderType::READER_COLD_DATA_COMPACTION:
-    case ReaderType::READER_SEGMENT_COMPACTION:
-    case ReaderType::READER_FULL_COMPACTION:
-        _cache_loader_counter = &g_segment_cache_loaded_by_compaction;
-        break;
-    default:
-        _cache_loader_counter = &g_segment_cache_loaded_by_other;
-        break;
-    }
-    *_cache_loader_counter << 1;
-}
-
-namespace {
-bvar::Adder<int64_t> g_segment_real_retained_bytes("segment_real_retained_bytes");
-} // namespace
-
-int64_t Segment::real_mem_usage() {
-    int64_t bytes = meta_mem_usage() + _column_meta_bytes.load(std::memory_order_relaxed);
-    if (_create_column_meta_once_call.has_called() && _column_reader_cache != nullptr) {
-        bytes += _column_reader_cache->retained_bytes();
-    }
-    if (_index_file_reader_open.has_called() && _index_file_reader != nullptr) {
-        bytes += _index_file_reader->retained_bytes();
-    }
-    g_segment_real_retained_bytes << bytes - _reported_real_bytes.exchange(bytes);
-    return bytes;
-}
-
 Segment::~Segment() {
-    g_segment_real_retained_bytes << -_reported_real_bytes.load();
-    if (_cache_loader_counter != nullptr) {
-        *_cache_loader_counter << -1;
-    }
     g_segment_estimate_mem_bytes << -_tracked_meta_mem_usage;
     // if failed, fix `_tracked_meta_mem_usage` accuracy
     DCHECK(_tracked_meta_mem_usage == meta_mem_usage());
@@ -845,25 +794,10 @@ DataTypePtr Segment::get_data_type_of(const TabletColumn& column,
 Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
                                          const io::IOContext* source_io_ctx, bool* created) {
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
-    return _create_column_meta_once_call.call([this, stats, source_io_ctx, created] {
-        if (created != nullptr) {
-            *created = true;
-        }
+    return _create_column_meta_once_call.call([this, stats, source_io_ctx] {
         std::shared_ptr<SegmentFooterPB> footer_pb_shared;
         RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
-        // The parsed footer is charged to the footer cache; only what the segment builds from it
-        // counts here.
-        const int64_t allocated_before = thread_net_allocated_bytes();
-        Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-        // The column meta region is let go after the segment's first iterator is set up (see
-        // `release_column_meta_region`), so it never counts toward the segment cache charge.
-        const auto region =
-                _column_meta_accessor != nullptr ? _column_meta_accessor->meta_region() : nullptr;
-        const int64_t region_bytes = region != nullptr ? region->charged_bytes : 0;
-        const int64_t allocated = thread_net_allocated_bytes() - allocated_before;
-        _column_meta_bytes = std::max<int64_t>(
-                0, allocated >= region_bytes ? allocated - region_bytes : allocated);
-        return st;
+        return _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
     });
 }
 

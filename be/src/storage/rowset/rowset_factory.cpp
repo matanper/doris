@@ -42,10 +42,7 @@ Status RowsetFactory::create_rowset(const TabletSchemaSPtr& schema, const std::s
         return Status::Error<ROWSET_INVALID>("invalid rowset_type");
     }
     if (rowset_meta->rowset_type() == BETA_ROWSET) {
-        // The control block goes to the rowset metadata arena too.
-        *rowset = std::shared_ptr<BetaRowset>(new BetaRowset(schema, rowset_meta, tablet_path),
-                                              std::default_delete<BetaRowset>(),
-                                              MetadataArenaAllocator<BetaRowset>());
+        rowset->reset(new BetaRowset(schema, rowset_meta, tablet_path));
         return (*rowset)->init();
     }
     return Status::Error<ROWSET_TYPE_NOT_FOUND>("invalid rowset_type"); // should never happen

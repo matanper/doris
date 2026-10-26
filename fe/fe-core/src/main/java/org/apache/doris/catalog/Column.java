@@ -983,11 +983,8 @@ public class Column implements GsonPostProcessable {
         }
 
         if (type.isVariantType() && other.type.isVariantType()) {
-            // A positive count only moves the line between materialized and sparse sub-columns,
-            // which compaction re-draws for every output rowset. 0 means no sparse column at all.
-            if (this.getVariantMaxSubcolumnsCount() != other.getVariantMaxSubcolumnsCount()
-                    && (this.getVariantMaxSubcolumnsCount() == 0 || other.getVariantMaxSubcolumnsCount() == 0)) {
-                throw new DdlException("Can not change variant max subcolumns count between 0 and a positive value");
+            if (this.getVariantMaxSubcolumnsCount() != other.getVariantMaxSubcolumnsCount()) {
+                throw new DdlException("Can not change variant max subcolumns count");
             }
             if (this.getVariantEnableTypedPathsToSparse() != other.getVariantEnableTypedPathsToSparse()) {
                 throw new DdlException("Can not change variant enable typed paths to sparse");
@@ -1007,29 +1004,10 @@ public class Column implements GsonPostProcessable {
             if (this.getVariantEnableNestedGroup() != other.getVariantEnableNestedGroup()) {
                 throw new DdlException("Can not change variant enable nested group");
             }
-            if (!sameVariantSchemaTemplates(this.getChildren(), other.getChildren())) {
+            if (CollectionUtils.isNotEmpty(this.getChildren()) || CollectionUtils.isNotEmpty(other.getChildren())) {
                 throw new DdlException("Can not change variant schema templates");
             }
         }
-    }
-
-    // Typed paths restated unchanged, in the same order and with the same pattern types.
-    private static boolean sameVariantSchemaTemplates(List<Column> children, List<Column> otherChildren) {
-        if (CollectionUtils.isEmpty(children) || CollectionUtils.isEmpty(otherChildren)) {
-            return CollectionUtils.isEmpty(children) && CollectionUtils.isEmpty(otherChildren);
-        }
-        if (children.size() != otherChildren.size()) {
-            return false;
-        }
-        for (int i = 0; i < children.size(); i++) {
-            Column child = children.get(i);
-            Column otherChild = otherChildren.get(i);
-            if (!child.equals(otherChild)
-                    || !Objects.equals(child.getFieldPatternType(), otherChild.getFieldPatternType())) {
-                return false;
-            }
-        }
-        return true;
     }
 
     public boolean nameEquals(String otherColName, boolean ignorePrefix) {

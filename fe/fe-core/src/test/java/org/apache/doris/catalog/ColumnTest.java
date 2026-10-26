@@ -27,7 +27,6 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.persist.gson.GsonUtils;
-import org.apache.doris.thrift.TPatternType;
 
 import org.junit.Assert;
 import org.junit.Before;
@@ -37,9 +36,6 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 
 public class ColumnTest {
 
@@ -261,58 +257,5 @@ public class ColumnTest {
         Column mvColumnComplex = new Column("mv_b", ArrayType.create(Type.INT, true), false, null, true, "0", "");
         mvColumnComplex.setDefineExpr(add);
         Assert.assertTrue(mvColumnComplex.tryGetBaseColumnName().equalsIgnoreCase("mv_b"));
-    }
-
-    private static Column variantColumn(int maxSubcolumns, ArrayList<VariantField> typedPaths) {
-        VariantType type = new VariantType(typedPaths, maxSubcolumns, false, 10000, 0, false, 0L, 64, false);
-        return new Column("v", type, false, null, true, null, "");
-    }
-
-    private static ArrayList<VariantField> typedPaths(Type firstType, TPatternType firstPattern) {
-        ArrayList<VariantField> fields = new ArrayList<>();
-        fields.add(new VariantField("event.code", firstType, "", firstPattern));
-        fields.add(new VariantField("src.*", Type.STRING, "", TPatternType.MATCH_NAME_GLOB));
-        return fields;
-    }
-
-    @Test
-    public void testVariantMaxSubcolumnsCountChangesBetweenPositiveValues() throws DdlException {
-        variantColumn(2048, new ArrayList<>()).checkSchemaChangeAllowed(variantColumn(4096, new ArrayList<>()));
-        variantColumn(4096, new ArrayList<>()).checkSchemaChangeAllowed(variantColumn(1024, new ArrayList<>()));
-        variantColumn(0, new ArrayList<>()).checkSchemaChangeAllowed(variantColumn(0, new ArrayList<>()));
-    }
-
-    @Test
-    public void testVariantMaxSubcolumnsCountChangeWithSameTypedPaths() throws DdlException {
-        Column oldColumn = variantColumn(2048, typedPaths(Type.BIGINT, TPatternType.MATCH_NAME));
-        Column newColumn = variantColumn(4096, typedPaths(Type.BIGINT, TPatternType.MATCH_NAME));
-        Assert.assertEquals(2, oldColumn.getChildren().size());
-        oldColumn.checkSchemaChangeAllowed(newColumn);
-    }
-
-    @Test
-    public void testVariantMaxSubcolumnsCountCannotLeaveOrReachZero() {
-        Assert.assertThrows(DdlException.class, () -> variantColumn(0, new ArrayList<>())
-                .checkSchemaChangeAllowed(variantColumn(2048, new ArrayList<>())));
-        Assert.assertThrows(DdlException.class, () -> variantColumn(2048, new ArrayList<>())
-                .checkSchemaChangeAllowed(variantColumn(0, new ArrayList<>())));
-    }
-
-    @Test
-    public void testVariantTypedPathsCannotChange() {
-        ArrayList<VariantField> reordered = typedPaths(Type.BIGINT, TPatternType.MATCH_NAME);
-        Collections.reverse(reordered);
-        ArrayList<VariantField> fewer = typedPaths(Type.BIGINT, TPatternType.MATCH_NAME);
-        fewer.remove(1);
-        for (ArrayList<VariantField> changed : Arrays.asList(
-                typedPaths(Type.INT, TPatternType.MATCH_NAME),
-                typedPaths(Type.BIGINT, TPatternType.MATCH_NAME_GLOB),
-                reordered, fewer, new ArrayList<VariantField>())) {
-            Column oldColumn = variantColumn(2048, typedPaths(Type.BIGINT, TPatternType.MATCH_NAME));
-            Column newColumn = variantColumn(4096, changed);
-            DdlException e = Assert.assertThrows(DdlException.class,
-                    () -> oldColumn.checkSchemaChangeAllowed(newColumn));
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("variant schema templates"));
-        }
     }
 }
