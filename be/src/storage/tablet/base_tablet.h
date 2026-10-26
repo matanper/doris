@@ -366,6 +366,13 @@ public:
     [[nodiscard]] virtual Result<std::vector<Version>> capture_consistent_versions_unlocked(
             const Version& version_range, const CaptureRowsetOps& options) const;
 
+    // The rowset of a version on a captured path that is in neither version map, or nullptr.
+    // A cloud tablet puts the prefix [s, v] of a hole rowset range on a path without keeping
+    // a rowset for it. Caller holds `_meta_lock`, shared or exclusive.
+    [[nodiscard]] virtual RowsetSharedPtr on_demand_rowset_unlocked(const Version&) const {
+        return nullptr;
+    }
+
     [[nodiscard]] Result<std::vector<RowSetSplits>> capture_rs_readers_unlocked(
             const Version& version_range, const CaptureRowsetOps& options) const;
 
