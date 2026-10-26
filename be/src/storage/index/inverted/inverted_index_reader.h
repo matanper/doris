@@ -20,6 +20,7 @@
 #include <CLucene/util/bkd/bkd_reader.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -234,6 +235,15 @@ public:
                             InvertedIndexQueryCacheHandle* cache_handle,
                             lucene::store::Directory* dir = nullptr);
 
+protected:
+    // A null bitmap whose bytes did not parse: re-reads its range of the index file from storage,
+    // bypassing the file cache, and logs whether the bytes differ. Sets `parsed` and evicts the
+    // cached file when the storage's bytes parse; otherwise returns Corruption.
+    Status _recover_corrupt_null_bitmap(lucene::store::Directory* dir, const char* file_name,
+                                        const std::string& bytes,
+                                        std::optional<roaring::Roaring>* parsed);
+
+public:
     virtual InvertedIndexReaderType type() = 0;
 
     [[nodiscard]] uint64_t get_index_id() const override { return _index_meta.index_id(); }

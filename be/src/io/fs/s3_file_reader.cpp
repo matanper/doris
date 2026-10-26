@@ -54,6 +54,10 @@ bvar::Adder<uint64_t> s3_file_reader_total("s3_file_reader", "total_num");
 bvar::Adder<uint64_t> s3_bytes_read_total("s3_file_reader", "bytes_read");
 bvar::Adder<uint64_t> s3_file_being_read("s3_file_reader", "file_being_read");
 bvar::Adder<uint64_t> s3_file_reader_too_many_request_counter("s3_file_reader", "too_many_request");
+bvar::Adder<uint64_t> s3_file_reader_server_error_retry_counter("s3_file_reader",
+                                                                "server_error_retry");
+bvar::Adder<uint64_t> s3_file_reader_transport_error_retry_counter("s3_file_reader",
+                                                                   "transport_error_retry");
 bvar::LatencyRecorder s3_bytes_per_read("s3_file_reader", "bytes_per_read"); // also QPS
 bvar::PerSecond<bvar::Adder<uint64_t>> s3_read_througthput("s3_file_reader", "s3_read_throughput",
                                                            &s3_bytes_read_total);
@@ -107,6 +111,36 @@ Status S3FileReader::close() {
     }
     return Status::OK();
 }
+
+namespace {
+
+enum class S3ReadRetryClass { NONE, TOO_MANY_REQUESTS, SERVER_ERROR, TRANSPORT_ERROR };
+
+// Classifies a failed GetObject. The SDK has already retried what its retry strategy accepts, but
+// it never retries a failure while receiving the body (it reports those as a non-retryable client
+// error without an HTTP status), and a throttled or failing endpoint can outlast its short
+// backoff. Requests the server rejected for good (4xx other than 429) are not retried.
+S3ReadRetryClass classify_failed_read(int http_code) {
+    switch (http_code) {
+    case static_cast<int>(Aws::Http::HttpResponseCode::TOO_MANY_REQUESTS):
+        return S3ReadRetryClass::TOO_MANY_REQUESTS;
+    case static_cast<int>(Aws::Http::HttpResponseCode::INTERNAL_SERVER_ERROR):
+    case static_cast<int>(Aws::Http::HttpResponseCode::BAD_GATEWAY):
+    case static_cast<int>(Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE):
+    case static_cast<int>(Aws::Http::HttpResponseCode::GATEWAY_TIMEOUT):
+        return S3ReadRetryClass::SERVER_ERROR;
+    default:
+        break;
+    }
+    // No HTTP status: the connection, the request or the body transfer failed in the client.
+    // A 2xx status on a failed read means the body was shorter than the requested range.
+    if (http_code < 100 || (http_code >= 200 && http_code < 300)) {
+        return S3ReadRetryClass::TRANSPORT_ERROR;
+    }
+    return S3ReadRetryClass::NONE;
+}
+
+} // namespace
 
 Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                   const IOContext* /*io_ctx*/) {
@@ -170,22 +204,40 @@ Status S3FileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_rea
         // clang-format on
         _s3_stats.total_get_request_counter++;
         if (resp.status.code != ErrorCode::OK) {
-            if (resp.http_code ==
-                static_cast<int>(Aws::Http::HttpResponseCode::TOO_MANY_REQUESTS)) {
-                s3_file_reader_too_many_request_counter << 1;
-                retry_count++;
-                int wait_time = std::min(base_wait_time * (1 << retry_count),
-                                         max_wait_time); // Exponential backoff
-                std::this_thread::sleep_for(std::chrono::milliseconds(wait_time));
-                _s3_stats.too_many_request_err_counter++;
-                _s3_stats.too_many_request_sleep_time_ms += wait_time;
-                total_sleep_time += wait_time;
-                continue;
-            } else {
-                // Handle other errors
+            const auto retry_class = classify_failed_read(resp.http_code);
+            if (retry_class == S3ReadRetryClass::NONE || retry_count >= max_retries) {
                 return std::move(Status(resp.status.code, std::move(resp.status.msg))
-                                         .append("failed to read"));
+                                         .append(fmt::format("failed to read after {} tries",
+                                                             retry_count + 1)));
             }
+            switch (retry_class) {
+            case S3ReadRetryClass::TOO_MANY_REQUESTS:
+                s3_file_reader_too_many_request_counter << 1;
+                _s3_stats.too_many_request_err_counter++;
+                break;
+            case S3ReadRetryClass::SERVER_ERROR:
+                s3_file_reader_server_error_retry_counter << 1;
+                _s3_stats.server_error_retry_counter++;
+                break;
+            case S3ReadRetryClass::TRANSPORT_ERROR:
+                s3_file_reader_transport_error_retry_counter << 1;
+                _s3_stats.transport_error_retry_counter++;
+                break;
+            case S3ReadRetryClass::NONE:
+                break;
+            }
+            retry_count++;
+            int wait_time = std::min(base_wait_time * (1 << retry_count),
+                                     max_wait_time); // Exponential backoff
+            if (config::enable_s3_retry_full_jitter) {
+                wait_time = static_cast<int>(full_jitter_delay_ms(wait_time));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_time));
+            _s3_stats.retry_sleep_time_ms += wait_time;
+            total_sleep_time += wait_time;
+            // The whole range is requested again from `offset`, so a body that failed midway is
+            // never returned.
+            continue;
         }
         if (*bytes_read != bytes_req) {
             std::string msg = fmt::format(
@@ -223,8 +275,12 @@ void S3FileReader::_collect_profile_before_close() {
                 ADD_CHILD_COUNTER(_profile, "TotalGetRequest", TUnit::UNIT, s3_profile_name);
         RuntimeProfile::Counter* too_many_request_err_counter =
                 ADD_CHILD_COUNTER(_profile, "TooManyRequestErr", TUnit::UNIT, s3_profile_name);
-        RuntimeProfile::Counter* too_many_request_sleep_time = ADD_CHILD_COUNTER(
-                _profile, "TooManyRequestSleepTime", TUnit::TIME_MS, s3_profile_name);
+        RuntimeProfile::Counter* server_error_retry_counter =
+                ADD_CHILD_COUNTER(_profile, "ServerErrorRetry", TUnit::UNIT, s3_profile_name);
+        RuntimeProfile::Counter* transport_error_retry_counter =
+                ADD_CHILD_COUNTER(_profile, "TransportErrorRetry", TUnit::UNIT, s3_profile_name);
+        RuntimeProfile::Counter* retry_sleep_time = ADD_CHILD_COUNTER(
+                _profile, "RetrySleepTime", TUnit::TIME_MS, s3_profile_name);
         RuntimeProfile::Counter* total_bytes_read =
                 ADD_CHILD_COUNTER(_profile, "TotalBytesRead", TUnit::BYTES, s3_profile_name);
         RuntimeProfile::Counter* total_get_request_time_ns =
@@ -232,7 +288,9 @@ void S3FileReader::_collect_profile_before_close() {
 
         COUNTER_UPDATE(total_get_request_counter, _s3_stats.total_get_request_counter);
         COUNTER_UPDATE(too_many_request_err_counter, _s3_stats.too_many_request_err_counter);
-        COUNTER_UPDATE(too_many_request_sleep_time, _s3_stats.too_many_request_sleep_time_ms);
+        COUNTER_UPDATE(server_error_retry_counter, _s3_stats.server_error_retry_counter);
+        COUNTER_UPDATE(transport_error_retry_counter, _s3_stats.transport_error_retry_counter);
+        COUNTER_UPDATE(retry_sleep_time, _s3_stats.retry_sleep_time_ms);
         COUNTER_UPDATE(total_bytes_read, _s3_stats.total_bytes_read);
         COUNTER_UPDATE(total_get_request_time_ns, _s3_stats.total_get_request_time_ns);
         COUNTER_UPDATE(total_time, _s3_stats.total_get_request_time_ns);

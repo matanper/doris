@@ -151,6 +151,29 @@ public:
     void set_deleting() { _is_deleting = true; }
     bool is_deleting() const { return _is_deleting; };
 
+    // Where the block's bytes came from, recorded when it is written, so that bad cached bytes can
+    // be traced to their source. UNKNOWN: not recorded, e.g. written by a load or loaded from disk
+    // at startup.
+    // PEER_SERVER_FILL: from a peer that was asked to fill missing blocks from remote storage first.
+    // FILLED_FOR_PEER: filled from remote storage on this BE to serve a peer's fill request.
+    enum class FillSource : uint8_t {
+        UNKNOWN = 0,
+        REMOTE = 1,
+        PEER = 2,
+        LOCAL_WRITE = 3,
+        PEER_SERVER_FILL = 4,
+        FILLED_FOR_PEER = 5,
+    };
+    void set_fill_source(FillSource source, uint32_t peer_ipv4 = 0) {
+        _fill_peer_ipv4.store(peer_ipv4, std::memory_order_relaxed);
+        _fill_source.store(source, std::memory_order_relaxed);
+    }
+    FillSource fill_source() const { return _fill_source.load(std::memory_order_relaxed); }
+    // "remote", "peer <ip>", "local write" or "unrecorded".
+    std::string fill_source_desc() const;
+    // The IPv4 address in network order, or 0 when host is not an IPv4 literal.
+    static uint32_t ipv4_of(const std::string& host);
+
 public:
     std::atomic<bool> _owned_by_cached_reader {
             false}; // pocessed by CachedRemoteFileReader::_cache_file_readers
@@ -194,6 +217,8 @@ private:
     FileCacheKey _key;
     size_t _downloaded_size {0};
     bool _is_deleting {false};
+    std::atomic<FillSource> _fill_source {FillSource::UNKNOWN};
+    std::atomic<uint32_t> _fill_peer_ipv4 {0};
 
     FileBlockCell* cell {nullptr};
 };

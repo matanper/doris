@@ -17,11 +17,14 @@
 
 #include "io/fs/packed_file_trailer.h"
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 
 #include "common/status.h"
+#include "io/fs/file_reader.h"
 #include "util/coding.h"
+#include "util/slice.h"
 
 namespace doris::io {
 
@@ -78,6 +81,47 @@ Status parse_packed_file_trailer(std::string_view data, cloud::PackedFileFooterP
     debug_pb->mutable_packed_file_info()->Swap(&packed_info);
     *version = 0;
     return Status::OK();
+}
+
+Status read_packed_file_trailer(const FileSystemSPtr& fs, const std::string& packed_file_path,
+                                int64_t packed_file_size, cloud::PackedFileFooterPB* footer,
+                                uint32_t* version) {
+    if (fs == nullptr || footer == nullptr || version == nullptr) {
+        return Status::InvalidArgument("packed file trailer read needs a file system and outputs");
+    }
+    FileReaderOptions opts;
+    opts.cache_type = FileCachePolicy::NO_CACHE;
+    if (packed_file_size > 0) {
+        opts.file_size = packed_file_size;
+    }
+    FileReaderSPtr reader;
+    RETURN_IF_ERROR(fs->open_file(Path(packed_file_path), &reader, &opts));
+    const size_t file_size = reader->size();
+    if (file_size < kPackedFileTrailerSuffixSize) {
+        return Status::Corruption("packed file {} is too small for a trailer: {} bytes",
+                                  packed_file_path, file_size);
+    }
+    auto read_tail = [&](size_t count, std::string* out) -> Status {
+        out->resize(count);
+        size_t bytes_read = 0;
+        RETURN_IF_ERROR(reader->read_at(file_size - count, Slice(out->data(), count), &bytes_read));
+        if (bytes_read != count) {
+            return Status::Corruption("short read of the last {} bytes of packed file {}", count,
+                                      packed_file_path);
+        }
+        return Status::OK();
+    };
+    std::string suffix;
+    RETURN_IF_ERROR(read_tail(kPackedFileTrailerSuffixSize, &suffix));
+    // Both trailer formats end with the payload length in the first or last four bytes.
+    const auto* suffix_ptr = reinterpret_cast<const uint8_t*>(suffix.data());
+    const uint64_t payload_size =
+            std::max<uint64_t>(decode_fixed32_le(suffix_ptr), decode_fixed32_le(suffix_ptr + 4));
+    const size_t tail_size = static_cast<size_t>(
+            std::min<uint64_t>(file_size, payload_size + kPackedFileTrailerSuffixSize));
+    std::string tail;
+    RETURN_IF_ERROR(read_tail(tail_size, &tail));
+    return parse_packed_file_trailer(tail, footer, version);
 }
 
 Status read_packed_file_trailer(const std::string& file_path, cloud::PackedFileFooterPB* debug_pb,
