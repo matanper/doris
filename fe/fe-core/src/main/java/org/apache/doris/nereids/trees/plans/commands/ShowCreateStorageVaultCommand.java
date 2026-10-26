@@ -96,8 +96,7 @@ public class ShowCreateStorageVaultCommand extends ShowCommand {
                 createStmt = getHdfsCreateStmt(storageVaultPB.get().getHdfsInfo());
             }
             if (storageVaultPB.get().hasObjInfo()) {
-                createStmt = getObjectCreateStmt(storageVaultPB.get().getObjInfo(),
-                        storageVaultPB.get().getPathFormat());
+                createStmt = getObjectCreateStmt(storageVaultPB.get().getObjInfo());
             }
             rows.add(Arrays.asList(storageVaultName, createStmt));
         } catch (RpcException e) {
@@ -119,8 +118,7 @@ public class ShowCreateStorageVaultCommand extends ShowCommand {
         }
     }
 
-    private String getObjectCreateStmt(Cloud.ObjectStoreInfoPB objectInfo,
-            Cloud.StorageVaultPB.PathFormat pathFormat) {
+    private String getObjectCreateStmt(Cloud.ObjectStoreInfoPB objectInfo) {
         StringBuilder stmtBuilder = new StringBuilder();
         stmtBuilder.append("CREATE STORAGE VAULT ");
         stmtBuilder.append(storageVaultName);
@@ -138,10 +136,6 @@ public class ShowCreateStorageVaultCommand extends ShowCommand {
         properties.put("use_path_style", String.valueOf(objectInfo.getUsePathStyle()));
         if (objectInfo.hasExternalEndpoint()) {
             properties.put("s3.external_endpoint", objectInfo.getExternalEndpoint());
-        }
-        if (pathFormat.getPathVersion() != 0) {
-            properties.put("path_version", String.valueOf(pathFormat.getPathVersion()));
-            properties.put("shard_num", String.valueOf(pathFormat.getShardNum()));
         }
 
         stmtBuilder.append(new PrintableMap<>(properties, " = ", true, true, true));

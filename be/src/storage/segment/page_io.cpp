@@ -120,7 +120,8 @@ Status PageIO::write_page(io::FileWriter* writer, const std::vector<Slice>& body
 }
 
 io::UInt128Wrapper file_cache_key_from_path(const std::string& seg_path) {
-    return io::BlockFileCache::hash(io::remote_file_cache_name(seg_path));
+    std::string base = seg_path.substr(seg_path.rfind('/') + 1); // tricky: npos + 1 == 0
+    return io::BlockFileCache::hash(base);
 }
 
 std::string file_cache_key_str(const std::string& seg_path) {
