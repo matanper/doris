@@ -1402,6 +1402,14 @@ Status VariantV1ColumnWriter::_process_subcolumns(ColumnVariant* ptr,
                                                   OlapBlockDataConvertor* converter,
                                                   size_t num_rows, int& column_id) {
     _subcolumns_indexes.resize(ptr->get_subcolumns().size());
+    // With variant_subcolumn_write_parallelism, the subcolumn writers are created here in path
+    // order and their data is converted and appended afterwards in parallel; the writers keep
+    // their pages in memory until write_data(), which runs in path order.
+    // A compaction writes its subcolumns one by one.
+    const bool parallel = config::variant_subcolumn_write_parallelism > 1 &&
+                          !(_opts.rowset_ctx != nullptr &&
+                            _opts.rowset_ctx->write_type == DataWriteType::TYPE_COMPACTION);
+    std::vector<variant_writer_helpers::PendingSubcolumnWrite> pending;
 
     auto write_one_subcolumn = [&](const std::string& current_path, const PathInData& relative_path,
                                    const DataTypePtr& current_type, const ColumnPtr& current_column,
@@ -1429,6 +1437,14 @@ Status VariantV1ColumnWriter::_process_subcolumns(ColumnVariant* ptr,
         _subcolumn_writers.push_back(std::move(writer));
         _subcolumn_opts.push_back(opts);
 
+        if (parallel) {
+            // The convertor slot keeps the shared convertor's ids in step with the column ids;
+            // the subcolumn is converted on its own convertor below.
+            converter->add_column_data_convertor(tablet_column);
+            pending.push_back({std::move(tablet_column), current_type, current_column,
+                               _subcolumn_writers.back().get(), false, {}});
+            return Status::OK();
+        }
         RETURN_IF_ERROR(variant_writer_helpers::convert_and_write_column(
                 converter, tablet_column, current_type, _subcolumn_writers.back().get(),
                 current_column, ptr->rows(), current_column_id));
@@ -1467,7 +1483,7 @@ Status VariantV1ColumnWriter::_process_subcolumns(ColumnVariant* ptr,
                                             true /* check_storage_type */,
                                             true /* use_existing_subcolumn_info */));
     }
-    return Status::OK();
+    return variant_writer_helpers::write_pending_subcolumns(&pending, ptr->rows());
 }
 
 Status VariantV1ColumnWriter::_process_regular_doc_value_staging(ColumnVariant* ptr,

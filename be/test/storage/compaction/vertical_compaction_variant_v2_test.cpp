@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <random>
@@ -449,6 +451,49 @@ TEST_F(VerticalCompactionVariantV2Test, MoreThan2048DistinctPaths) {
     // which paths stay materialized and moves the rest to the sparse column.
     ScopedConfig gather(&config::enable_vertical_compaction_gather_copy, true);
     check_compaction(810005, 2048, 3, 1200, true, 6);
+}
+
+namespace {
+std::string segment_bytes(const RowsetSharedPtr& rowset) {
+    auto path = rowset->segment_path(0);
+    if (!path.has_value()) {
+        return {};
+    }
+    std::ifstream in(path.value(), std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+} // namespace
+
+// VARIANT subcolumns and segment columns appended in parallel write the same segment files as
+// appended one by one, for a load and for its compaction.
+TEST_F(VerticalCompactionVariantV2Test, ParallelSubcolumnWritesTheSameSegments) {
+    create_tablet(810006, 2048);
+    const auto generated = make_rows(2, 400, false, 2);
+    std::vector<std::string> loads;
+    std::vector<std::string> compactions;
+    int64_t version = 2;
+    int64_t sequence = 0;
+    for (int32_t parallelism : {1, 1, 8}) {
+        ScopedConfig subcolumns(&config::variant_subcolumn_write_parallelism, parallelism);
+        ScopedConfig columns(&config::segment_column_write_parallelism, parallelism);
+        ScopedConfig min_bytes(&config::segment_write_task_min_bytes, int64_t {0});
+        std::vector<RowsetSharedPtr> inputs;
+        for (const auto& rows : generated) {
+            inputs.push_back(write_rowset(rows, version++));
+            ASSERT_NE(inputs.back(), nullptr);
+        }
+        loads.push_back(segment_bytes(inputs[0]));
+        auto output = compact(inputs, sequence++);
+        ASSERT_NE(output, nullptr);
+        compactions.push_back(segment_bytes(output));
+        ASSERT_FALSE(loads.back().empty());
+        ASSERT_FALSE(compactions.back().empty());
+    }
+    ASSERT_TRUE(loads[0] == loads[1]);
+    ASSERT_TRUE(compactions[0] == compactions[1]);
+    EXPECT_TRUE(loads[0] == loads[2]) << loads[0].size() << " vs " << loads[2].size();
+    EXPECT_TRUE(compactions[0] == compactions[2])
+            << compactions[0].size() << " vs " << compactions[2].size();
 }
 
 } // namespace doris

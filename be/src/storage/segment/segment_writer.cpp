@@ -1086,7 +1086,9 @@ Status SegmentWriter::_write_zone_map() {
 }
 
 Status SegmentWriter::_write_inverted_index() {
-    IndexFinishBatch batch;
+    IndexFinishBatch batch(_opts.write_type == DataWriteType::TYPE_COMPACTION
+                                   ? IndexFinishLane::COMPACTION
+                                   : IndexFinishLane::LOAD);
     for (auto& column_writer : _column_writers) {
         RETURN_IF_ERROR(column_writer->write_inverted_index());
     }
