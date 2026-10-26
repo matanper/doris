@@ -142,12 +142,6 @@ private:
     static void _scanner_scan(std::shared_ptr<ScannerContext> ctx,
                               std::shared_ptr<ScanTask> scan_task);
 
-    // Records the scanner's profile, marks it to close at eos and hands the task back to the
-    // context. It is the last use of the scanner and the task on this thread.
-    static void _hand_back_scan_task(const std::shared_ptr<ScannerContext>& ctx, Scanner& scanner,
-                                     const std::shared_ptr<ScanTask>& scan_task, bool eos,
-                                     const Status& status);
-
     static void _make_sure_virtual_col_is_materialized(const std::shared_ptr<Scanner>& scanner,
                                                        Block* block);
 };

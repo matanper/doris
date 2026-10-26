@@ -368,12 +368,6 @@ const FlushStatistic& MemTableWriter::get_flush_token_stats() {
     return _flush_token->get_stats();
 }
 
-void MemTableWriter::wait_for_flush_slot(const std::function<bool()>& should_stop) {
-    if (_flush_token != nullptr) {
-        _flush_token->wait_for_flush_slot(should_stop);
-    }
-}
-
 uint64_t MemTableWriter::flush_running_count() const {
     return _flush_token == nullptr ? 0 : _flush_token->get_stats().flush_running_count.load();
 }

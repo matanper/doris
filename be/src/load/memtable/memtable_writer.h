@@ -105,9 +105,6 @@ public:
 
     uint64_t flush_running_count() const;
 
-    // Waits until a flush slot of this writer is free (FlushToken::wait_for_flush_slot).
-    void wait_for_flush_slot(const std::function<bool()>& should_stop = nullptr);
-
     uint64_t workload_group_id() const {
         auto wg = _resource_ctx->workload_group();
         if (wg != nullptr) {

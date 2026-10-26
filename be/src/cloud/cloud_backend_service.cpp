@@ -74,12 +74,6 @@ void CloudBackendService::sync_load_for_tablets(TSyncLoadForTabletsResponse&,
     static_cast<void>(_engine.sync_load_for_tablets_thread_pool().submit_func(std::move(f)));
 }
 
-void CloudBackendService::publish_tablet_ownership(TPublishTabletOwnershipResponse& response,
-                                                   const TPublishTabletOwnershipRequest& request) {
-    _engine.tablet_mgr().set_owned_tablets(request.owned_tablet_ids, request.generated_at_ms);
-    response.__set_status(Status::OK().to_thrift());
-}
-
 void CloudBackendService::get_top_n_hot_partitions(TGetTopNHotPartitionsResponse& response,
                                                    const TGetTopNHotPartitionsRequest& request) {
     _engine.tablet_hotspot().get_top_n_hot_partition(&response.hot_tables);

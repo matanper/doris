@@ -29,23 +29,16 @@
 #include <random>
 #include <ranges>
 #include <set>
-#include <thread>
-
-#include <bvar/bvar.h>
 
 #include "cloud/cloud_meta_mgr.h"
-#include "cloud/config.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_warm_up_manager.h"
 #include "common/config.h"
 #include "cpp/sync_point.h"
-#include "runtime/exec_env.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
-#include "storage/rowset/rowset_reader.h"
 #include "storage/tablet/tablet_meta.h"
-#include "util/defer_op.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -65,16 +58,14 @@ public:
     }
     void TearDown() override {}
 
-    // With `with_schema`, the rowset has the tablet's schema, which removing its cache needs.
-    RowsetSharedPtr create_rowset(Version version, int num_segments = 1, bool with_schema = false) {
+    RowsetSharedPtr create_rowset(Version version, int num_segments = 1) {
         auto rs_meta = std::make_shared<RowsetMeta>();
         rs_meta->set_rowset_type(BETA_ROWSET);
         rs_meta->set_version(version);
         rs_meta->set_rowset_id(_engine.next_rowset_id());
         rs_meta->set_num_segments(num_segments);
         RowsetSharedPtr rowset;
-        Status st = RowsetFactory::create_rowset(with_schema ? _tablet->tablet_schema() : nullptr,
-                                                 "", rs_meta, &rowset);
+        Status st = RowsetFactory::create_rowset(nullptr, "", rs_meta, &rowset);
         if (!st.ok()) {
             return nullptr;
         }
@@ -87,100 +78,6 @@ protected:
     std::shared_ptr<CloudTablet> _tablet;
     CloudStorageEngine _engine;
 };
-
-// An unused rowset that something else still references is counted as stuck once it has been
-// unused for unused_rowset_stuck_log_sec, with a live reader counted separately, and the counts
-// leave the bvars with the tablet.
-TEST_F(CloudTabletWarmUpStateTest, StuckUnusedRowsetsAreCounted) {
-    auto exposed = [](const char* name) {
-        return std::stoll(bvar::Variable::describe_exposed(name));
-    };
-    const int64_t old_sec = config::unused_rowset_stuck_log_sec;
-    config::unused_rowset_stuck_log_sec = 1;
-    const int64_t stuck_before = exposed("unused_rowsets_stuck_count");
-    const int64_t reader_before = exposed("unused_rowsets_stuck_with_reader_count");
-
-    auto held = create_rowset(Version(2, 2));
-    auto read = create_rowset(Version(3, 3));
-    ASSERT_NE(held, nullptr);
-    ASSERT_NE(read, nullptr);
-    RowsetReaderSharedPtr reader;
-    ASSERT_TRUE(read->create_reader(&reader).ok());
-    _tablet->add_unused_rowsets({held, read});
-    RowsetSharedPtr holder = held;
-    read.reset();
-
-    _tablet->remove_unused_rowsets();
-    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 0);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    _tablet->remove_unused_rowsets();
-    _tablet->remove_unused_rowsets();
-    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 2);
-    EXPECT_EQ(exposed("unused_rowsets_stuck_with_reader_count") - reader_before, 1);
-    EXPECT_TRUE(_tablet->need_remove_unused_rowsets());
-
-    _tablet.reset();
-    EXPECT_EQ(exposed("unused_rowsets_stuck_count") - stuck_before, 0);
-    EXPECT_EQ(exposed("unused_rowsets_stuck_with_reader_count") - reader_before, 0);
-    config::unused_rowset_stuck_log_sec = old_sec;
-}
-
-// The unused rowset counts follow the tablet's unused rowsets: a rowset added twice counts once,
-// one released by its last reader while a vacuum runs is taken off exactly once, and a tablet
-// destroyed with unused rowsets left takes them off.
-TEST_F(CloudTabletWarmUpStateTest, UnusedRowsetCountsFollowTheTablet) {
-    auto exposed = [](const char* name) {
-        return std::stoll(bvar::Variable::describe_exposed(name));
-    };
-    // Removing a rowset recycles its cache through the engine's warm up manager.
-    ExecEnv::GetInstance()->set_storage_engine(std::make_unique<CloudStorageEngine>(EngineOptions {}));
-    Defer reset_engine {[] { ExecEnv::GetInstance()->set_storage_engine(nullptr); }};
-    auto& cloud_engine = ExecEnv::GetInstance()->storage_engine().to_cloud();
-    cloud_engine.set_cloud_warm_up_manager(std::make_unique<CloudWarmUpManager>(cloud_engine));
-    const int64_t count_before = exposed("unused_rowsets_count");
-    const int64_t bytes_before = exposed("unused_rowsets_bytes");
-    std::vector<RowsetSharedPtr> rowsets;
-    for (int64_t v = 2; v < 34; ++v) {
-        rowsets.push_back(create_rowset(Version(v, v), 1, true));
-        ASSERT_NE(rowsets.back(), nullptr);
-        rowsets.back()->rowset_meta()->set_total_disk_size(1000);
-    }
-    _tablet->add_unused_rowsets(rowsets);
-    _tablet->add_unused_rowsets({rowsets[0], rowsets[1]});
-    EXPECT_EQ(exposed("unused_rowsets_count") - count_before, 32);
-    EXPECT_EQ(exposed("unused_rowsets_bytes") - bytes_before, 32000);
-
-    // Readers hold the first half; they let go while vacuums run.
-    std::vector<RowsetSharedPtr> readers(rowsets.begin(), rowsets.begin() + 16);
-    rowsets.clear();
-    std::thread release([&readers]() {
-        for (auto& r : readers) {
-            r.reset();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-        }
-    });
-    for (int i = 0; i < 50; ++i) {
-        _tablet->remove_unused_rowsets();
-    }
-    release.join();
-    _tablet->remove_unused_rowsets();
-    EXPECT_EQ(exposed("unused_rowsets_count") - count_before, 0);
-    EXPECT_EQ(exposed("unused_rowsets_bytes") - bytes_before, 0);
-    EXPECT_FALSE(_tablet->need_remove_unused_rowsets());
-
-    // A tablet evicted with unused rowsets still held elsewhere.
-    auto held = create_rowset(Version(40, 40), 1, true);
-    ASSERT_NE(held, nullptr);
-    held->rowset_meta()->set_total_disk_size(700);
-    _tablet->add_unused_rowsets({held});
-    _tablet->remove_unused_rowsets();
-    EXPECT_EQ(exposed("unused_rowsets_count") - count_before, 1);
-    EXPECT_EQ(exposed("unused_rowsets_bytes") - bytes_before, 700);
-    _tablet.reset();
-    EXPECT_EQ(exposed("unused_rowsets_count") - count_before, 0);
-    EXPECT_EQ(exposed("unused_rowsets_bytes") - bytes_before, 0);
-}
 
 // Test get_rowset_warmup_state for non-existent rowset
 TEST_F(CloudTabletWarmUpStateTest, TestGetRowsetWarmupStateNonExistent) {

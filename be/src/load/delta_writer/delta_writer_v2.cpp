@@ -35,7 +35,6 @@
 #include "core/block/block.h"
 #include "exec/sink/load_stream_stub.h"
 #include "io/fs/file_writer.h" // IWYU pragma: keep
-#include "load/memtable/memtable_flush_executor.h"
 #include "load/memtable/memtable_memory_limiter.h"
 #include "runtime/exec_env.h"
 #include "runtime/query_context.h"
@@ -170,12 +169,13 @@ Status DeltaWriterV2::write(const Block* block, const DorisVector<uint32_t>& row
     }
     {
         SCOPED_RAW_TIMER(&_wait_flush_limit_time);
+        auto memtable_flush_running_count_limit = config::memtable_flush_running_count_limit;
         DBUG_EXECUTE_IF("DeltaWriterV2.write.back_pressure",
                         { std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000)); });
-        while (_memtable_writer->flush_running_count() >= FlushToken::flush_running_count_limit()) {
+        while (_memtable_writer->flush_running_count() >= memtable_flush_running_count_limit) {
             DBUG_EXECUTE_IF("DeltaWriterV2.write.flush_limit_wait", DBUG_RUN_CALLBACK());
             RETURN_IF_ERROR(cancel_check());
-            _memtable_writer->wait_for_flush_slot([&] { return !cancel_check().ok(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
     SCOPED_RAW_TIMER(&_write_memtable_time);

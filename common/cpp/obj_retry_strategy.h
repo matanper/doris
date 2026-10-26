@@ -20,8 +20,6 @@
 #include <aws/core/client/AWSError.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
 
-#include <functional>
-
 #ifdef USE_AZURE
 #include <azure/core/http/policies/policy.hpp>
 #endif
@@ -29,27 +27,16 @@
 namespace doris {
 void record_object_request_failed(int http_code);
 
-// A delay drawn uniformly from [0, max_delay_ms].
-long full_jitter_delay_ms(long max_delay_ms);
-
 class S3CustomRetryStrategy final : public Aws::Client::DefaultRetryStrategy {
 public:
-    // While `full_jitter` returns true, each delay is drawn uniformly from [0, d], where d is the
-    // exponential delay of DefaultRetryStrategy, so that requests throttled together do not all
-    // retry together.
-    S3CustomRetryStrategy(int maxRetries, bool retry_slow_down = true,
-                          std::function<bool()> full_jitter = nullptr);
+    S3CustomRetryStrategy(int maxRetries, bool retry_slow_down = true);
     ~S3CustomRetryStrategy() override;
 
     bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors>& error,
                      long attemptedRetries) const override;
 
-    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors>& error,
-                                       long attemptedRetries) const override;
-
 private:
     bool _retry_slow_down;
-    std::function<bool()> _full_jitter;
 };
 
 #ifdef USE_AZURE

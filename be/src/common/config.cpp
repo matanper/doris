@@ -778,8 +778,7 @@ DEFINE_mInt64(write_buffer_size_for_agg, "104857600");
 DEFINE_mInt64(min_write_buffer_size_for_partial_update, "1048576");
 DEFINE_mBool(memtable_flush_release_input_columns, "true");
 // max parallel flush task per memtable writer
-DEFINE_mInt32(memtable_flush_running_count_limit, "32");
-DEFINE_mBool(enable_adaptive_memtable_flush_running_count_limit, "true");
+DEFINE_mInt32(memtable_flush_running_count_limit, "2");
 
 // maximum sleep time to wait for memory when writing or flushing memtable.
 DEFINE_mInt32(memtable_wait_for_memory_sleep_time_s, "300");
@@ -1429,7 +1428,11 @@ DEFINE_Int32(inverted_index_read_buffer_size, "4096");
 DEFINE_Int32(max_depth_in_bkd_tree, "32");
 // index compaction
 DEFINE_mBool(inverted_index_compaction_enable, "true");
-DEFINE_mBool(enable_variant_typed_path_index_compaction, "false");
+DEFINE_mBool(enable_variant_subcolumn_index_compaction, "true");
+// Before index compaction merges the input indexes, read each input segment's index file once
+// through the file cache, in chunks of index_compaction_preload_chunk_bytes, on at most
+// index_compaction_preload_threads threads shared by all compactions.
+DEFINE_mBool(enable_index_compaction_preload, "true");
 // When a compaction ends, whatever its outcome, drop its input segments from the segment cache.
 // Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
 // the segment cache does not count, so its memory bound does not hold for them.
@@ -1438,8 +1441,6 @@ DEFINE_mBool(enable_compaction_pin_input_segments, "true");
 // Before merging, read each input segment data file once through the file cache, on the index
 // compaction preload pool.
 DEFINE_mBool(enable_compaction_data_preload, "true");
-// The compaction preload pool: files are read in chunks of index_compaction_preload_chunk_bytes on
-// at most index_compaction_preload_threads threads shared by all compactions.
 DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
 DEFINE_mInt32(index_compaction_preload_threads, "0");
 DEFINE_Validator(index_compaction_preload_threads,
@@ -1683,7 +1684,6 @@ DEFINE_Int64(wait_cancel_release_memory_ms, "5000");
 DEFINE_mBool(check_segment_when_build_rowset_meta, "false");
 
 DEFINE_mInt32(max_s3_client_retry, "10");
-DEFINE_mBool(enable_s3_retry_full_jitter, "true");
 DEFINE_mInt32(s3_read_base_wait_time_ms, "100");
 DEFINE_mInt32(s3_read_max_wait_time_ms, "800");
 DEFINE_mBool(enable_s3_object_check_after_upload, "true");
@@ -1829,9 +1829,9 @@ DEFINE_mInt64(load_s3_upload_buffer_backpressure_bytes, "0");
 DEFINE_mInt32(load_s3_upload_buffer_backpressure_resume_percent, "80");
 DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
 DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
-DEFINE_mInt64(file_cache_writer_thread_num, "32");
+DEFINE_Int64(file_cache_writer_thread_num, "32");
 DEFINE_Int64(file_cache_writer_queue_size, "256");
-DEFINE_mInt64(file_cache_writer_load_thread_num, "8");
+DEFINE_Int64(file_cache_writer_load_thread_num, "8");
 DEFINE_Int64(file_cache_writer_load_queue_size, "256");
 DEFINE_mInt64(file_cache_writer_backlog_bytes, "2147483648");
 

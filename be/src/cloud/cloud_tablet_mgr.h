@@ -22,7 +22,6 @@
 
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 #include "common/status.h"
@@ -64,16 +63,6 @@ public:
     bool peek_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* tablet_meta);
 
     void erase_tablet(int64_t tablet_id);
-
-    // Replaces the set of tablets this BE owns, as the FE computed it at `generated_at_ms`.
-    void set_owned_tablets(const std::vector<int64_t>& tablet_ids, int64_t generated_at_ms);
-
-    // Drops the cached tablets this BE does not own that nothing has used for
-    // config::foreign_tablet_idle_evict_sec, with their segments. Returns how many it dropped.
-    int64_t evict_idle_foreign_tablets();
-
-    // True when the latest owned set is fresh and does not contain the tablet.
-    bool is_foreign_tablet(int64_t tablet_id);
 
     void vacuum_stale_rowsets(const CountDownLatch& stop_latch);
 
@@ -132,10 +121,6 @@ private:
     class CacheValue;
     std::unique_ptr<TabletMap> _tablet_map;
     std::unique_ptr<LRUCachePolicy> _cache;
-
-    struct Ownership;
-    std::mutex _ownership_mtx;
-    std::shared_ptr<const Ownership> _ownership;
 };
 
 } // namespace doris

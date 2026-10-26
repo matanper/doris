@@ -24,8 +24,6 @@
 
 #include "common/config.h"
 #include "common/status.h"
-#include "runtime/exec_env.h"
-#include "storage/cache/page_cache.h"
 #include "storage/olap_define.h"
 #include "storage/rowset/beta_rowset.h"
 #include "storage/segment/column_reader.h"
@@ -168,23 +166,9 @@ void SegmentLoader::erase_segment(const SegmentCache::CacheKey& key) {
     _segment_cache->erase(key);
 }
 
-void SegmentLoader::erase_segments(const RowsetId& rowset_id, int64_t num_segments,
-                                   bool erase_footers) {
-    auto* footer_cache = erase_footers ? ExecEnv::GetInstance()->get_storage_page_cache() : nullptr;
+void SegmentLoader::erase_segments(const RowsetId& rowset_id, int64_t num_segments) {
     for (int64_t i = 0; i < num_segments; i++) {
-        SegmentCache::CacheKey key(rowset_id, i);
-        if (footer_cache != nullptr) {
-            SegmentCacheHandle handle;
-            if (_segment_cache->lookup(key, &handle)) {
-                const auto& file_reader = handle.get_segments()[0]->file_reader();
-                if (file_reader != nullptr) {
-                    footer_cache->erase(
-                            segment_v2::Segment::get_segment_footer_cache_key(file_reader),
-                            segment_v2::PageTypePB::INDEX_PAGE);
-                }
-            }
-        }
-        erase_segment(key);
+        erase_segment(SegmentCache::CacheKey(rowset_id, i));
     }
 }
 

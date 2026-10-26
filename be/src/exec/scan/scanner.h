@@ -133,10 +133,6 @@ protected:
     // Update the counters before closing this scanner
     virtual void _collect_profile_before_close();
 
-    // Releases what the scanner holds only to read, once it has read its last block and its
-    // profile is collected.
-    virtual void _release_after_eos() {}
-
     // Whether rows filtered/unselected by this scanner should be reported to the load
     // counters in RuntimeState. Only the scanner reading the load source data should
     // report, otherwise rows filtered by query predicates (e.g. in INSERT INTO ... SELECT
@@ -200,9 +196,6 @@ public:
         if (_is_open) {
             _collect_profile_before_close();
         }
-        // The scanner reads nothing more; what it holds only for reading goes now, not when the
-        // query ends.
-        _release_after_eos();
         _need_to_close = true;
     }
 

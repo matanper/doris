@@ -33,8 +33,6 @@ import org.apache.doris.thrift.TGetTopNHotPartitionsResponse;
 import org.apache.doris.thrift.TIngestBinlogRequest;
 import org.apache.doris.thrift.TIngestBinlogResult;
 import org.apache.doris.thrift.TNetworkAddress;
-import org.apache.doris.thrift.TPublishTabletOwnershipRequest;
-import org.apache.doris.thrift.TPublishTabletOwnershipResponse;
 import org.apache.doris.thrift.TPublishTopicRequest;
 import org.apache.doris.thrift.TPublishTopicResult;
 import org.apache.doris.thrift.TPythonEnvInfo;
@@ -260,12 +258,6 @@ public class GenericPoolTest {
         @Override
         public List<TPythonPackageInfo> getPythonPackages(String pythonVersion) throws TException {
             return null;
-        }
-
-        @Override
-        public TPublishTabletOwnershipResponse publishTabletOwnership(TPublishTabletOwnershipRequest request)
-                throws TException {
-            return new TPublishTabletOwnershipResponse();
         }
     }
 

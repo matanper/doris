@@ -470,14 +470,6 @@ public:
 
     bool need_remove_unused_rowsets();
 
-private:
-    // Logs, at most unused_rowset_stuck_log_per_minute times a minute across all tablets, an
-    // unused rowset that something besides _unused_rowsets still references, with what is known
-    // about the tablet's compactions, syncs and the rowset's readers.
-    void _log_stuck_unused_rowset(const Rowset& rowset, long use_count, int64_t age_s);
-
-public:
-    // A rowset already unused is not added, or counted, again.
     void add_unused_rowsets(const std::vector<RowsetSharedPtr>& rowsets);
     void remove_unused_rowsets();
 
@@ -660,23 +652,6 @@ private:
     // unused_rowsets, [start_version, end_version]
     std::mutex _gc_mutex;
     std::unordered_map<RowsetId, RowsetSharedPtr> _unused_rowsets;
-    // When each of _unused_rowsets was added, in seconds since the epoch, and whether a stuck
-    // rowset was already logged.
-    // The bytes are those added to unused_rowsets_bytes, so that removing the rowset takes off
-    // exactly what adding it put on.
-    struct UnusedRowsetAge {
-        int64_t added_s = 0;
-        bool logged = false;
-        int64_t bytes = 0;
-    };
-    std::unordered_map<RowsetId, UnusedRowsetAge> _unused_rowset_ages;
-    // How many of _unused_rowsets were held by another reference for at least
-    // unused_rowset_stuck_log_sec at the last remove_unused_rowsets().
-    int64_t _stuck_unused_rowsets = 0;
-    int64_t _stuck_unused_rowsets_bytes = 0;
-    // What _unused_rowsets adds to unused_rowsets_bytes; the destructor takes it off again.
-    int64_t _unused_rowsets_bytes = 0;
-    int64_t _stuck_unused_rowsets_with_reader = 0;
     std::vector<std::pair<std::vector<RowsetId>, DeleteBitmapKeyRanges>> _unused_delete_bitmap;
 
     // for warm up states management
