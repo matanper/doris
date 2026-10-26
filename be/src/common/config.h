@@ -703,20 +703,6 @@ DECLARE_Bool(enable_all_http_auth);
 // Number of webserver workers
 DECLARE_Int32(webserver_num_workers);
 
-// Wait for a stream load to finish and commit on a pool thread instead of the HTTP event loop
-// thread, which serves the bodies of other loads on the same keep-alive event loop.
-DECLARE_mBool(enable_stream_load_finish_off_event_loop);
-DECLARE_Int32(stream_load_finish_thread_num);
-// Begin a stream load's transaction, plan it and start its fragment on a pool thread instead of
-// the HTTP event loop thread, which serves the other connections on the same loop.
-DECLARE_mBool(enable_stream_load_header_off_event_loop);
-DECLARE_Int32(stream_load_header_thread_num);
-// Pause reading a stream load's HTTP body while its pipe is full instead of blocking the event
-// loop thread, which serves the other connections on the same loop.
-DECLARE_mBool(enable_stream_load_receive_flow_control);
-// Bytes of a streaming stream load's body buffered between the HTTP receiver and the scanner.
-DECLARE_mInt64(stream_load_pipe_buffer_bytes);
-
 DECLARE_Bool(enable_single_replica_load);
 // Number of download workers for single replica load
 DECLARE_Int32(single_replica_load_download_num_workers);
@@ -966,18 +952,6 @@ DECLARE_mBool(enable_adaptive_flush_threads);
 DECLARE_mBool(enable_table_memtable_flush_backpressure);
 // Max pending flush memtables for one table on this BE before blocking new writes.
 DECLARE_mInt32(table_memtable_flush_pending_count_limit);
-// Wait (bounded) on memtable writes when process memory crosses a watermark below the GC limit.
-DECLARE_mBool(enable_load_memory_backpressure);
-// Percent of mem_limit at which load writes start to flush and wait.
-DECLARE_mInt32(load_memory_backpressure_process_mem_percent);
-// Budget for queued plus flushing memtable bytes, percent of mem_limit. 0 disables it.
-DECLARE_mInt32(load_memtable_pending_mem_limit_percent);
-// Upper bound of one memory-driven load wait.
-DECLARE_mInt64(load_memory_backpressure_max_wait_ms);
-// Scope the memory part of the per-table write gate to the writer's own load.
-DECLARE_mBool(load_memory_backpressure_wait_on_own_load);
-// Process GC frees only the overshoot plus this percent of mem_limit from loads. -1 disables it.
-DECLARE_mInt32(load_memory_gc_free_extra_percent);
 
 // config for tablet meta checkpoint
 DECLARE_mInt32(tablet_meta_checkpoint_min_new_rowsets_num);

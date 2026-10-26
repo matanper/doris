@@ -29,7 +29,6 @@ class ExecEnv;
 class Status;
 class StreamLoadContext;
 class HttpRequest;
-class ThreadPool;
 
 class StreamLoadAction : public HttpHandler {
 public:
@@ -47,23 +46,7 @@ public:
 
 private:
     Status _on_header(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx);
-    // Validates the headers without calling FE; cheap enough for the event loop thread.
-    Status _parse_header(HttpRequest* http_req, const std::shared_ptr<StreamLoadContext>& ctx);
-    // Begins the transaction, plans the load on FE and starts its fragment.
-    Status _begin_txn_and_plan(HttpRequest* http_req,
-                               const std::shared_ptr<StreamLoadContext>& ctx);
-    // Runs _begin_txn_and_plan() on a pool thread with the body read paused. Returns false when
-    // nothing was scheduled; the caller then runs it inline.
-    bool _on_header_off_event_loop(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx);
-    void _on_header_work_done(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx,
-                              int64_t submit_nanos, Status st);
-    void _on_header_work_abandoned(const std::shared_ptr<StreamLoadContext>& ctx,
-                                   int64_t submit_nanos, Status st);
-    Status _append_pending_body(const std::shared_ptr<StreamLoadContext>& ctx);
-    void _fail_header(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx, Status st);
     Status _handle(std::shared_ptr<StreamLoadContext> ctx);
-    void _finish_load(const std::shared_ptr<StreamLoadContext>& ctx);
-    void _reply(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx);
     Status _data_saved_path(HttpRequest* req, std::string* file_path, int64_t file_bytes);
     Status _process_put(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx);
     Status _can_group_commit(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx,
@@ -74,10 +57,6 @@ private:
 
 private:
     ExecEnv* _exec_env;
-    // Waits for loads to finish so the HTTP event loop threads keep reading other bodies.
-    std::unique_ptr<ThreadPool> _finish_pool;
-    // Waits on FE to begin and plan loads so the HTTP event loop threads keep reading other bodies.
-    std::unique_ptr<ThreadPool> _header_pool;
 
     std::shared_ptr<MetricEntity> _stream_load_entity;
     IntCounter* streaming_load_requests_total;

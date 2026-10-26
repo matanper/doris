@@ -29,7 +29,6 @@
 #include <sys/time.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -55,8 +54,6 @@
 #include "load/stream_load/stream_load_executor.h"
 #include "load/stream_load/stream_load_recorder.h"
 #include "runtime/exec_env.h"
-#include "service/http/ev_http_server.h"
-#include "service/http/http_body_flow_control.h"
 #include "service/http/http_channel.h"
 #include "service/http/http_common.h"
 #include "service/http/http_headers.h"
@@ -65,10 +62,8 @@
 #include "storage/storage_engine.h"
 #include "util/byte_buffer.h"
 #include "util/client_cache.h"
-#include "util/debug_points.h"
 #include "util/load_util.h"
 #include "util/string_util.h"
-#include "util/threadpool.h"
 #include "util/thrift_rpc_helper.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -84,7 +79,6 @@ DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(streaming_load_current_processing, MetricUnit
 bvar::LatencyRecorder g_stream_load_receive_data_latency_ms("stream_load_receive_data_latency_ms");
 bvar::LatencyRecorder g_stream_load_commit_and_publish_latency_ms("stream_load",
                                                                   "commit_and_publish_ms");
-bvar::LatencyRecorder g_stream_load_header_wait_latency_ms("stream_load", "header_wait_ms");
 
 static constexpr size_t MIN_CHUNK_SIZE = 64 * 1024;
 static constexpr size_t MEBIBYTE = 1024 * 1024;
@@ -107,14 +101,6 @@ StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
     INT_COUNTER_METRIC_REGISTER(_stream_load_entity, streaming_load_requests_total);
     INT_COUNTER_METRIC_REGISTER(_stream_load_entity, streaming_load_duration_ms);
     INT_GAUGE_METRIC_REGISTER(_stream_load_entity, streaming_load_current_processing);
-    static_cast<void>(ThreadPoolBuilder("StreamLoadFinish")
-                              .set_min_threads(0)
-                              .set_max_threads(config::stream_load_finish_thread_num)
-                              .build(&_finish_pool));
-    static_cast<void>(ThreadPoolBuilder("StreamLoadHeader")
-                              .set_min_threads(0)
-                              .set_max_threads(config::stream_load_header_thread_num)
-                              .build(&_header_pool));
 }
 
 StreamLoadAction::~StreamLoadAction() {
@@ -127,30 +113,7 @@ void StreamLoadAction::handle(HttpRequest* req) {
     if (ctx == nullptr) {
         return;
     }
-    if (ctx->header_in_flight) {
-        // The whole body arrived with the headers. The header work calls handle() again once
-        // the load is planned.
-        ctx->body_complete_during_header = true;
-        ctx->header_flow_control->body_complete();
-        return;
-    }
-    if (ctx->body_flow_control != nullptr) {
-        ctx->body_flow_control->body_complete();
-    }
 
-    // Waiting for the load to finish takes as long as the write and commit. Done on the event
-    // loop thread, it stalls the bodies of every other load on the same keep-alive event loop.
-    if (ctx->status.ok() && config::enable_stream_load_finish_off_event_loop &&
-        run_off_event_loop(
-                req, _finish_pool.get(), [this, ctx]() { _finish_load(ctx); },
-                [this, req, ctx]() { _reply(req, ctx); })) {
-        return;
-    }
-    _finish_load(ctx);
-    _reply(req, ctx);
-}
-
-void StreamLoadAction::_finish_load(const std::shared_ptr<StreamLoadContext>& ctx) {
     // status already set to fail
     if (ctx->status.ok()) {
         ctx->status = _handle(ctx);
@@ -171,11 +134,22 @@ void StreamLoadAction::_finish_load(const std::shared_ptr<StreamLoadContext>& ct
         }
     }
 
+    auto str = ctx->to_json();
+    // add new line at end
+    str = str + '\n';
+    HttpChannel::send_reply(req, str);
+#ifndef BE_TEST
+    if (config::enable_stream_load_record || config::enable_stream_load_record_to_audit_log_table) {
+        if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
+            str = ctx->prepare_stream_load_record(str);
+            _save_stream_load_record(ctx, str);
+        }
+    }
+#endif
+
     LOG(INFO) << "finished to execute stream load. label=" << ctx->label
               << ", txn_id=" << ctx->txn_id << ", query_id=" << ctx->id
-              << ", load_cost_ms=" << ctx->load_cost_millis
-              << ", header_wait_ms=" << ctx->header_wait_cost_nanos / 1000000
-              << ", receive_data_cost_ms="
+              << ", load_cost_ms=" << ctx->load_cost_millis << ", receive_data_cost_ms="
               << (ctx->receive_and_read_data_cost_nanos - ctx->read_data_cost_nanos) / 1000000
               << ", read_data_cost_ms=" << ctx->read_data_cost_nanos / 1000000
               << ", write_data_cost_ms=" << ctx->write_data_cost_nanos / 1000000
@@ -192,21 +166,6 @@ void StreamLoadAction::_finish_load(const std::shared_ptr<StreamLoadContext>& ct
     if (!ctx->data_saved_path.empty()) {
         _exec_env->load_path_mgr()->clean_tmp_files(ctx->data_saved_path);
     }
-}
-
-void StreamLoadAction::_reply(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx) {
-    auto str = ctx->to_json();
-    // add new line at end
-    str = str + '\n';
-    HttpChannel::send_reply(req, str);
-#ifndef BE_TEST
-    if (config::enable_stream_load_record || config::enable_stream_load_record_to_audit_log_table) {
-        if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
-            str = ctx->prepare_stream_load_record(str);
-            _save_stream_load_record(ctx, str);
-        }
-    }
-#endif
 }
 
 Status StreamLoadAction::_handle(std::shared_ptr<StreamLoadContext> ctx) {
@@ -273,192 +232,37 @@ int StreamLoadAction::on_header(HttpRequest* req) {
     ctx->begin_receive_and_read_data_cost_nanos = MonotonicNanos();
 
     if (st.ok()) {
-        if (config::enable_stream_load_header_off_event_loop) {
-            st = _parse_header(req, ctx);
-            if (st.ok() && _on_header_off_event_loop(req, ctx)) {
-                return 0;
-            }
-            if (st.ok()) {
-                st = _begin_txn_and_plan(req, ctx);
-            }
-        } else {
-            st = _on_header(req, ctx);
-        }
+        st = _on_header(req, ctx);
         LOG(INFO) << "finished to handle HTTP header, " << ctx->brief();
     }
     if (!st.ok()) {
-        _fail_header(req, ctx, std::move(st));
+        ctx->status = std::move(st);
+        if (ctx->need_rollback) {
+            _exec_env->stream_load_executor()->rollback_txn(ctx.get());
+            ctx->need_rollback = false;
+        }
+        if (ctx->body_sink != nullptr) {
+            ctx->body_sink->cancel(ctx->status.to_string());
+        }
+        auto str = ctx->to_json();
+        // add new line at end
+        str = str + '\n';
+        HttpChannel::send_reply(req, str);
+#ifndef BE_TEST
+        if (config::enable_stream_load_record ||
+            config::enable_stream_load_record_to_audit_log_table) {
+            if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
+                str = ctx->prepare_stream_load_record(str);
+                _save_stream_load_record(ctx, str);
+            }
+        }
+#endif
         return -1;
     }
     return 0;
 }
 
-void StreamLoadAction::_fail_header(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx,
-                                    Status st) {
-    ctx->status = std::move(st);
-    if (ctx->need_rollback) {
-        _exec_env->stream_load_executor()->rollback_txn(ctx.get());
-        ctx->need_rollback = false;
-    }
-    if (ctx->body_sink != nullptr) {
-        ctx->body_sink->cancel(ctx->status.to_string());
-    }
-    auto str = ctx->to_json();
-    // add new line at end
-    str = str + '\n';
-    HttpChannel::send_reply(req, str);
-#ifndef BE_TEST
-    if (config::enable_stream_load_record || config::enable_stream_load_record_to_audit_log_table) {
-        if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
-            str = ctx->prepare_stream_load_record(str);
-            _save_stream_load_record(ctx, str);
-        }
-    }
-#endif
-}
-
-bool StreamLoadAction::_on_header_off_event_loop(HttpRequest* req,
-                                                 const std::shared_ptr<StreamLoadContext>& ctx) {
-    auto flow_control = HttpBodyFlowControl::create(req);
-    if (flow_control == nullptr) {
-        return false;
-    }
-    // The connection, and `req` with it, may be freed while the pool thread waits on FE, so the
-    // pool thread reads the headers and params from a copy.
-    auto headers = std::make_shared<HttpRequest>(nullptr);
-    for (const auto& [key, value] : req->headers()) {
-        headers->set_header(key, value);
-    }
-    *headers->params() = *req->params();
-    ctx->header_flow_control = flow_control;
-
-    auto header_status = std::make_shared<Status>();
-    const int64_t submit_nanos = MonotonicNanos();
-    bool scheduled = run_off_event_loop(
-            req, _header_pool.get(),
-            [this, ctx, headers, header_status, alive = req->lifetime_token()]() {
-                if (alive.expired()) {
-                    *header_status = Status::Cancelled("sender is gone");
-                } else if (ctx->timeout_second > 0 &&
-                           UnixMillis() - ctx->start_millis > ctx->timeout_second * 1000L) {
-                    *header_status = Status::TimedOut(
-                            "stream load timed out after {}s before its transaction began",
-                            ctx->timeout_second);
-                } else {
-                    *header_status = _begin_txn_and_plan(headers.get(), ctx);
-                }
-            },
-            [this, req, ctx, header_status, submit_nanos]() {
-                _on_header_work_done(req, ctx, submit_nanos, std::move(*header_status));
-            },
-            [this, ctx, header_status, submit_nanos]() {
-                _on_header_work_abandoned(ctx, submit_nanos, std::move(*header_status));
-            });
-    if (!scheduled) {
-        ctx->header_flow_control.reset();
-        return false;
-    }
-    // The completion runs on this thread, so it cannot run before these are set. Body bytes
-    // libevent buffered with the headers still reach on_chunk_data once this returns; reads of
-    // the socket stop until the load is planned.
-    ctx->header_in_flight = true;
-    ctx->header_off_event_loop = true;
-    flow_control->pause();
-    return true;
-}
-
-void StreamLoadAction::_on_header_work_done(HttpRequest* req,
-                                            const std::shared_ptr<StreamLoadContext>& ctx,
-                                            int64_t submit_nanos, Status st) {
-    ctx->header_in_flight = false;
-    ctx->header_wait_cost_nanos = MonotonicNanos() - submit_nanos;
-    g_stream_load_header_wait_latency_ms << ctx->header_wait_cost_nanos / 1000000;
-    LOG(INFO) << "finished to handle HTTP header off the event loop, " << ctx->brief()
-              << ", header_wait_ms=" << ctx->header_wait_cost_nanos / 1000000;
-    if (!st.ok()) {
-        ctx->pending_body.clear();
-        ctx->pending_body.shrink_to_fit();
-        if (!ctx->body_complete_during_header) {
-            // The rest of the body is still unread. Close the connection after the reply rather
-            // than parse that body as the next request.
-            req->add_output_header(HttpHeaders::CONNECTION, "close");
-        }
-        _fail_header(req, ctx, std::move(st));
-        return;
-    }
-    // Resume before appending the held bytes, which pause the read again if they fill the pipe.
-    ctx->header_flow_control->resume_on_loop();
-    if (!ctx->pending_body.empty()) {
-        Status append_st = _append_pending_body(ctx);
-        if (!append_st.ok()) {
-            LOG(WARNING) << "append body content failed. errmsg=" << append_st << ", "
-                         << ctx->brief();
-            ctx->status = std::move(append_st);
-        }
-    }
-    if (ctx->body_complete_during_header) {
-        handle(req);
-    }
-}
-
-void StreamLoadAction::_on_header_work_abandoned(const std::shared_ptr<StreamLoadContext>& ctx,
-                                                 int64_t submit_nanos, Status st) {
-    ctx->header_in_flight = false;
-    ctx->header_wait_cost_nanos = MonotonicNanos() - submit_nanos;
-    ctx->pending_body.clear();
-    ctx->pending_body.shrink_to_fit();
-    ctx->status = st.ok() ? Status::Cancelled("sender is gone") : std::move(st);
-    LOG(WARNING) << "stream load sender is gone before its header was handled, " << ctx->brief()
-                 << ", header_wait_ms=" << ctx->header_wait_cost_nanos / 1000000
-                 << ", status=" << ctx->status;
-    // free_handler_ctx() left these to this completion, which owns them again now.
-    if (ctx->need_rollback) {
-        _exec_env->stream_load_executor()->rollback_txn(ctx.get());
-        ctx->need_rollback = false;
-    }
-    if (ctx->body_sink != nullptr) {
-        ctx->body_sink->cancel(ctx->status.to_string());
-    }
-    _exec_env->new_load_stream_mgr()->remove(ctx->id);
-    if (!ctx->data_saved_path.empty()) {
-        _exec_env->load_path_mgr()->clean_tmp_files(ctx->data_saved_path);
-    }
-}
-
-Status StreamLoadAction::_append_pending_body(const std::shared_ptr<StreamLoadContext>& ctx) {
-    SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
-    std::string pending = std::move(ctx->pending_body);
-    ctx->pending_body.clear();
-    const bool flow_control = ctx->body_flow_control != nullptr && ctx->pipe != nullptr;
-    bool pipe_full = false;
-    for (size_t offset = 0; offset < pending.size();) {
-        const size_t len = std::min<size_t>(pending.size() - offset, 128 * 1024);
-        ByteBufferPtr bb;
-        RETURN_IF_ERROR(ByteBuffer::allocate(len, &bb));
-        bb->put_bytes(pending.data() + offset, len);
-        bb->flip();
-        if (flow_control) {
-            bool full = false;
-            RETURN_IF_ERROR(ctx->pipe->append_without_wait(bb, &full));
-            pipe_full = pipe_full || full;
-        } else {
-            RETURN_IF_ERROR(ctx->body_sink->append(bb));
-        }
-        offset += len;
-    }
-    if (pipe_full) {
-        ctx->body_flow_control->pause();
-    }
-    return Status::OK();
-}
-
 Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx) {
-    RETURN_IF_ERROR(_parse_header(http_req, ctx));
-    return _begin_txn_and_plan(http_req, ctx);
-}
-
-Status StreamLoadAction::_parse_header(HttpRequest* http_req,
-                                       const std::shared_ptr<StreamLoadContext>& ctx) {
     // auth information
     if (!parse_basic_auth(*http_req, &ctx->auth)) {
         LOG(WARNING) << "parse basic authorization failed." << ctx->brief();
@@ -551,11 +355,6 @@ Status StreamLoadAction::_parse_header(HttpRequest* http_req,
     if (!http_req->header(HTTP_COMMENT).empty()) {
         ctx->load_comment = http_req->header(HTTP_COMMENT);
     }
-    return Status::OK();
-}
-
-Status StreamLoadAction::_begin_txn_and_plan(HttpRequest* http_req,
-                                             const std::shared_ptr<StreamLoadContext>& ctx) {
     // begin transaction
     if (!ctx->group_commit) {
         int64_t begin_txn_start_time = MonotonicNanos();
@@ -565,7 +364,6 @@ Status StreamLoadAction::_begin_txn_and_plan(HttpRequest* http_req,
             RETURN_IF_ERROR(_check_wal_space(ctx->group_commit_mode, ctx->body_bytes));
         }
     }
-    DBUG_EXECUTE_IF("StreamLoadAction._begin_txn_and_plan.block", DBUG_BLOCK);
 
     // process put file
     return _process_put(http_req, ctx);
@@ -574,7 +372,7 @@ Status StreamLoadAction::_begin_txn_and_plan(HttpRequest* http_req,
 void StreamLoadAction::on_chunk_data(HttpRequest* req) {
     std::shared_ptr<StreamLoadContext> ctx =
             std::static_pointer_cast<StreamLoadContext>(req->handler_ctx());
-    if (ctx == nullptr) {
+    if (ctx == nullptr || !ctx->status.ok()) {
         return;
     }
 
@@ -583,50 +381,24 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
 
     SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
 
-    if (ctx->header_in_flight) {
-        // libevent hands over the body bytes that arrived with the headers right after
-        // on_header(), and drops whatever this callback leaves behind. The body sink does not
-        // exist yet, so hold them; the socket itself is not read until the load is planned.
-        const size_t len = evbuffer_get_length(evbuf);
-        const size_t held = ctx->pending_body.size();
-        ctx->pending_body.resize(held + len);
-        evbuffer_remove(evbuf, ctx->pending_body.data() + held, len);
-        ctx->receive_bytes += len;
-        return;
-    }
-    if (!ctx->status.ok()) {
-        return;
-    }
-
     int64_t start_read_data_time = MonotonicNanos();
-    if (ctx->body_flow_control != nullptr && ctx->pipe != nullptr) {
-        int64_t moved_bytes = 0;
-        Status st = ctx->body_flow_control->move_body_to_pipe(evbuf, ctx->pipe.get(), &moved_bytes);
-        ctx->receive_bytes += moved_bytes;
+    while (evbuffer_get_length(evbuf) > 0) {
+        ByteBufferPtr bb;
+        Status st = ByteBuffer::allocate(128 * 1024, &bb);
+        if (!st.ok()) {
+            ctx->status = st;
+            return;
+        }
+        auto remove_bytes = evbuffer_remove(evbuf, bb->ptr, bb->capacity);
+        bb->pos = remove_bytes;
+        bb->flip();
+        st = ctx->body_sink->append(bb);
         if (!st.ok()) {
             LOG(WARNING) << "append body content failed. errmsg=" << st << ", " << ctx->brief();
             ctx->status = st;
             return;
         }
-    } else {
-        while (evbuffer_get_length(evbuf) > 0) {
-            ByteBufferPtr bb;
-            Status st = ByteBuffer::allocate(128 * 1024, &bb);
-            if (!st.ok()) {
-                ctx->status = st;
-                return;
-            }
-            auto remove_bytes = evbuffer_remove(evbuf, bb->ptr, bb->capacity);
-            bb->pos = remove_bytes;
-            bb->flip();
-            st = ctx->body_sink->append(bb);
-            if (!st.ok()) {
-                LOG(WARNING) << "append body content failed. errmsg=" << st << ", " << ctx->brief();
-                ctx->status = st;
-                return;
-            }
-            ctx->receive_bytes += remove_bytes;
-        }
+        ctx->receive_bytes += remove_bytes;
     }
     int64_t read_data_time = MonotonicNanos() - start_read_data_time;
     int64_t last_receive_and_read_data_cost_nanos = ctx->receive_and_read_data_cost_nanos;
@@ -642,12 +414,6 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
 void StreamLoadAction::free_handler_ctx(std::shared_ptr<void> param) {
     std::shared_ptr<StreamLoadContext> ctx = std::static_pointer_cast<StreamLoadContext>(param);
     if (ctx == nullptr) {
-        return;
-    }
-    if (ctx->header_in_flight) {
-        // A pool thread is still beginning the transaction and planning the load, and owns the
-        // body sink and the stream load manager entry; its completion cleans them up.
-        streaming_load_current_processing->increment(-1);
         return;
     }
     // sender is gone, make receiver know it
@@ -676,23 +442,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     request.__set_loadId(ctx->id.to_thrift());
     if (ctx->use_streaming) {
         std::shared_ptr<io::StreamLoadPipe> pipe;
-        const auto pipe_bytes = static_cast<size_t>(std::max<int64_t>(
-                config::stream_load_pipe_buffer_bytes, static_cast<int64_t>(MIN_CHUNK_SIZE)));
         if (ctx->is_chunked_transfer) {
-            pipe = std::make_shared<io::StreamLoadPipe>(pipe_bytes /* max_buffered_bytes */);
+            pipe = std::make_shared<io::StreamLoadPipe>(
+                    io::kMaxPipeBufferedBytes /* max_buffered_bytes */);
             pipe->set_is_chunked_transfer(true);
         } else {
-            pipe = std::make_shared<io::StreamLoadPipe>(pipe_bytes /* max_buffered_bytes */,
-                                                        MIN_CHUNK_SIZE /* min_chunk_size */,
-                                                        ctx->body_bytes /* total_length */);
-        }
-        if (config::enable_stream_load_receive_flow_control) {
-            ctx->body_flow_control = ctx->header_flow_control != nullptr
-                                             ? ctx->header_flow_control
-                                             : HttpBodyFlowControl::create(http_req);
-            if (ctx->body_flow_control != nullptr) {
-                ctx->body_flow_control->attach_pipe(pipe.get());
-            }
+            pipe = std::make_shared<io::StreamLoadPipe>(
+                    io::kMaxPipeBufferedBytes /* max_buffered_bytes */,
+                    MIN_CHUNK_SIZE /* min_chunk_size */, ctx->body_bytes /* total_length */);
         }
         request.fileType = TFileType::FILE_STREAM;
         ctx->body_sink = pipe;
