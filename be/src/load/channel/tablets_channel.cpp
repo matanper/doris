@@ -25,7 +25,6 @@
 #include <ctime>
 
 #include "common/compiler_util.h" // IWYU pragma: keep
-#include "common/config.h"
 #include "common/status.h"
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
@@ -42,9 +41,6 @@
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
 #include "core/block/block.h"
-#include "core/data_type_serde/data_type_variant_v2_serde.h"
-#include "cpp/sync_point.h"
-#include "load/channel/eos_completion.h"
 #include "load/channel/load_channel.h"
 #include "load/delta_writer/delta_writer.h"
 #include "storage/storage_engine.h"
@@ -659,45 +655,14 @@ std::ostream& operator<<(std::ostream& os, const TabletsChannelKey& key) {
     return os;
 }
 
-namespace {
-
-// The sending BE validated every VARIANT payload when it built the column.
-Status deserialize_peer_block(const PTabletWriterAddBlockRequest& request, Block* block,
-                              size_t* uncompressed_bytes, int64_t* decompress_time) {
-    TrustedPeerVariantBlockScope trusted_peer(!config::variant_v2_validate_internal_block);
-    return block->deserialize(request.block(), uncompressed_bytes, decompress_time);
-}
-
-} // namespace
-
-Status BaseTabletsChannel::resolve_send_block(const PTabletWriterAddBlockRequest& request,
-                                              const Block* local_block, Block* deserialized,
-                                              const Block** send_data) {
-    if (local_block != nullptr) {
-        if (request.has_block()) {
-            return Status::InternalError(
-                    "add block request carries both a serialized and an in-process block, "
-                    "packet_seq={}",
-                    request.packet_seq());
-        }
-        *send_data = local_block;
-        return Status::OK();
-    }
-    [[maybe_unused]] size_t uncompressed_size = 0;
-    [[maybe_unused]] int64_t uncompressed_time = 0;
-    RETURN_IF_ERROR(
-            deserialize_peer_block(request, deserialized, &uncompressed_size, &uncompressed_time));
-    *send_data = deserialized;
-    return Status::OK();
-}
-
 Status BaseTabletsChannel::_write_block_data(
         const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
         std::unordered_map<int64_t, DorisVector<uint32_t>>& tablet_to_rowidxs,
-        PTabletWriterAddBlockResult* response, const Block* local_block) {
-    Block deserialized;
-    const Block* send_data = nullptr;
-    RETURN_IF_ERROR(resolve_send_block(request, local_block, &deserialized, &send_data));
+        PTabletWriterAddBlockResult* response) {
+    Block send_data;
+    [[maybe_unused]] size_t uncompressed_size = 0;
+    [[maybe_unused]] int64_t uncompressed_time = 0;
+    RETURN_IF_ERROR(send_data.deserialize(request.block(), &uncompressed_size, &uncompressed_time));
     int request_rows = request.is_adaptive_random_bucket() ? request.partition_ids_size()
                                                            : request.tablet_ids_size();
     if (send_data->rows() != request_rows) {
@@ -787,11 +752,12 @@ std::shared_ptr<std::mutex> BaseTabletsChannel::_get_partition_route_lock(int64_
 Status BaseTabletsChannel::_write_block_data_for_adaptive_random_bucket(
         const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
         std::unordered_map<int64_t, DorisVector<uint32_t>>& partition_to_rowidxs,
-        PTabletWriterAddBlockResult* response, const Block* local_block) {
-    Block deserialized;
-    const Block* send_data = nullptr;
-    RETURN_IF_ERROR(resolve_send_block(request, local_block, &deserialized, &send_data));
-    if (send_data->rows() != request.partition_ids_size()) {
+        PTabletWriterAddBlockResult* response) {
+    Block send_data;
+    [[maybe_unused]] size_t uncompressed_size = 0;
+    [[maybe_unused]] int64_t uncompressed_time = 0;
+    RETURN_IF_ERROR(send_data.deserialize(request.block(), &uncompressed_size, &uncompressed_time));
+    if (send_data.rows() != request.partition_ids_size()) {
         return Status::InternalError(
                 "invalid adaptive random bucket add block request row count, load_id={}, "
                 "index_id={}, packet_seq={}, block_rows={}, partition_ids_size={}",

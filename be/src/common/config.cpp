@@ -776,7 +776,6 @@ DEFINE_mBool(enable_adaptive_write_buffer_size, "true");
 // max buffer size used in memtable for the aggregated table, default 400MB
 DEFINE_mInt64(write_buffer_size_for_agg, "104857600");
 DEFINE_mInt64(min_write_buffer_size_for_partial_update, "1048576");
-DEFINE_mBool(memtable_flush_release_input_columns, "true");
 // max parallel flush task per memtable writer
 DEFINE_mInt32(memtable_flush_running_count_limit, "32");
 DEFINE_mBool(enable_adaptive_memtable_flush_running_count_limit, "true");
@@ -1267,8 +1266,6 @@ DEFINE_mInt64(variant_threshold_rows_to_estimate_sparse_column, "2048");
 DEFINE_mInt32(variant_max_json_key_length, "255");
 DEFINE_mBool(variant_throw_exeception_on_invalid_json, "false");
 DEFINE_mBool(variant_enable_duplicate_json_path_check, "false");
-DEFINE_mBool(variant_v2_shredder_fast_path, "true");
-DEFINE_mBool(variant_v2_json_encoder_fast_path, "true");
 // Controls storage-layer parse target for plain non-doc VARIANT columns:
 // 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
 // NestedGroup, deprecated flatten-nested, and persistent doc mode keep their required paths.
@@ -1280,9 +1277,6 @@ DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
 // Deeper arrays will be stored as JSONB
 DEFINE_mInt32(variant_nested_group_max_depth, "10");
 DEFINE_mBool(variant_nested_group_discard_scalar_on_conflict, "true");
-DEFINE_mBool(variant_v2_validate_internal_block, "false");
-DEFINE_mBool(variant_v2_check_read_paths, "false");
-DEFINE_mBool(variant_v2_bounded_column_growth, "true");
 
 DEFINE_Validator(variant_max_json_key_length,
                  [](const int config) -> bool { return config > 0 && config <= 65535; });
