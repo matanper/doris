@@ -381,8 +381,7 @@ Status IndexBuilder::handle_single_rowset(RowsetMetaSharedPtr output_rowset_meta
                 std::string index_path =
                         InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
                 io::FileWriterPtr file_writer;
-                io::FileWriterOptions opts {.background_write = true};
-                Status st = fs->create_file(index_path, &file_writer, &opts);
+                Status st = fs->create_file(index_path, &file_writer);
                 if (!st.ok()) {
                     LOG(WARNING) << "failed to create writable file. path=" << index_path
                                  << ", err: " << st;
@@ -462,8 +461,7 @@ Status IndexBuilder::handle_single_rowset(RowsetMetaSharedPtr output_rowset_meta
                 std::string index_path =
                         InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
                 io::FileWriterPtr file_writer;
-                io::FileWriterOptions opts {.background_write = true};
-                Status st = fs->create_file(index_path, &file_writer, &opts);
+                Status st = fs->create_file(index_path, &file_writer);
                 if (!st.ok()) {
                     LOG(WARNING) << "failed to create writable file. path=" << index_path
                                  << ", err: " << st;

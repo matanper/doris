@@ -1555,14 +1555,6 @@ DECLARE_mInt32(tablet_path_check_batch_size);
 
 // it must be larger than or equal to 5MB
 DECLARE_mInt64(s3_write_buffer_size);
-// Initial allocation of an S3 upload part buffer. The buffer grows geometrically up to
-// s3_write_buffer_size as data is appended, so a small file never reserves a full part.
-// A value <= 0 or >= s3_write_buffer_size allocates the whole part up front.
-DECLARE_mInt64(s3_write_buffer_initial_size);
-// An upload part buffer doubles only up to this size; growing past it allocates the whole
-// part at once, so filling a part copies at most about this many bytes instead of about the
-// part size. A value <= 0 or >= s3_write_buffer_size doubles all the way to the part size.
-DECLARE_mInt64(s3_write_buffer_grow_jump_threshold);
 // Log interval when doing s3 upload task
 DECLARE_mInt32(s3_file_writer_log_interval_second);
 // the max number of cached file handle for block segemnt
@@ -1873,11 +1865,6 @@ DECLARE_mBool(enable_s3_retry_full_jitter);
 DECLARE_mInt32(s3_read_base_wait_time_ms);
 DECLARE_mInt32(s3_read_max_wait_time_ms);
 DECLARE_mBool(enable_s3_object_check_after_upload);
-// Integrity checksum sent with each S3 PutObject/UploadPart body: "md5" (Content-MD5),
-// "crc32c" (x-amz-checksum-crc32c, reusing the write buffer's crc32c) or "none".
-// Each file writer reads it once, so a change applies to files opened afterwards.
-// Uploads completed by FE (S3 committer) fall back from crc32c to md5.
-DECLARE_mString(s3_upload_content_md5);
 DECLARE_mInt32(aws_client_request_timeout_ms);
 
 // write as inverted index tmp directory
@@ -1965,51 +1952,6 @@ DECLARE_mDouble(max_hdfs_wirter_jni_heap_usage_ratio);
 DECLARE_mInt64(hdfs_jni_write_sleep_milliseconds);
 // The max retry times when hdfs write failed
 DECLARE_mInt64(hdfs_jni_write_max_retry_time);
-
-// Route compaction and schema change S3 part uploads and async closes to dedicated
-// pools so a compaction burst cannot queue ahead of load segment closes. Read when a
-// writer is created; flipping it affects writers opened afterwards.
-DECLARE_mBool(enable_separate_compaction_s3_upload_pool);
-// Max threads of CompactionS3FileUploadThreadPool. 0 means the number of cores.
-DECLARE_Int64(compaction_s3_upload_thread_num);
-// Max threads of CompactionNonBlockCloseThreadPool. 0 means the number of cores.
-DECLARE_Int64(compaction_nonblock_close_thread_num);
-// Upper bound on compaction / schema change upload parts submitted but not yet uploaded,
-// per BE. Each part holds one s3_write_buffer_size buffer, so this bounds that memory.
-// A writer that hits the bound blocks before submitting. <= 0 disables the bound.
-DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
-// Upper bound on load (non background) upload parts submitted but not yet uploaded, across
-// all load S3 file writers per BE. Each part holds one s3_write_buffer_size buffer, so this
-// bounds that memory. A writer that hits the bound blocks before submitting. <= 0 disables
-// the bound.
-DECLARE_mInt64(load_s3_upload_max_inflight_parts);
-// Bytes held by load S3 upload buffers (filling, waiting for an upload slot, uploading or waiting
-// for the file cache copy) at which new load writes wait in the memtable memory gate. <= 0
-// disables it.
-DECLARE_mInt64(load_s3_upload_buffer_backpressure_bytes);
-// Once engaged, the gate holds writes until the bytes fall to this percent of the threshold.
-DECLARE_mInt32(load_s3_upload_buffer_backpressure_resume_percent);
-// Upper bound of one wait in that gate. <= 0 means no bound.
-DECLARE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms);
-
-// Copy an uploaded part into the file cache on S3FileCacheWriterThreadPool instead of on the
-// upload thread, so a slow or contended file cache cannot hold upload threads. A part that
-// finds the queue full is not cached. Only applies while enable_flush_file_cache_async is on.
-DECLARE_mBool(enable_file_cache_write_off_upload_thread);
-// Max threads of S3FileCacheWriterThreadPool; a change applies at the next copy.
-DECLARE_mInt64(file_cache_writer_thread_num);
-// Max queued part copies of S3FileCacheWriterThreadPool. Each holds one s3_write_buffer_size
-// buffer until it is copied.
-DECLARE_Int64(file_cache_writer_queue_size);
-// Threads and queue of S3FileCacheWriterLoadThreadPool, which copies the parts of load writers
-// into the file cache, so they never wait behind compaction copies. The pool exists only when
-// the thread num is positive at startup; a later change of it applies at the next copy. The
-// queue size is read at startup.
-DECLARE_mInt64(file_cache_writer_load_thread_num);
-DECLARE_Int64(file_cache_writer_load_queue_size);
-// Bytes of non-load parts queued for or in a file cache copy at which a further part is not
-// copied: it is already in S3, so only its cache warm-up is lost. <= 0 means no bound.
-DECLARE_mInt64(file_cache_writer_backlog_bytes);
 
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);

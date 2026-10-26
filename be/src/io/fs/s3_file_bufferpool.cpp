@@ -20,8 +20,6 @@
 #include <bvar/bvar.h>
 #include <crc32c/crc32c.h>
 
-#include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -39,115 +37,11 @@
 #include "runtime/thread_context.h"
 #include "util/defer_op.h"
 #include "util/slice.h"
-#include "util/threadpool.h"
 
 namespace doris {
 namespace io {
 
 bvar::Adder<uint64_t> s3_file_buffer_allocated("s3_file_buffer_allocated");
-// Bytes currently allocated by S3 file buffers; an upload buffer holds only what it has grown to.
-bvar::Adder<int64_t> s3_file_buffer_allocated_bytes("s3_file_buffer_allocated_bytes");
-bvar::Adder<uint64_t> s3_file_buffer_grow_count("s3_file_buffer_grow_count");
-// Bytes copied because a grow could not extend the allocation in place.
-bvar::Adder<uint64_t> s3_file_buffer_grow_copied_bytes("s3_file_buffer_grow_copied_bytes");
-// Read on every load write by the S3 upload-buffer gate, so kept in one atomic rather than a
-// bvar::Adder, whose read combines every thread's agent.
-static std::atomic<int64_t> g_load_upload_buffer_bytes {0};
-
-int64_t load_upload_buffer_bytes() {
-    return g_load_upload_buffer_bytes.load(std::memory_order_relaxed);
-}
-
-static int64_t get_load_upload_buffer_bytes(void*) {
-    return load_upload_buffer_bytes();
-}
-bvar::PassiveStatus<int64_t> s3_load_upload_buffer_bytes("s3_load_upload_buffer_bytes",
-                                                         get_load_upload_buffer_bytes, nullptr);
-
-bvar::Adder<int64_t> s3_file_cache_write_queued("s3_file_cache_write_queued");
-bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread(
-        "s3_file_cache_write_off_upload_thread");
-bvar::Adder<uint64_t> s3_file_cache_write_dropped("s3_file_cache_write_dropped");
-bvar::Adder<int64_t> s3_compaction_upload_inflight_parts("s3_compaction_upload_inflight_parts");
-bvar::Adder<int64_t> s3_compaction_upload_waiting_writers("s3_compaction_upload_waiting_writers");
-bvar::LatencyRecorder s3_compaction_upload_permit_wait_us("s3_compaction_upload_permit_wait_us");
-bvar::Adder<int64_t> s3_load_upload_inflight_parts("s3_load_upload_inflight_parts");
-bvar::Adder<int64_t> s3_load_upload_waiting_writers("s3_load_upload_waiting_writers");
-bvar::LatencyRecorder s3_load_upload_permit_wait_us("s3_load_upload_permit_wait_us");
-
-struct UploadBufferInflightLimiter::Metrics {
-    bvar::Adder<int64_t>* inflight_parts;
-    bvar::Adder<int64_t>* waiting_writers;
-    bvar::LatencyRecorder* permit_wait_us;
-};
-
-UploadBufferInflightLimiter* UploadBufferInflightLimiter::compaction() {
-    static const Metrics metrics {&s3_compaction_upload_inflight_parts,
-                                  &s3_compaction_upload_waiting_writers,
-                                  &s3_compaction_upload_permit_wait_us};
-    static UploadBufferInflightLimiter limiter(
-            [] { return config::compaction_s3_upload_max_inflight_parts; }, &metrics);
-    return &limiter;
-}
-
-UploadBufferInflightLimiter* UploadBufferInflightLimiter::load() {
-    static const Metrics metrics {&s3_load_upload_inflight_parts, &s3_load_upload_waiting_writers,
-                                  &s3_load_upload_permit_wait_us};
-    static UploadBufferInflightLimiter limiter(
-            [] { return config::load_s3_upload_max_inflight_parts; }, &metrics);
-    return &limiter;
-}
-
-UploadBufferInflightLimiter::Permit UploadBufferInflightLimiter::acquire() {
-    std::unique_lock lock(_mutex);
-    auto has_slot = [this] {
-        auto limit = _limit();
-        return limit <= 0 || _inflight < limit;
-    };
-    if (!has_slot()) {
-        auto start = std::chrono::steady_clock::now();
-        ++_waiters;
-        if (_metrics != nullptr) {
-            *_metrics->waiting_writers << 1;
-        }
-        // Timed wait so that raising the limit at runtime wakes blocked writers.
-        while (!_cv.wait_for(lock, std::chrono::seconds(1), has_slot)) {
-        }
-        --_waiters;
-        if (_metrics != nullptr) {
-            *_metrics->waiting_writers << -1;
-            *_metrics->permit_wait_us << std::chrono::duration_cast<std::chrono::microseconds>(
-                                                 std::chrono::steady_clock::now() - start)
-                                                 .count();
-        }
-    }
-    ++_inflight;
-    if (_metrics != nullptr) {
-        *_metrics->inflight_parts << 1;
-    }
-    return Permit(this);
-}
-
-void UploadBufferInflightLimiter::_release() {
-    {
-        std::lock_guard lock(_mutex);
-        --_inflight;
-    }
-    if (_metrics != nullptr) {
-        *_metrics->inflight_parts << -1;
-    }
-    _cv.notify_one();
-}
-
-int64_t UploadBufferInflightLimiter::inflight() const {
-    std::lock_guard lock(_mutex);
-    return _inflight;
-}
-
-int64_t UploadBufferInflightLimiter::waiters() const {
-    std::lock_guard lock(_mutex);
-    return _waiters;
-}
 
 template <typename Allocator = Allocator<false>>
 struct Memory : boost::noncopyable, Allocator {
@@ -155,25 +49,12 @@ struct Memory : boost::noncopyable, Allocator {
     explicit Memory(size_t size) : _size(size) {
         alloc(size);
         s3_file_buffer_allocated << 1;
-        s3_file_buffer_allocated_bytes << static_cast<int64_t>(size);
     }
     ~Memory() {
-        s3_file_buffer_allocated_bytes << -static_cast<int64_t>(_size);
         dealloc();
         s3_file_buffer_allocated << -1;
     }
     void alloc(size_t size) { _data = static_cast<char*>(Allocator::alloc(size, 0)); }
-    // Keeps the first `used` bytes. On failure it throws and leaves the memory unchanged.
-    void grow(size_t new_size, size_t used) {
-        char* old_data = _data;
-        _data = static_cast<char*>(Allocator::realloc(_data, _size, new_size, 0));
-        s3_file_buffer_allocated_bytes << static_cast<int64_t>(new_size - _size);
-        s3_file_buffer_grow_count << 1;
-        if (_data != old_data) {
-            s3_file_buffer_grow_copied_bytes << used;
-        }
-        _size = new_size;
-    }
     void dealloc() {
         if (_data == nullptr) {
             return;
@@ -187,100 +68,25 @@ struct Memory : boost::noncopyable, Allocator {
 
 struct FileBuffer::PartData {
     Memory<> _memory;
-    // Set once, before the buffer is shared; then follows every change of _memory._size.
-    std::atomic<int64_t>* _counter = nullptr;
-    explicit PartData(size_t size) : _memory(size) {}
-    ~PartData() { _count(-static_cast<int64_t>(_memory._size)); }
+    PartData() : _memory(config::s3_write_buffer_size) {}
+    ~PartData() = default;
     [[nodiscard]] Slice data() const { return Slice {_memory._data, _memory._size}; }
     [[nodiscard]] size_t size() const { return _memory._size; }
-    void grow(size_t new_size, size_t used) {
-        size_t old_size = _memory._size;
-        _memory.grow(new_size, used);
-        _count(static_cast<int64_t>(new_size - old_size));
-    }
-    void count_in(std::atomic<int64_t>* counter) {
-        DCHECK(_counter == nullptr);
-        _counter = counter;
-        _count(static_cast<int64_t>(_memory._size));
-    }
-
-private:
-    void _count(int64_t delta) {
-        if (_counter != nullptr) {
-            _counter->fetch_add(delta, std::memory_order_relaxed);
-        }
-    }
 };
-
-void FileBuffer::count_as_load_upload() {
-    DCHECK(_type == BufferType::UPLOAD);
-    _is_load_upload = true;
-    _inner_data->count_in(&g_load_upload_buffer_bytes);
-}
-
-// An upload buffer starts at config::s3_write_buffer_initial_size and grows on append, so a
-// small file holds about its own size rather than a whole part. A download buffer is filled
-// in place by its download callback, so it allocates its whole capacity.
-static size_t initial_allocation(BufferType type, size_t capacity) {
-    if (type != BufferType::UPLOAD) {
-        return capacity;
-    }
-    int64_t initial = config::s3_write_buffer_initial_size;
-    if (initial <= 0 || static_cast<size_t>(initial) >= capacity) {
-        return capacity;
-    }
-    return static_cast<size_t>(initial);
-}
-
-// Doubling a buffer to a whole part copies about one part per part: with a 64 MiB part, every
-// full part re-copies ~64 MiB on its way up. So an upload buffer doubles only up to
-// config::s3_write_buffer_grow_jump_threshold and the next grow allocates its whole capacity.
-// A full part then copies less than twice the threshold in total (the doubling steps below it
-// plus one copy of at most the threshold at the jump), while a file that fits under the
-// threshold still holds only about its own size.
-static size_t grow_jump_threshold(size_t capacity) {
-    int64_t threshold = config::s3_write_buffer_grow_jump_threshold;
-    if (threshold <= 0 || static_cast<size_t>(threshold) >= capacity) {
-        return capacity;
-    }
-    return static_cast<size_t>(threshold);
-}
 
 Slice FileBuffer::get_slice() const {
     return _inner_data->data();
 }
 
 FileBuffer::FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> alloc_holder,
-                       size_t offset, OperationState state, size_t capacity)
+                       size_t offset, OperationState state)
         : _type(type),
           _alloc_holder(std::move(alloc_holder)),
           _offset(offset),
           _size(0),
           _state(std::move(state)),
-          _capacity(capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size)),
-          _grow_jump_threshold(grow_jump_threshold(_capacity)) {
-    _inner_data = std::make_unique<FileBuffer::PartData>(initial_allocation(type, _capacity));
-}
-
-size_t FileBuffer::get_allocated_size() const {
-    return _inner_data->size();
-}
-
-// Only the appending thread reaches this, before the buffer is submitted, so no reader holds
-// a pointer into the memory that a grow may move.
-Status FileBuffer::_reserve(size_t required) {
-    size_t allocated = _inner_data->size();
-    if (required <= allocated) [[likely]] {
-        return Status::OK();
-    }
-    DCHECK_LE(required, _capacity);
-    size_t new_size = required > _grow_jump_threshold
-                              ? _capacity
-                              : std::min(std::max(required, allocated * 2), _grow_jump_threshold);
-    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->s3_file_buffer_tracker());
-    RETURN_IF_CATCH_EXCEPTION(_inner_data->grow(new_size, _size));
-    return Status::OK();
-}
+          _inner_data(std::make_unique<FileBuffer::PartData>()),
+          _capacity(_inner_data->size()) {}
 
 FileBuffer::~FileBuffer() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->s3_file_buffer_tracker());
@@ -294,106 +100,10 @@ FileBuffer::~FileBuffer() {
 Status UploadFileBuffer::append_data(const Slice& data) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("UploadFileBuffer::append_data", Status::OK(), this,
                                       data.get_size());
-    if (data.get_size() > _capacity - _size) [[unlikely]] {
-        return Status::InternalError("append {} bytes to upload buffer of {}/{} bytes",
-                                     data.get_size(), _size, _capacity);
-    }
-    RETURN_IF_ERROR(_reserve(_size + data.get_size()));
     std::memcpy((void*)(_inner_data->data().get_data() + _size), data.get_data(), data.get_size());
     _size += data.get_size();
     _crc_value = crc32c::Extend(_crc_value, (const uint8_t*)data.get_data(), data.get_size());
     return Status::OK();
-}
-
-// Bytes of non-load parts queued for or in a file cache copy.
-std::atomic<int64_t> g_file_cache_copy_backlog_bytes {0};
-bvar::PassiveStatus<int64_t> s3_file_cache_write_backlog_bytes(
-        "s3_file_cache_write_backlog_bytes",
-        [](void*) { return g_file_cache_copy_backlog_bytes.load(std::memory_order_relaxed); },
-        nullptr);
-bvar::Adder<uint64_t> s3_file_cache_write_dropped_over_backlog(
-        "s3_file_cache_write_dropped_over_backlog");
-bvar::Adder<uint64_t> s3_file_cache_write_load_queue(
-        "s3_file_cache_write_off_upload_thread_load");
-
-// The part is already in S3, so a copy that cannot be queued is skipped rather than waited for.
-// Load parts go to their own pool, so they never queue behind compaction copies; other parts are
-// skipped once their backlog reaches file_cache_writer_backlog_bytes, so a compaction burst
-// cannot hold buffer memory waiting for the cache disk.
-// Resizes `pool` to `wanted` threads when the config changed at runtime. `seen` holds the
-// config value last applied, starting from the first one observed, which the pool was built with.
-static void follow_thread_num_config(ThreadPool* pool, int64_t wanted, std::atomic<int64_t>* seen) {
-    int64_t last = seen->load(std::memory_order_relaxed);
-    if (last == wanted) {
-        return;
-    }
-    if (last < 0) {
-        seen->compare_exchange_strong(last, wanted);
-        return;
-    }
-    if (wanted <= 0 || !seen->compare_exchange_strong(last, wanted)) {
-        return;
-    }
-    const int threads = static_cast<int>(wanted);
-    if (pool->min_threads() > threads) {
-        static_cast<void>(pool->set_min_threads(threads));
-    }
-    if (!pool->set_max_threads(threads).ok()) {
-        LOG(WARNING) << "failed to resize the file cache writer pool to " << threads;
-    }
-}
-
-static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
-    // From here the buffer only waits for the cache copy, which the upload bounds do not
-    // cover.
-    buffer->set_inflight_permit({});
-    auto* env = ExecEnv::GetInstance();
-    const bool load = buffer->is_load_upload() && env->s3_file_cache_writer_load_thread_pool();
-    auto* pool = load ? env->s3_file_cache_writer_load_thread_pool()
-                      : env->s3_file_cache_writer_thread_pool();
-    if (pool == nullptr) {
-        s3_file_cache_write_dropped << 1;
-        return;
-    }
-    static std::atomic<int64_t> load_threads_seen {-1};
-    static std::atomic<int64_t> threads_seen {-1};
-    if (load) {
-        follow_thread_num_config(pool, config::file_cache_writer_load_thread_num,
-                                 &load_threads_seen);
-    } else {
-        follow_thread_num_config(pool, config::file_cache_writer_thread_num, &threads_seen);
-    }
-    const auto bytes = static_cast<int64_t>(buffer->get_size());
-    if (!load) {
-        const int64_t limit = config::file_cache_writer_backlog_bytes;
-        const int64_t backlog =
-                g_file_cache_copy_backlog_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        if (limit > 0 && backlog + bytes > limit) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-            s3_file_cache_write_dropped_over_backlog << 1;
-            return;
-        }
-    }
-    s3_file_cache_write_queued << 1;
-    auto st = pool->submit_func([buf = std::move(buffer), load, bytes]() {
-        s3_file_cache_write_queued << -1;
-        static_cast<UploadFileBuffer*>(buf.get())->upload_to_local_file_cache(false);
-        if (!load) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        }
-    });
-    if (st.ok()) {
-        s3_file_cache_write_off_upload_thread << 1;
-        if (load) {
-            s3_file_cache_write_load_queue << 1;
-        }
-    } else {
-        s3_file_cache_write_queued << -1;
-        s3_file_cache_write_dropped << 1;
-        if (!load) {
-            g_file_cache_copy_backlog_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        }
-    }
 }
 
 /**
@@ -402,16 +112,8 @@ static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
  */
 static Status submit_upload_buffer(std::shared_ptr<FileBuffer> buffer) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("UploadFileBuffer::submit", Status::OK(), buffer.get());
-    auto* pool = static_cast<UploadFileBuffer*>(buffer.get())->upload_thread_pool();
-    if (pool == nullptr) {
-        pool = ExecEnv::GetInstance()->s3_file_upload_thread_pool();
-    }
-    return pool->submit_func([buf = std::move(buffer)]() mutable {
-        buf->execute_async();
-        if (static_cast<UploadFileBuffer*>(buf.get())->take_pending_file_cache_write()) {
-            submit_file_cache_write(std::move(buf));
-        }
-    });
+    return ExecEnv::GetInstance()->s3_file_upload_thread_pool()->submit_func(
+            [buf = std::move(buffer)]() { buf->execute_async(); });
 }
 
 std::ostream& operator<<(std::ostream& os, const BufferType& value) {
@@ -457,13 +159,6 @@ void UploadFileBuffer::on_upload() {
         // s3 file writer is already destructed
         bool cancelled = is_cancelled();
         _state.set_status();
-        if (!cancelled && config::enable_file_cache_write_off_upload_thread &&
-            config::enable_file_cache_write_from_s3_file_writer && config::enable_file_cache &&
-            _alloc_holder != nullptr &&
-            ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool() != nullptr) {
-            _file_cache_write_pending = true;
-            return;
-        }
         // this control flow means the buf and the stream shares one memory
         // so we can directly use buf here
         upload_to_local_file_cache(cancelled);
@@ -552,15 +247,9 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
     OperationState state(_sync_after_complete_task, _is_cancelled);
 
     if (_type == BufferType::UPLOAD) {
-        std::shared_ptr<UploadFileBuffer> upload_buf;
-        RETURN_IF_CATCH_EXCEPTION(upload_buf = std::make_shared<UploadFileBuffer>(
+        RETURN_IF_CATCH_EXCEPTION(*buf = std::make_shared<UploadFileBuffer>(
                                           std::move(_upload_cb), std::move(state), _offset,
-                                          std::move(_alloc_holder_cb), _buffer_size));
-        upload_buf->set_upload_thread_pool(_upload_thread_pool);
-        if (_count_as_load_upload) {
-            upload_buf->count_as_load_upload();
-        }
-        *buf = std::move(upload_buf);
+                                          std::move(_alloc_holder_cb)));
         return Status::OK();
     }
     if (_type == BufferType::DOWNLOAD) {
@@ -568,7 +257,7 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
                                           std::move(_download),
                                           std::move(_write_to_local_file_cache),
                                           std::move(_write_to_use_buffer), std::move(state),
-                                          _offset, std::move(_alloc_holder_cb), _buffer_size));
+                                          _offset, std::move(_alloc_holder_cb)));
         return Status::OK();
     }
     // should never come here
