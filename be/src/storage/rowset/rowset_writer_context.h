@@ -89,23 +89,6 @@ struct RowsetWriterContext {
     bool enable_unique_key_merge_on_write = false;
     // store column_unique_id to do index compaction
     std::set<int32_t> columns_to_do_index_compaction;
-    // Full paths (PathInData::get_path()) of VARIANT typed subcolumns whose indexes index
-    // compaction merges from the inputs instead of the segment writers building them.
-    std::set<std::string> variant_paths_to_do_index_compaction;
-
-    bool has_index_compaction() const {
-        return !columns_to_do_index_compaction.empty() ||
-               !variant_paths_to_do_index_compaction.empty();
-    }
-
-    // True when index compaction writes the indexes of `column`, so a segment writer skips them.
-    bool is_index_compaction_column(const TabletColumn& column) const {
-        if (column.is_extracted_column()) {
-            return column.path_info_ptr() != nullptr &&
-                   variant_paths_to_do_index_compaction.contains(column.path_info_ptr()->get_path());
-        }
-        return columns_to_do_index_compaction.contains(column.unique_id());
-    }
     DataWriteType write_type = DataWriteType::TYPE_DEFAULT;
     // need to figure out the sub type of compaction
     ReaderType compaction_type = ReaderType::UNKNOWN;

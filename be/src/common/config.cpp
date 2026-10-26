@@ -1429,31 +1429,6 @@ DEFINE_Int32(inverted_index_read_buffer_size, "4096");
 DEFINE_Int32(max_depth_in_bkd_tree, "32");
 // index compaction
 DEFINE_mBool(inverted_index_compaction_enable, "true");
-DEFINE_mBool(enable_variant_typed_path_index_compaction, "false");
-// When a compaction ends, whatever its outcome, drop its input segments from the segment cache.
-// Compaction reads load the meta of every VARIANT sub-column into the segments it reads, which
-// the segment cache does not count, so its memory bound does not hold for them.
-DEFINE_mBool(enable_compaction_release_input_segments, "true");
-DEFINE_mBool(enable_compaction_pin_input_segments, "true");
-// Before merging, read each input segment data file once through the file cache, on the index
-// compaction preload pool.
-DEFINE_mBool(enable_compaction_data_preload, "true");
-// The compaction preload pool: files are read in chunks of index_compaction_preload_chunk_bytes on
-// at most index_compaction_preload_threads threads shared by all compactions.
-DEFINE_mInt64(index_compaction_preload_chunk_bytes, "8388608");
-DEFINE_mInt32(index_compaction_preload_threads, "0");
-DEFINE_Validator(index_compaction_preload_threads,
-                 [](const int32_t config) -> bool { return config >= 0; });
-// Before index compaction merges the input indexes, read each input segment's index file once
-// through the file cache on the compaction preload pool.
-DEFINE_mBool(enable_index_compaction_preload, "true");
-DEFINE_mBool(enable_compaction_async_data_preload, "false");
-DEFINE_mBool(enable_compaction_memory_preload, "false");
-DEFINE_mInt64(compaction_memory_preload_task_bytes, "2147483648");
-DEFINE_mInt64(compaction_memory_preload_total_bytes, "17179869184");
-DEFINE_mInt32(cumu_compaction_thread_nice, "0");
-DEFINE_Validator(cumu_compaction_thread_nice,
-                 [](const int32_t config) -> bool { return config >= 0 && config <= 19; });
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory

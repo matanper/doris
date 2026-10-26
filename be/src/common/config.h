@@ -1475,40 +1475,6 @@ DECLARE_Int32(inverted_index_read_buffer_size);
 DECLARE_Int32(max_depth_in_bkd_tree);
 // index compaction
 DECLARE_mBool(inverted_index_compaction_enable);
-// Index compaction also merges the inverted indexes of VARIANT typed subcolumns (field_pattern
-// indexes on typed paths) when every input segment has them, instead of the segment writers
-// tokenizing every value again.
-DECLARE_mBool(enable_variant_typed_path_index_compaction);
-DECLARE_mBool(enable_compaction_release_input_segments);
-// A compaction keeps each input segment it opened for the rest of the task, so that reading
-// the inputs once per column group opens every segment once.
-DECLARE_mBool(enable_compaction_pin_input_segments);
-DECLARE_mBool(enable_compaction_data_preload);
-DECLARE_mInt64(index_compaction_preload_chunk_bytes);
-// 0 sizes the pool from the compaction slots: max(64, 2 * compaction_task_num_per_fast_disk), since
-// its threads mostly wait on remote reads.
-DECLARE_mInt32(index_compaction_preload_threads);
-DECLARE_mBool(enable_index_compaction_preload);
-// Before merging, load each input segment data file whole into memory, charged to the
-// compaction's memory tracker, and serve the merge's reads of it from there. The loads run on the
-// compaction preload pool and read the file cache only for the chunks it holds whole; nothing is
-// written to it, so compaction inputs no longer pass through its disposable queue. The merge
-// starts at once and loads any chunk it reaches before the pool has. The files beyond
-// compaction_memory_preload_task_bytes per compaction, or compaction_memory_preload_total_bytes
-// for all of them, are preloaded and read through the file cache as before.
-DECLARE_mBool(enable_compaction_memory_preload);
-DECLARE_mInt64(compaction_memory_preload_task_bytes);
-DECLARE_mInt64(compaction_memory_preload_total_bytes);
-// Start the compaction data preload without waiting for it: the merge reads blocks as they
-// arrive, and the chunks not started when the merge ends are skipped. Off by default: with many
-// compactions sharing the preload pool, the merges get ahead of it and fetch the blocks it has
-// not reached themselves, one small remote read at a time.
-DECLARE_mBool(enable_compaction_async_data_preload);
-// Nice value of the threads running cumulative compactions and the compaction preload, from 0
-// (unchanged) to 19, so that loads get the CPU first. A thread takes the value when it starts
-// its next task; lowering it again needs CAP_SYS_NICE, so without it a lower value only
-// applies to threads not raised yet.
-DECLARE_mInt32(cumu_compaction_thread_nice);
 // Only for debug, do not use in production
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory
