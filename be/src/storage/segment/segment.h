@@ -182,6 +182,10 @@ public:
     // metas, creating its column readers, loading their external meta and opening its index file
     // allocated and kept. Updates the segment_real_retained_bytes bvar.
     int64_t real_mem_usage();
+    // Let the column meta region go once the readers the first query needs exist: later lookups
+    // read each meta from the file, and the segment keeps only the metas its readers hold.
+    void release_column_meta_region();
+
     // The charge the segment cache holds this segment with.
     int64_t cache_charge() const { return _cache_charge.load(std::memory_order_relaxed); }
     void set_cache_charge(int64_t charge) { _cache_charge = charge; }
@@ -264,8 +268,12 @@ private:
 
     Status _open_index_file_reader();
 
+    // `created` is set when this call created the column metas, and so read the meta region.
     Status _create_column_meta_once(OlapReaderStatistics* stats,
-                                    const io::IOContext* io_ctx = nullptr);
+                                    const io::IOContext* io_ctx = nullptr,
+                                    bool* created = nullptr);
+
+    void release_region_if(bool created);
 
     virtual Status _get_segment_footer(std::shared_ptr<SegmentFooterPB>&,
                                        OlapReaderStatistics* stats,
@@ -292,6 +300,8 @@ private:
     int64_t _meta_mem_usage;
     int64_t _tracked_meta_mem_usage = 0;
     std::atomic<int64_t> _column_meta_bytes {0};
+    // Whether parsing the footer read from remote storage (or a peer) rather than the local cache.
+    std::atomic<bool> _footer_read_remote {false};
     std::atomic<int64_t> _cache_charge {0};
     // The value last added to segment_real_retained_bytes for this segment.
     std::atomic<int64_t> _reported_real_bytes {0};

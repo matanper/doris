@@ -75,6 +75,7 @@
 #include "storage/segment/column_reader.h"
 #include "storage/segment/column_reader_cache.h"
 #include "storage/segment/empty_segment_iterator.h"
+#include "storage/segment/external_col_meta_util.h"
 #include "storage/segment/page_io.h"
 #include "storage/segment/page_pointer.h"
 #include "storage/segment/segment_iterator.h"
@@ -85,6 +86,7 @@
 #include "storage/types.h"
 #include "storage/utils.h"
 #include "util/coding.h"
+#include "util/defer_op.h"
 #include "util/json/path_in_data.h"
 #include "util/slice.h" // Slice
 
@@ -425,6 +427,9 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
     if (read_options.runtime_state != nullptr) {
         _be_exec_version = read_options.runtime_state->be_exec_version();
     }
+    // The region serves the metas this call needs, whether it ends with an iterator, an empty one
+    // for a pruned segment, or an error; after it, readers read their metas from the file.
+    Defer release_region {[this] { release_column_meta_region(); }};
     RETURN_IF_ERROR(_create_column_meta_once(read_options.stats, &read_options.io_ctx));
 
     read_options.stats->total_segment_number++;
@@ -528,6 +533,21 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
     return iter->get()->init(read_options);
 }
 
+void Segment::release_column_meta_region() {
+    if (_create_column_meta_once_call.has_called() && _column_meta_accessor != nullptr) {
+        _column_meta_accessor->release_meta_region();
+    }
+}
+
+void Segment::release_region_if(bool created) {
+    // A call that created the column metas outside new_iterator (a column reader for stats or a
+    // schema, a column iterator, a meta traversal) lets the region go when it returns: no
+    // iterator may follow to release it, and an idle cached segment would keep it.
+    if (created) {
+        release_column_meta_region();
+    }
+}
+
 Status Segment::_write_error_file(size_t file_size, size_t offset, size_t bytes_read, char* data,
                                   io::IOContext& io_ctx) {
     if (!config::enbale_dump_error_file || !doris::config::is_cloud_mode()) {
@@ -603,6 +623,16 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     size_t bytes_read = 0;
     auto io_ctx = create_index_io_context(source_io_ctx, stats);
     TEST_SYNC_POINT_CALLBACK("Segment::_parse_footer::io_ctx", &io_ctx);
+    io::FileCacheStatistics footer_cache_stats;
+    if (io_ctx.file_cache_stats == nullptr) {
+        io_ctx.file_cache_stats = &footer_cache_stats;
+    }
+    const auto remote_ios = [&io_ctx] {
+        return io_ctx.file_cache_stats->num_remote_io_total +
+               io_ctx.file_cache_stats->num_peer_io_total;
+    };
+    const int64_t remote_ios_before = remote_ios();
+    Defer record_remote {[&] { _footer_read_remote = remote_ios() > remote_ios_before; }};
     RETURN_IF_ERROR(
             _file_reader->read_at(file_size - 12, Slice(fixed_buf, 12), &bytes_read, &io_ctx));
     DCHECK_EQ(bytes_read, 12);
@@ -813,16 +843,26 @@ DataTypePtr Segment::get_data_type_of(const TabletColumn& column,
 }
 
 Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
-                                         const io::IOContext* source_io_ctx) {
+                                         const io::IOContext* source_io_ctx, bool* created) {
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
-    return _create_column_meta_once_call.call([this, stats, source_io_ctx] {
+    return _create_column_meta_once_call.call([this, stats, source_io_ctx, created] {
+        if (created != nullptr) {
+            *created = true;
+        }
         std::shared_ptr<SegmentFooterPB> footer_pb_shared;
         RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
         // The parsed footer is charged to the footer cache; only what the segment builds from it
         // counts here.
         const int64_t allocated_before = thread_net_allocated_bytes();
         Status st = _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
-        _column_meta_bytes = std::max<int64_t>(0, thread_net_allocated_bytes() - allocated_before);
+        // The column meta region is let go after the segment's first iterator is set up (see
+        // `release_column_meta_region`), so it never counts toward the segment cache charge.
+        const auto region =
+                _column_meta_accessor != nullptr ? _column_meta_accessor->meta_region() : nullptr;
+        const int64_t region_bytes = region != nullptr ? region->charged_bytes : 0;
+        const int64_t allocated = thread_net_allocated_bytes() - allocated_before;
+        _column_meta_bytes = std::max<int64_t>(
+                0, allocated >= region_bytes ? allocated - region_bytes : allocated);
         return st;
     });
 }
@@ -832,12 +872,37 @@ Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderSta
     // Initialize column meta accessor which internally maintains uid -> column_ordinal mapping.
     _column_meta_accessor = std::make_unique<ColumnMetaAccessor>();
     RETURN_IF_ERROR(_column_meta_accessor->init(footer, _file_reader));
+    // One read of the whole meta region serves every later meta lookup of this segment: the
+    // top-level metas below, each column reader's meta and each VARIANT subcolumn's. The region
+    // is let go once the call that created the metas returns, so it is not charged to the cache.
+    if (const int64_t max_bytes = config::segment_column_meta_region_buffer_max_bytes;
+        max_bytes > 0) {
+        // Timed apart, and left out of segment_create_column_readers_timer_ns, so that timer still
+        // counts what it did without the region.
+        int64_t region_read_ns = 0;
+        Status st;
+        {
+            SCOPED_RAW_TIMER(&region_read_ns);
+            // A footer this open fetched from remote storage brought the file tail, and so most
+            // or all of the region, into the local file cache only now: the segment is cold, and
+            // one local read of the region replaces many small ones. A segment whose footer was
+            // already cached or local is a re-open, which reads only the metas it needs.
+            st = _column_meta_accessor->load_meta_region(footer, max_bytes, stats, source_io_ctx,
+                                                         !_footer_read_remote);
+        }
+        stats->segment_column_meta_region_read_timer_ns += region_read_ns;
+        stats->segment_create_column_readers_timer_ns -= region_read_ns;
+        if (!st.ok()) {
+            LOG(WARNING) << "Failed to read the column meta region of " << _file_reader->path()
+                         << ", metas are read one at a time: " << st;
+        }
+    }
 
     if (config::enable_adaptive_batch_size) {
         // Cache raw_data_bytes per column uid for adaptive batch size prediction. Only top-level
-        // columns are kept, so only their metas are read: a wide VARIANT's subcolumn metas, most
-        // of the meta region, are skipped. This runs under call_once, so no thread-safety
-        // concerns.
+        // columns are kept. Without the region in memory only their metas are read: a wide
+        // VARIANT's subcolumn metas, most of the region, are skipped. This runs under call_once,
+        // so no thread-safety concerns.
         auto st = _column_meta_accessor->traverse_top_level_metas(
                 footer,
                 [this](const ColumnMetaPB& meta) {
@@ -898,7 +963,9 @@ Status Segment::new_column_iterator(const TabletColumn& tablet_column,
     if (opt->runtime_state != nullptr) {
         _be_exec_version = opt->runtime_state->be_exec_version();
     }
-    RETURN_IF_ERROR(_create_column_meta_once(opt->stats, &opt->io_ctx));
+    bool created = false;
+    Defer release_region {[&] { release_region_if(created); }};
+    RETURN_IF_ERROR(_create_column_meta_once(opt->stats, &opt->io_ctx, &created));
 
     // For compability reason unique_id may less than 0 for variant extracted column
     int32_t unique_id = tablet_column.unique_id() >= 0 ? tablet_column.unique_id()
@@ -963,7 +1030,9 @@ Status Segment::new_column_iterator(const TabletColumn& tablet_column,
 
 Status Segment::get_column_reader(int32_t col_uid, std::shared_ptr<ColumnReader>* column_reader,
                                   OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) {
-    RETURN_IF_ERROR(_create_column_meta_once(stats, source_io_ctx));
+    bool created = false;
+    Defer release_region {[&] { release_region_if(created); }};
+    RETURN_IF_ERROR(_create_column_meta_once(stats, source_io_ctx, &created));
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
     // The column is not in this segment, return nullptr
     if (!_tablet_schema->has_column_unique_id(col_uid)) {
@@ -977,7 +1046,9 @@ Status Segment::get_column_reader(int32_t col_uid, std::shared_ptr<ColumnReader>
 Status Segment::traverse_column_meta_pbs(const std::function<void(const ColumnMetaPB&)>& visitor) {
     // Ensure column meta accessor and reader cache are initialized once.
     OlapReaderStatistics dummy_stats;
-    RETURN_IF_ERROR(_create_column_meta_once(&dummy_stats));
+    bool created = false;
+    Defer release_region {[&] { release_region_if(created); }};
+    RETURN_IF_ERROR(_create_column_meta_once(&dummy_stats, nullptr, &created));
     std::shared_ptr<SegmentFooterPB> footer_pb_shared;
     RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, &dummy_stats));
     return _column_meta_accessor->traverse_metas(*footer_pb_shared, visitor, &dummy_stats);
@@ -986,7 +1057,9 @@ Status Segment::traverse_column_meta_pbs(const std::function<void(const ColumnMe
 Status Segment::get_column_reader(const TabletColumn& col,
                                   std::shared_ptr<ColumnReader>* column_reader,
                                   OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) {
-    RETURN_IF_ERROR(_create_column_meta_once(stats, source_io_ctx));
+    bool created = false;
+    Defer release_region {[&] { release_region_if(created); }};
+    RETURN_IF_ERROR(_create_column_meta_once(stats, source_io_ctx, &created));
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
     int col_uid = col.unique_id() >= 0 ? col.unique_id() : col.parent_unique_id();
     // The column is not in this segment, return nullptr
