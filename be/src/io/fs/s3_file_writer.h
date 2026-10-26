@@ -73,7 +73,15 @@ public:
     Status close(bool non_block = false) override;
     Status try_finish_close() override;
 
+    // True when this writer's parts and async close run on the compaction pools and its
+    // submitted parts count against UploadBufferInflightLimiter::compaction(); otherwise
+    // they count against UploadBufferInflightLimiter::load() unless
+    // FileWriterOptions::bound_load_upload_inflight is false.
+    bool uses_background_pools() const { return _background_write; }
+
 private:
+    ThreadPool* _upload_thread_pool() const;
+    ThreadPool* _close_thread_pool() const;
     Status _close_impl();
     Status _abort();
     [[nodiscard]] std::string _dump_completed_part() const;
@@ -89,6 +97,11 @@ private:
     void _record_close_latency();
 
     ObjectStoragePathOptions _obj_storage_path_opts;
+
+    // config::s3_write_buffer_size when the writer was created. Every part, the buffers that hold
+    // them and the expected part count use this value, so a live config change cannot mix part
+    // sizes within one file.
+    const size_t _buffer_size;
 
     // Current Part Num for CompletedPart
     int _cur_part_num = 1;
@@ -113,6 +126,13 @@ private:
     // Because hive committers have best-effort semantics,
     // this shortens the inconsistent time window.
     bool _used_by_s3_committer;
+    // Fixed at construction from FileWriterOptions::background_write and
+    // config::enable_separate_compaction_s3_upload_pool.
+    bool _background_write;
+    // From FileWriterOptions::bound_load_upload_inflight; ignored for background writers.
+    bool _bound_load_upload_inflight;
+    // From FileWriterOptions::load_upload_buffer.
+    bool _load_upload_buffer;
     std::unique_ptr<AsyncCloseStatusPack> _async_close_pack;
     State _state {State::OPENED};
     std::shared_ptr<ObjClientHolder> _obj_client;
