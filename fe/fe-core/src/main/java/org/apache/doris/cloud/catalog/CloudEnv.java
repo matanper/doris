@@ -89,8 +89,6 @@ public class CloudEnv extends Env {
 
     private CleanCopyJobScheduler cleanCopyJobScheduler;
     private CloudSnapshotHandler cloudSnapshotHandler;
-    private CloudCompactionScheduler cloudCompactionScheduler;
-    private CloudTabletOwnershipPublisher cloudTabletOwnershipPublisher;
 
     private String cloudInstanceId;
 
@@ -109,12 +107,6 @@ public class CloudEnv extends Env {
         this.cloudSyncVersionDaemon = new CloudSyncVersionDaemon();
         this.cloudFEVersionSynchronizer = new CloudFEVersionSynchronizer();
         this.cloudSnapshotHandler = CloudSnapshotHandler.getInstance();
-        this.cloudCompactionScheduler = new CloudCompactionScheduler();
-        this.cloudTabletOwnershipPublisher = new CloudTabletOwnershipPublisher();
-    }
-
-    public CloudCompactionScheduler getCloudCompactionScheduler() {
-        return this.cloudCompactionScheduler;
     }
 
     public CloudTabletRebalancer getCloudTabletRebalancer() {
@@ -186,8 +178,6 @@ public class CloudEnv extends Env {
         }
         upgradeMgr.start();
         cloudSnapshotHandler.start();
-        cloudCompactionScheduler.start();
-        cloudTabletOwnershipPublisher.start();
     }
 
     public CloudFEVersionSynchronizer getCloudFEVersionSynchronizer() {

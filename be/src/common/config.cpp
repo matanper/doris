@@ -462,7 +462,6 @@ DEFINE_mBool(enable_vertical_compaction, "true");
 DEFINE_mBool(enable_ordered_data_compaction, "true");
 // In vertical compaction, column number for every group
 DEFINE_mInt32(vertical_compaction_num_columns_per_group, "5");
-DEFINE_mBool(enable_vertical_compaction_gather_copy, "true");
 // In vertical compaction, max memory usage for row_source_buffer
 DEFINE_Int32(vertical_compaction_max_row_source_memory_mb, "1024");
 // In vertical compaction, max dest segment file size
@@ -974,8 +973,6 @@ DEFINE_mInt32(max_tablet_version_num, "2000");
 
 DEFINE_mInt32(time_series_max_tablet_version_num, "20000");
 
-DEFINE_mBool(time_series_compaction_prefer_empty_rowsets, "false");
-
 // the max sleep time when meeting high pressure load task
 DEFINE_mInt64(max_load_back_pressure_version_wait_time_ms, "3000");
 // the threshold of rowset number gap that triggers back pressure
@@ -1344,9 +1341,6 @@ DEFINE_mInt64(cache_lock_held_long_tail_threshold_us, "30000000");
 // write to file cache, enable_file_cache_adaptive_write true means when file cache is enough, it
 // will write to file cache; satisfying any of the two conditions will write to file cache.
 DEFINE_mBool(enable_file_cache_keep_base_compaction_output, "false");
-// Write the output of full compactions to the file cache, so the first query after a full
-// compaction does not read the whole tablet from remote storage.
-DEFINE_mBool(enable_file_cache_keep_full_compaction_output, "false");
 DEFINE_mBool(enable_file_cache_adaptive_write, "true");
 DEFINE_mDouble(file_cache_keep_base_compaction_output_min_hit_ratio, "0.7");
 DEFINE_mDouble(file_cache_keep_schema_change_output_min_hit_ratio, "0.7");

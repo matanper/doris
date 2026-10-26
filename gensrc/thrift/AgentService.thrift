@@ -370,8 +370,6 @@ struct TCompactionReq {
     1: optional Types.TTabletId tablet_id
     2: optional Types.TSchemaHash schema_hash
     3: optional string type
-    // When true, the BE reports the end of the compaction (or its rejection) through finish_task.
-    4: optional bool report_finish
 }
 
 struct TStorageMediumMigrateReq {

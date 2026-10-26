@@ -177,7 +177,6 @@ Status CloudCumulativeCompaction::request_global_lock() {
             cloud_tablet()->mark_dropped();
             cloud_tablet()->clear_cache();
         } else if (resp.status().code() == cloud::JOB_TABLET_BUSY) {
-            cloud_tablet()->on_cumu_compaction_busy(UnixMillis());
             LOG_WARNING("failed to prepare cumu compaction")
                     .tag("job_id", _uuid)
                     .tag("msg", resp.status().msg());
@@ -196,9 +195,6 @@ Status CloudCumulativeCompaction::request_global_lock() {
             LOG(WARNING) << msg;
             return Status::InternalError(msg);
         }
-    }
-    if (st.ok()) {
-        cloud_tablet()->reset_cumu_compaction_busy();
     }
     return st;
 }

@@ -121,9 +121,6 @@ Status Merger::vmerge_rowsets(BaseTabletSPtr tablet, ReaderType reader_type,
             return Status::Error<INTERNAL_ERROR>("tablet {} is not used any more",
                                                  tablet->tablet_id());
         }
-        if (tablet->compaction_cancel_requested()) {
-            return Status::Cancelled("compaction of tablet {} is cancelled", tablet->tablet_id());
-        }
 
         // Read one block from block reader
         RETURN_NOT_OK_STATUS_WITH_WARN(reader.next_block_with_aggregation(&block, &eof),
@@ -310,9 +307,6 @@ Status Merger::vertical_compact_one_group(
             tablet->clear_cache();
             return Status::Error<INTERNAL_ERROR>("tablet {} is not used any more",
                                                  tablet->tablet_id());
-        }
-        if (tablet->compaction_cancel_requested()) {
-            return Status::Cancelled("compaction of tablet {} is cancelled", tablet->tablet_id());
         }
         // Read one block from block reader
         RETURN_NOT_OK_STATUS_WITH_WARN(reader.next_block_with_aggregation(&block, &eof),

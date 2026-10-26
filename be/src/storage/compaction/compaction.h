@@ -78,8 +78,6 @@ public:
     // files that fit are loaded into memory instead, held in _memory_preload until the merge ends.
     void preload_input_segment_files(bool async = false);
 
-    const BaseTabletSPtr& tablet() const { return _tablet; }
-
     // Pick input rowsets satisfied to compact
     virtual Status prepare_compact() = 0;
 

@@ -90,7 +90,6 @@ DECLARE_mInt32(sync_rowsets_slow_threshold_ms);
 
 // Cloud compaction config
 DECLARE_mInt64(min_compaction_failure_interval_ms);
-DECLARE_mInt64(cumu_compaction_busy_max_backoff_ms);
 DECLARE_mBool(enable_new_tablet_do_compaction);
 // Enable empty rowset compaction strategy
 DECLARE_mBool(enable_empty_rowset_compaction);

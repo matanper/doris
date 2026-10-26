@@ -68,9 +68,6 @@ private:
     /// fetch compaction running status
     Status _handle_run_status_compaction(HttpRequest* req, std::string* json_result);
 
-    /// cancel the full compaction submitted on a tablet
-    Status _handle_cancel_compaction(HttpRequest* req, std::string* json_result);
-
 private:
     CloudStorageEngine& _engine;
     CompactionActionType _compaction_type;

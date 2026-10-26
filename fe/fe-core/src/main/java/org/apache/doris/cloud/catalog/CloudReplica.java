@@ -83,14 +83,6 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
 
     private static final Random rand = new Random();
 
-    // From the latest tablet stats, not persisted: segment and rowset counts (-1 until stats
-    // arrive), when cumulative compaction last committed, and the compute group that last loaded
-    // or compacted the tablet.
-    private transient volatile long segmentCount = -1;
-    private transient volatile long rowsetCount = -1;
-    private transient volatile long lastCumuCompactionTimeMs = 0;
-    private transient volatile String lastActiveClusterId = "";
-
     // clusterId, secondaryBe, changeTimestamp
     private Map<String, Pair<Long, Long>> secondaryClusterToBackends
             = new ConcurrentHashMap<String, Pair<Long, Long>>();
@@ -251,33 +243,6 @@ public class CloudReplica extends Replica implements GsonPostProcessable {
             }
             return -1;
         }
-    }
-
-    public long getSegmentCount() {
-        return segmentCount;
-    }
-
-    public void setSegmentCount(long segmentCount) {
-        this.segmentCount = segmentCount;
-    }
-
-    public long getRowsetCount() {
-        return rowsetCount;
-    }
-
-    public long getLastCumuCompactionTimeMs() {
-        return lastCumuCompactionTimeMs;
-    }
-
-    public String getLastActiveClusterId() {
-        return lastActiveClusterId;
-    }
-
-    public void setCompactionStats(long rowsetCount, long lastCumuCompactionTimeMs,
-            String lastActiveClusterId) {
-        this.rowsetCount = rowsetCount;
-        this.lastCumuCompactionTimeMs = lastCumuCompactionTimeMs;
-        this.lastActiveClusterId = lastActiveClusterId == null ? "" : lastActiveClusterId;
     }
 
     public long getPrimaryBackendId() {

@@ -489,11 +489,6 @@ void HttpService::register_cloud_handler(CloudStorageEngine& engine) {
                                       TPrivilegeHier::GLOBAL, TPrivilegeType::ADMIN));
     _ev_http_server->register_handler(HttpMethod::GET, "/api/compaction/run_status",
                                       run_status_compaction_action);
-    CloudCompactionAction* cancel_compaction_action = _pool.add(
-            new CloudCompactionAction(CompactionActionType::CANCEL_COMPACTION, _env, engine,
-                                      TPrivilegeHier::GLOBAL, TPrivilegeType::ADMIN));
-    _ev_http_server->register_handler(HttpMethod::POST, "/api/compaction/cancel",
-                                      cancel_compaction_action);
 
     CompactionProfileAction* compaction_profile_action = _pool.add(
             new CompactionProfileAction(_env, TPrivilegeHier::GLOBAL, TPrivilegeType::ADMIN));

@@ -19,7 +19,6 @@
 
 #include <gen_cpp/olap_common.pb.h>
 
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -73,15 +72,6 @@ public:
     // e.g. by TRUNCATE). Compaction neither picks nor keeps merging a dropped tablet.
     void mark_dropped() { _dropped.store(true, std::memory_order_relaxed); }
     bool is_dropped() const { return _dropped.load(std::memory_order_relaxed); }
-
-    // Set while a cancel of the tablet's full compaction is pending. The merge loops stop at
-    // the next block when it is set.
-    void set_compaction_cancel_requested(bool requested) {
-        _compaction_cancel_requested.store(requested, std::memory_order_relaxed);
-    }
-    bool compaction_cancel_requested() const {
-        return _compaction_cancel_requested.load(std::memory_order_relaxed);
-    }
     Status set_tablet_state(TabletState state);
     int64_t table_id() const { return _tablet_meta->table_id(); }
     size_t row_size() const { return _tablet_meta->tablet_schema()->row_size(); }
@@ -312,17 +302,10 @@ public:
 
     virtual void clear_cache() = 0;
 
-    // Find the first run of consecutive empty rowsets (no segments, no delete predicate) in
-    // `candidate_rowsets`, which must be sorted by version, that holds at least `min_count`
-    // rowsets and is followed by another candidate. `min_count` is a lower bound only: the whole
-    // run is returned, so one compaction absorbs a run of any length. A run longer than
-    // `max_count` is returned as its first `max_count` rowsets, which keeps a single compaction
-    // job inside the meta-service transaction limits; the rest of the run is picked by the next
-    // compaction, together with the empty rowset that this one outputs.
-    static void calc_consecutive_empty_rowsets(
-            std::vector<RowsetSharedPtr>* empty_rowsets,
-            const std::vector<RowsetSharedPtr>& candidate_rowsets, int64_t min_count,
-            int64_t max_count = std::numeric_limits<int64_t>::max());
+    // Find the first consecutive empty rowsets. output->size() >= limit
+    void calc_consecutive_empty_rowsets(std::vector<RowsetSharedPtr>* empty_rowsets,
+                                        const std::vector<RowsetSharedPtr>& candidate_rowsets,
+                                        int64_t limit);
 
     void traverse_rowsets(std::function<void(const RowsetSharedPtr&)> visitor,
                           bool include_stale = false) {
@@ -420,7 +403,6 @@ protected:
     // `_alter_failed` is used to indicate whether the tablet failed to perform a schema change
     std::atomic<bool> _alter_failed = false;
     std::atomic<bool> _dropped = false;
-    std::atomic<bool> _compaction_cancel_requested = false;
 
     // metrics of this tablet
     std::shared_ptr<MetricEntity> _metric_entity;

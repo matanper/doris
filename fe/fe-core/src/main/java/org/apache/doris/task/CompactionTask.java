@@ -26,8 +26,6 @@ public class CompactionTask extends AgentTask {
 
     private int schemaHash;
     private String type;
-    // Ask the backend to report the end of the compaction through finishTask.
-    private boolean reportFinish = false;
 
     public CompactionTask(long backendId, long dbId, long tableId, long partitionId, long indexId,
                           long tabletId, int schemaHash, String type) {
@@ -40,18 +38,11 @@ public class CompactionTask extends AgentTask {
         return schemaHash;
     }
 
-    public void setReportFinish(boolean reportFinish) {
-        this.reportFinish = reportFinish;
-    }
-
     public TCompactionReq toThrift() {
         TCompactionReq request = new TCompactionReq();
         request.setTabletId(tabletId);
         request.setSchemaHash(schemaHash);
         request.setType(type);
-        if (reportFinish) {
-            request.setReportFinish(true);
-        }
 
         return request;
     }
