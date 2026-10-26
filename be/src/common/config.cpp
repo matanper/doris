@@ -633,6 +633,25 @@ DEFINE_Bool(enable_all_http_auth, "false");
 // Number of webserver workers
 DEFINE_Int32(webserver_num_workers, "128");
 
+// Wait for a stream load to finish and commit on a pool thread instead of the HTTP event loop
+// thread, which serves the bodies of other loads on the same keep-alive event loop.
+DEFINE_mBool(enable_stream_load_finish_off_event_loop, "true");
+// Upper bound of threads waiting for stream loads to finish; idle threads exit.
+DEFINE_Int32(stream_load_finish_thread_num, "1024");
+// Begin a stream load's transaction, plan it and start its fragment on a pool thread instead of
+// the HTTP event loop thread. Reading the load's body stays paused until the plan is running.
+DEFINE_mBool(enable_stream_load_header_off_event_loop, "true");
+// Upper bound of threads waiting on FE for stream load headers; idle threads exit.
+DEFINE_Int32(stream_load_header_thread_num, "256");
+// When true, a stream load whose pipe is full stops reading its HTTP body (EV_READ is disabled on
+// the connection, so TCP flow control holds back the sender) and resumes once the scanner drained
+// the pipe to half its capacity. When false, the event loop thread blocks until the pipe has room,
+// which stalls every other connection on that loop. Read when a load's headers arrive.
+DEFINE_mBool(enable_stream_load_receive_flow_control, "true");
+// Capacity of the pipe between a streaming stream load's HTTP receiver and its scanner. A larger
+// pipe absorbs longer scanner stalls before the receiver pauses, at this much memory per load.
+DEFINE_mInt64(stream_load_pipe_buffer_bytes, "4194304");
+
 DEFINE_Bool(enable_single_replica_load, "true");
 // Number of download workers for single replica load
 DEFINE_Int32(single_replica_load_download_num_workers, "64");
@@ -872,6 +891,28 @@ DEFINE_mBool(enable_adaptive_flush_threads, "true");
 DEFINE_mBool(enable_table_memtable_flush_backpressure, "true");
 // Max pending flush memtables for one table on this BE before blocking new writes.
 DEFINE_mInt32(table_memtable_flush_pending_count_limit, "10");
+
+// Memory-driven load back-pressure: when enabled, memtable writes wait (bounded) once process
+// memory crosses a watermark below the process GC threshold, so loads are throttled before the
+// "Cancel Top Memory task" GC starts cancelling them.
+DEFINE_mBool(enable_load_memory_backpressure, "false");
+// Process memory, as a percent of mem_limit, at which load writes start to flush and wait.
+// Must sit below soft_mem_limit_frac * 100 to take effect earlier than the default limiter.
+DEFINE_mInt32(load_memory_backpressure_process_mem_percent, "85");
+// Budget for memtables queued for or running flush on this BE, as a percent of mem_limit.
+// Above it, table writes that have pending flushes wait. 0 disables the byte budget.
+DEFINE_mInt32(load_memtable_pending_mem_limit_percent, "0");
+// Upper bound of one memory-driven wait. After it the write proceeds, and the process GC remains
+// the safety valve. The pending-count gate keeps its own unbounded semantics.
+DEFINE_mInt64(load_memory_backpressure_max_wait_ms, "60000");
+// When true, the memory part of the per-table write gate holds a write only while the writer's own
+// load has memtables queued for or running flush on this BE. When false it holds every write to the
+// table while any load of that table has a pending flush. The pending-count gate is unaffected.
+DEFINE_mBool(load_memory_backpressure_wait_on_own_load, "false");
+// When >= 0, the process GC cancels loads only to free the overshoot above mem_limit plus this
+// percent of mem_limit (capped at process_full_gc_size), instead of process_full_gc_size.
+// Not applied when the GC is triggered by low system available memory. -1 keeps the old target.
+DEFINE_mInt32(load_memory_gc_free_extra_percent, "-1");
 
 // config for tablet meta checkpoint
 DEFINE_mInt32(tablet_meta_checkpoint_min_new_rowsets_num, "10");

@@ -66,6 +66,7 @@ private:
 };
 
 class MemTableWriter;
+class PUniqueId;
 struct WriterMemItem {
     std::weak_ptr<MemTableWriter> writer;
     int64_t mem_size;
@@ -83,7 +84,10 @@ public:
     // when memory is not available.
     // Then waits in the load S3 upload-buffer gate (see S3UploadBufferBackpressure).
     void handle_memtable_flush(std::function<bool()> cancel_check, WorkloadGroup* wg = nullptr);
-    void handle_table_memtable_backpressure(std::function<bool()> cancel_check, int64_t table_id);
+    // `load_id`, when given, lets the memory gate wait only on the flushes of the writer's own load
+    // (see config::load_memory_backpressure_wait_on_own_load).
+    void handle_table_memtable_backpressure(std::function<bool()> cancel_check, int64_t table_id,
+                                            const PUniqueId* load_id = nullptr);
 
     void register_writer(std::weak_ptr<MemTableWriter> writer);
 
@@ -103,12 +107,17 @@ private:
     void _handle_memtable_mem_limit(const std::function<bool()>& cancel_check);
     static inline int64_t _sys_avail_mem_less_than_warning_water_mark();
     static inline int64_t _process_used_mem_more_than_soft_mem_limit();
+    // Bytes above the load back-pressure watermark; <= 0 when below it or when disabled.
+    static int64_t _process_used_mem_more_than_backpressure_watermark(bool use_watermark);
 
     bool _soft_limit_reached();
-    bool _hard_limit_reached();
+    bool _hard_limit_reached(bool use_watermark = true);
     bool _load_usage_low();
-    int64_t _need_flush();
-    int64_t _table_flush_pending_memtable_count(int64_t table_id);
+    int64_t _need_flush(bool use_watermark);
+    // Memtables queued for or running flush for `table_id`, and the part of them that belongs to
+    // `load_id` (0 when `load_id` is null).
+    void _flush_pending_memtable_count(int64_t table_id, const PUniqueId* load_id,
+                                       int64_t* table_pending, int64_t* load_pending);
     int64_t _flush_active_memtables(int64_t need_flush);
     void _refresh_mem_tracker();
     std::mutex _lock;
