@@ -1485,6 +1485,8 @@ DEFINE_mInt32(tablet_path_check_batch_size, "1000");
 
 // it must be larger than or equal to 5MB
 DEFINE_mInt64(s3_write_buffer_size, "5242880");
+DEFINE_mInt64(s3_write_buffer_initial_size, "262144");
+DEFINE_mInt64(s3_write_buffer_grow_jump_threshold, "4194304");
 // Log interval when doing s3 upload task
 DEFINE_mInt32(s3_file_writer_log_interval_second, "60");
 DEFINE_mInt64(file_cache_max_file_reader_cache_size, "1000000");
@@ -1685,6 +1687,10 @@ DEFINE_mBool(enable_s3_retry_full_jitter, "true");
 DEFINE_mInt32(s3_read_base_wait_time_ms, "100");
 DEFINE_mInt32(s3_read_max_wait_time_ms, "800");
 DEFINE_mBool(enable_s3_object_check_after_upload, "true");
+DEFINE_mString(s3_upload_content_md5, "md5");
+DEFINE_Validator(s3_upload_content_md5, [](const std::string& config) -> bool {
+    return config == "md5" || config == "crc32c" || config == "none";
+});
 DEFINE_mInt32(aws_client_request_timeout_ms, "30000");
 
 DEFINE_mBool(enable_s3_rate_limiter, "false");
@@ -1810,6 +1816,24 @@ DEFINE_mDouble(max_hdfs_wirter_jni_heap_usage_ratio, "0.5");
 DEFINE_mInt64(hdfs_jni_write_sleep_milliseconds, "300");
 // The max retry times when hdfs write failed
 DEFINE_mInt64(hdfs_jni_write_max_retry_time, "3");
+
+DEFINE_mBool(enable_separate_compaction_s3_upload_pool, "true");
+DEFINE_Int64(compaction_s3_upload_thread_num, "64");
+DEFINE_Int64(compaction_nonblock_close_thread_num, "64");
+DEFINE_mInt64(compaction_s3_upload_max_inflight_parts, "256");
+DEFINE_mInt64(load_s3_upload_max_inflight_parts, "0");
+// Load S3 upload-buffer back-pressure. New load writes (the memtable memory gate in front of
+// add_block and the sink-side memtable writes) wait while load upload buffers hold at least this
+// many bytes, instead of buffer allocations blocking inside a flush. 0 disables it.
+DEFINE_mInt64(load_s3_upload_buffer_backpressure_bytes, "0");
+DEFINE_mInt32(load_s3_upload_buffer_backpressure_resume_percent, "80");
+DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
+DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
+DEFINE_mInt64(file_cache_writer_thread_num, "32");
+DEFINE_Int64(file_cache_writer_queue_size, "256");
+DEFINE_mInt64(file_cache_writer_load_thread_num, "8");
+DEFINE_Int64(file_cache_writer_load_queue_size, "256");
+DEFINE_mInt64(file_cache_writer_backlog_bytes, "2147483648");
 
 // The min thread num for NonBlockCloseThreadPool
 DEFINE_Int64(min_nonblock_close_thread_num, "12");
