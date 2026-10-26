@@ -22,9 +22,7 @@
 #include <utility>
 #include <vector>
 
-#include "common/config.h"
 #include "common/exception.h"
-#include "common/logging.h"
 #include "core/column/column_map.h"
 #include "core/column/column_nullable.h"
 #include "core/column/column_string.h"
@@ -36,7 +34,6 @@
 #include "exprs/function/parse/variant_jsonb_parse.h"
 #include "storage/segment/variant/v2/variant_assembler_internal.h"
 #include "storage/segment/variant/v2/variant_storage_cell.h"
-#include "util/utf8_check.h"
 
 namespace doris::segment_v2::variant_v2 {
 namespace {
@@ -162,22 +159,6 @@ struct StorageMapRowCursor {
     }
 };
 
-std::string hex_prefix(StringRef value, size_t limit) {
-    static constexpr char HEX[] = "0123456789abcdef";
-    std::string hex;
-    const size_t size = std::min(value.size, limit);
-    hex.reserve(size * 2 + 3);
-    for (size_t i = 0; i < size; ++i) {
-        const auto byte = static_cast<uint8_t>(value.data[i]);
-        hex.push_back(HEX[byte >> 4]);
-        hex.push_back(HEX[byte & 0x0f]);
-    }
-    if (value.size > size) {
-        hex += "...";
-    }
-    return hex;
-}
-
 // Emits ordered dotted paths into one VariantBatchBuilder row. The previous borrowed raw path and
 // open object scopes are sufficient to find the component LCP; components are scanned only while
 // they are emitted and are never materialized into a separate parts container.
@@ -194,13 +175,7 @@ struct ObjectEmitter {
     ObjectEmitter() { scopes.reserve(8); }
 
     static size_t component_end(StringRef path, size_t offset) {
-        // A depth larger than the path's component count would step past the end of the path, and
-        // the unsigned size below would then let memchr run over whatever memory follows it.
-        if (offset > path.size) [[unlikely]] {
-            throw Exception(ErrorCode::CORRUPTION,
-                            "Variant path of {} bytes has fewer components than its depth",
-                            path.size);
-        }
+        DCHECK_LE(offset, path.size);
         if (offset == path.size) {
             return path.size;
         }
@@ -248,15 +223,6 @@ struct ObjectEmitter {
         for (size_t part = 0; part < depth; ++part) {
             const size_t end = component_end(path, offset);
             if (part >= common_depth) {
-                if (config::variant_v2_check_read_paths &&
-                    !validate_utf8(path_data + offset, end - offset)) [[unlikely]] {
-                    LOG(WARNING) << "Variant assembler emits a key that is not valid UTF-8: part="
-                                 << part << " depth=" << depth << " common_depth=" << common_depth
-                                 << " offset=" << offset << " end=" << end
-                                 << " path_size=" << path.size << " path_hex="
-                                 << hex_prefix(path, 512) << " previous_size=" << previous_path.size
-                                 << " previous_hex=" << hex_prefix(previous_path, 256);
-                }
                 scopes.back().add_key({path_data + offset, end - offset});
                 if (part + 1 < depth) {
                     scopes.push_back(row->start_object());

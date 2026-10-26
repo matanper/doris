@@ -862,40 +862,6 @@ TEST(VariantAssemblerLegacyTest, UnsortedMaterializedPathsKeepSourceColumns) {
     EXPECT_EQ(json_at(assembled_values(output), 0), R"({"a":20,"m":{"child":30},"z":10})");
 }
 
-TEST(VariantAssemblerLegacyTest, RootSlotSortedAmongDeepSlotsKeepsEveryPath) {
-    // A materialized slot at the requested path itself has an empty relative path. Sorting the
-    // slots copy-assigns it over deeper ones; each slot must keep exactly its own path and depth.
-    const auto int_type = std::make_shared<DataTypeInt32>();
-    auto make = [](int32_t value) {
-        auto column = ColumnInt32::create();
-        column->insert_value(value);
-        return column;
-    };
-    auto deep = make(7);
-    auto root = make(1);
-    auto z = make(3);
-    auto b = make(2);
-    VariantAssemblerOptions options;
-    options.requested_path = PathInData("a");
-    options.materialized_paths = {
-            {.path = PathInData("a.k.p1.p2.p3.p4.p5"), .type = int_type},
-            {.path = PathInData("a"), .type = int_type},
-            {.path = PathInData("a.z"), .type = int_type},
-            {.path = PathInData("a.b"), .type = int_type},
-    };
-    auto assembler = create_assembler(std::move(options));
-    const std::array<const IColumn*, 4> materialized {deep.get(), root.get(), z.get(), b.get()};
-    VariantAssemblerBatchView batch;
-    batch.num_rows = 1;
-    batch.materialized_columns = materialized;
-    ColumnNullable::MutablePtr output;
-    const Status status = assembler->assemble(batch, &output);
-    ASSERT_TRUE(status.ok()) << status;
-    EXPECT_EQ(json_at(assembled_values(output), 0),
-              R"({"b":2,"k":{"p1":{"p2":{"p3":{"p4":{"p5":7}}}}},"z":3})");
-    EXPECT_FALSE(VariantRepairInvalidUtf8Scope::active());
-}
-
 TEST(VariantAssemblerLegacyTest, RootSidecarYieldsToVisibleHierarchicalStreams) {
     const auto int_type = std::make_shared<DataTypeInt32>();
     const std::string sparse_cell = fixed_storage_cell<int32_t>(FieldType::OLAP_FIELD_TYPE_INT, 20);

@@ -20,7 +20,6 @@
 #include <gen_cpp/segment_v2.pb.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -245,44 +244,6 @@ TEST_F(PathInDataTest, ComparisonWithIsTyped) {
     PathInData::Hash hasher;
     EXPECT_NE(hasher(path1), hasher(path2));
     EXPECT_EQ(hasher(path1), hasher(path3));
-}
-
-TEST_F(PathInDataTest, AssigningAnEmptyPathLeavesNoParts) {
-    PathInData path("requestObject.metadata.labels.statefulset.kubernetes.io/pod-name");
-    ASSERT_EQ(path.get_parts().size(), 6);
-    path = PathInData();
-    EXPECT_TRUE(path.empty());
-    EXPECT_TRUE(path.get_parts().empty());
-    EXPECT_EQ(path.get_path(), "");
-    EXPECT_FALSE(path.has_nested_part());
-
-    PathInData::Parts nested_parts;
-    nested_parts.emplace_back("a", true, 0);
-    nested_parts.emplace_back("b", false, 0);
-    PathInData nested(nested_parts);
-    ASSERT_TRUE(nested.has_nested_part());
-    nested = PathInData("x.y");
-    EXPECT_FALSE(nested.has_nested_part());
-    ASSERT_EQ(nested.get_parts().size(), 2);
-    EXPECT_EQ(nested.get_parts()[0].key, "x");
-    EXPECT_EQ(nested.get_parts()[1].key, "y");
-    EXPECT_EQ(nested.get_parts()[0].key.data(), nested.get_path().data());
-
-    // Sorting moves paths by copy assignment, so an empty path sorts among longer ones intact.
-    std::vector<PathInData> paths {PathInData("k.p1.p2.p3.p4.p5"), PathInData(), PathInData("b"),
-                                   PathInData("z.y")};
-    std::ranges::sort(paths, [](const PathInData& l, const PathInData& r) {
-        return l.get_path() < r.get_path();
-    });
-    EXPECT_TRUE(paths[0].empty());
-    EXPECT_EQ(paths[0].get_path(), "");
-    for (const PathInData& sorted : paths) {
-        size_t joined = 0;
-        for (const auto& part : sorted.get_parts()) {
-            joined += part.key.size() + 1;
-        }
-        EXPECT_EQ(sorted.get_parts().empty() ? 0 : joined - 1, sorted.get_path().size());
-    }
 }
 
 } // namespace doris

@@ -21,7 +21,6 @@
 #include <optional>
 #include <span>
 
-#include "common/config.h"
 #include "common/status.h"
 #include "core/assert_cast.h"
 #include "core/column/column.h"
@@ -43,7 +42,6 @@
 #include "storage/segment/variant/v2/variant_column_reader.h"
 #include "util/json/path_in_data.h"
 #include "util/jsonb_document.h"
-#include "util/utf8_check.h"
 
 namespace doris::segment_v2 {
 
@@ -51,71 +49,6 @@ HierarchicalDataIterator::HierarchicalDataIterator(const PathInData& path, ReadT
         : _path(path), _read_type(read_type) {}
 
 HierarchicalDataIterator::~HierarchicalDataIterator() = default;
-
-namespace {
-
-std::string hex_prefix(StringRef value, size_t limit) {
-    static constexpr char HEX[] = "0123456789abcdef";
-    std::string hex;
-    const size_t size = std::min(value.size, limit);
-    hex.reserve(size * 2 + 3);
-    for (size_t i = 0; i < size; ++i) {
-        const auto byte = static_cast<uint8_t>(value.data[i]);
-        hex.push_back(HEX[byte >> 4]);
-        hex.push_back(HEX[byte & 0x0f]);
-    }
-    if (value.size > size) {
-        hex += "...";
-    }
-    return hex;
-}
-
-// Logs the stored paths of one batch that are not valid UTF-8, with enough context to find them
-// on disk and to tell a decode problem from a bad stored value.
-void log_invalid_read_paths(const std::string& file_path, const PathInData& requested,
-                            const ColumnMap* storage_map,
-                            const variant_v2::VariantAssemblerOptions* options, size_t nrows) {
-    if (options != nullptr) {
-        for (const auto& materialized : options->materialized_paths) {
-            const std::string& path = materialized.path.get_path();
-            if (!path.empty() && !validate_utf8(path.data(), path.size())) {
-                LOG(WARNING) << "Variant subcolumn path is not valid UTF-8: file=" << file_path
-                             << " requested=" << requested.get_path() << " size=" << path.size()
-                             << " hex=" << hex_prefix({path.data(), path.size()}, 512);
-            }
-        }
-    }
-    if (storage_map == nullptr) {
-        return;
-    }
-    const auto& paths = assert_cast<const ColumnString&>(storage_map->get_keys());
-    const auto& offsets = storage_map->get_offsets();
-    if (paths.get_offsets().empty() ? !paths.get_chars().empty()
-                                    : paths.get_offsets().back() != paths.get_chars().size()) {
-        LOG(WARNING) << "Variant sparse paths have inconsistent offsets: file=" << file_path
-                     << " cells=" << paths.size() << " chars=" << paths.get_chars().size();
-    }
-    size_t logged = 0;
-    for (size_t cell = 0; cell < paths.size() && logged < 8; ++cell) {
-        const StringRef path = paths.get_data_at(cell);
-        if (path.size == 0 || validate_utf8(path.data, path.size)) {
-            continue;
-        }
-        const size_t row = std::upper_bound(offsets.begin(), offsets.end(), cell) - offsets.begin();
-        const StringRef previous = cell == 0 ? StringRef() : paths.get_data_at(cell - 1);
-        const StringRef next = cell + 1 < paths.size() ? paths.get_data_at(cell + 1) : StringRef();
-        LOG(WARNING) << "Variant sparse path read from storage is not valid UTF-8: file="
-                     << file_path << " requested=" << requested.get_path()
-                     << " batch_rows=" << nrows << " row=" << row << " cell=" << cell << "/"
-                     << paths.size() << " size=" << path.size << " hex=" << hex_prefix(path, 512)
-                     << " previous_size=" << previous.size
-                     << " previous_hex=" << hex_prefix(previous, 128)
-                     << " next_size=" << next.size << " next_hex=" << hex_prefix(next, 128);
-        ++logged;
-    }
-}
-
-} // namespace
 
 Status HierarchicalDataIterator::create(ColumnIteratorUPtr* reader, int32_t col_uid,
                                         PathInData path, const SubcolumnColumnMetaInfo::Node* node,
@@ -168,9 +101,6 @@ Status HierarchicalDataIterator::create(ColumnIteratorUPtr* reader, int32_t col_
                     {.path = stream.path, .type = stream.data.type});
             return Status::OK();
         }));
-        if (config::variant_v2_check_read_paths) {
-            log_invalid_read_paths("", path, nullptr, &assembler_options, 0);
-        }
         stream_iter->_variant_v2_assembler =
                 DORIS_TRY(variant_v2::VariantAssembler::create(std::move(assembler_options)));
     }
@@ -180,9 +110,6 @@ Status HierarchicalDataIterator::create(ColumnIteratorUPtr* reader, int32_t col_
 }
 
 Status HierarchicalDataIterator::init(const ColumnIteratorOptions& opts) {
-    if (opts.file_reader != nullptr) {
-        _file_path = opts.file_reader->path().native();
-    }
     RETURN_IF_ERROR(tranverse([&](SubstreamReaderTree::Node& node) {
         RETURN_IF_ERROR(node.data.iterator->init(opts));
         node.data.inited = true;
@@ -268,10 +195,6 @@ Status HierarchicalDataIterator::_assemble_variant_v2(MutableColumnPtr& dst, siz
         if (storage_map == nullptr) {
             return Status::Corruption("Variant V2 binary stream is not Map<String,String>");
         }
-    }
-
-    if (config::variant_v2_check_read_paths) {
-        log_invalid_read_paths(_file_path, _path, storage_map, nullptr, nrows);
     }
 
     variant_v2::VariantAssemblerBatchView batch;

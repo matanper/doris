@@ -37,7 +37,6 @@
 #include "core/pod_array.h"
 #include "core/value/large_int_value.h"
 #include "core/value/variant/variant_parquet_encoding.h"
-#include "util/stack_util.h"
 #include "util/utf8_check.h"
 
 namespace doris {
@@ -145,8 +144,7 @@ void log_repaired_utf8(const char* description, StringRef value) {
     LOG(WARNING) << "Variant " << description
                  << " read from storage is not valid UTF-8; invalid bytes replaced with U+FFFD."
                  << " size=" << value.size << " hex=" << hex
-                 << (value.size > logged ? "..." : "") << " repairs_so_far=" << count
-                 << (count <= 8 ? "\n" + get_stack_trace() : std::string());
+                 << (value.size > logged ? "..." : "") << " repairs_so_far=" << count;
 }
 
 template <typename String>

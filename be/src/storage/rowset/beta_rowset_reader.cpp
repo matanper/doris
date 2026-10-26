@@ -17,12 +17,9 @@
 
 #include "storage/rowset/beta_rowset_reader.h"
 
-#include <typeinfo>
-
 #include <stddef.h>
 
 #include <algorithm>
-#include <functional>
 #include <memory>
 #include <ostream>
 #include <roaring/roaring.hh>
@@ -53,7 +50,6 @@
 #include "storage/segment/segment.h"
 #include "storage/tablet/tablet_meta.h"
 #include "storage/tablet/tablet_schema.h"
-#include "util/debug_points.h"
 
 namespace doris {
 #include "common/compile_check_begin.h"
@@ -325,41 +321,12 @@ Status BetaRowsetReader::init(RowsetReaderContext* read_context, const RowSetSpl
 }
 
 Status BetaRowsetReader::_init_iterator_once() {
-    // DorisCallOnce rethrows an exception from _init_iterator on this and every later call, and
-    // nothing up the scan path catches a std::exception, so convert it to a Status here.
-    try {
-        return _init_iter_once.call([this] { return _init_iterator(); });
-    } catch (const doris::Exception& e) {
-        return e.to_status();
-    } catch (const std::exception& e) {
-        return Status::InternalError("init rowset reader of rowset {} threw {}: {}",
-                                     _rowset->rowset_id().to_string(), typeid(e).name(),
-                                     e.what());
-    }
+    return _init_iter_once.call([this] { return _init_iterator(); });
 }
 
 Status BetaRowsetReader::_init_iterator() {
-    // Names the step that throws, since the exception is converted to a Status by
-    // DorisCallOnce and its stack is lost.
-    const char* step = "get_segment_iterators";
-    try {
-        return _init_iterator_steps(&step);
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "exception initializing rowset reader, tablet="
-                     << _rowset->rowset_meta()->tablet_id() << " rowset=" << _rowset->rowset_id()
-                     << " step=" << step << ": " << typeid(e).name() << " " << e.what();
-        throw;
-    }
-}
-
-Status BetaRowsetReader::_init_iterator_steps(const char** step) {
-    DBUG_EXECUTE_IF("BetaRowsetReader._init_iterator.call_empty_function", {
-        std::function<void()> empty;
-        empty();
-    });
     std::vector<RowwiseIteratorUPtr> iterators;
     RETURN_IF_ERROR(get_segment_iterators(_read_context, &iterators));
-    *step = "build_iterator";
 
     SCOPED_RAW_TIMER(&_stats->rowset_reader_init_iterators_timer_ns);
 
@@ -388,7 +355,6 @@ Status BetaRowsetReader::_init_iterator_steps(const char** step) {
         _iterator = new_union_iterator(std::move(iterators), _output_schema);
     }
 
-    *step = "iterator_init";
     auto s = _iterator->init(_read_options);
     if (!s.ok()) {
         LOG(WARNING) << "failed to init iterator: " << s.to_string();
