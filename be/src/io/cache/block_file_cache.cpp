@@ -2739,29 +2739,6 @@ void BlockFileCache::clear_need_update_lru_blocks() {
     *_need_update_lru_blocks_length_recorder << _need_update_lru_blocks.size();
 }
 
-std::string BlockFileCache::describe_blocks(const UInt128Wrapper& hash, size_t left, size_t right,
-                                            bool* any_peer) {
-    *any_peer = false;
-    std::string out;
-    SCOPED_CACHE_LOCK(_mutex, this);
-    auto it = _files.find(hash);
-    if (it != _files.end()) {
-        for (auto& [offset, cell] : it->second) {
-            const auto& block = cell.file_block;
-            const auto& range = block->range();
-            if (range.right < left || range.left > right) {
-                continue;
-            }
-            *any_peer |= block->fill_source() == FileBlock::FillSource::PEER ||
-                         block->fill_source() == FileBlock::FillSource::PEER_SERVER_FILL;
-            out += fmt::format("{}[{}, {}] {} from {}", out.empty() ? "" : "; ", range.left,
-                               range.right, FileBlock::state_to_string(block->state()),
-                               block->fill_source_desc());
-        }
-    }
-    return out.empty() ? std::string("none cached") : out;
-}
-
 std::map<size_t, FileBlockSPtr> BlockFileCache::get_blocks_by_key(const UInt128Wrapper& hash) {
     std::map<size_t, FileBlockSPtr> offset_to_block;
     SCOPED_CACHE_LOCK(_mutex, this);

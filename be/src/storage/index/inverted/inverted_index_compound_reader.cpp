@@ -295,19 +295,6 @@ bool DorisCompoundReader::fileExists(const char* name) const {
     return _entries->find(std::string(name)) != _entries->end();
 }
 
-bool DorisCompoundReader::entry_range(const char* name, int64_t* offset, int64_t* length) const {
-    if (_closed || _entries == nullptr) {
-        return false;
-    }
-    auto it = _entries->find(std::string(name));
-    if (it == _entries->end() || it->second == nullptr) {
-        return false;
-    }
-    *offset = it->second->offset;
-    *length = it->second->length;
-    return true;
-}
-
 int64_t DorisCompoundReader::fileModified(const char* name) const {
     return 0;
 }

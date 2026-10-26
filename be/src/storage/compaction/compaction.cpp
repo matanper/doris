@@ -18,7 +18,6 @@
 #include "storage/compaction/compaction.h"
 #include "storage/index/index_writer.h"
 #include "storage/index/inverted/analyzer/analyzer.h"
-#include "storage/index/inverted/index_bitmap_util.h"
 #include "storage/index/inverted/inverted_index_parser.h"
 
 #include <bvar/bvar.h>
@@ -992,7 +991,7 @@ static std::optional<std::map<std::string, std::string>> index_properties(
 // Marks as null, in every destination index, the documents that come from source segments
 // without the index. A typed VARIANT path that never appeared in a segment is NULL for all of
 // its rows in the output, as a rebuild of the index would record them.
-static Status add_absent_source_nulls(
+static void add_absent_source_nulls(
         const std::vector<lucene::store::Directory*>& dest_dirs,
         const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& trans_vec,
         const std::vector<size_t>& absent_sources) {
@@ -1016,14 +1015,7 @@ static Status add_absent_source_nulls(
             if (!buf.empty()) {
                 in->readBytes(reinterpret_cast<uint8_t*>(buf.data()),
                               static_cast<int32_t>(buf.size()));
-                auto written = segment_v2::read_native_roaring(buf.data(), buf.size());
-                if (!written.has_value()) {
-                    return Status::Corruption(
-                            "merged index null bitmap of destination {} unreadable: {} bytes, "
-                            "first_bytes={}",
-                            dest, buf.size(), segment_v2::hex_prefix(buf));
-                }
-                nulls[dest] |= *written;
+                nulls[dest] |= roaring::Roaring::read(buf.data(), false);
             }
             in->close();
             in.reset();
@@ -1037,7 +1029,6 @@ static Status add_absent_source_nulls(
                         static_cast<int32_t>(buf.size()));
         out->close();
     }
-    return Status::OK();
 }
 
 Status Compaction::do_inverted_index_compaction() {
@@ -1367,7 +1358,7 @@ Status Compaction::do_inverted_index_compaction() {
                                     index_tmp_path.native(), present_trans_vec,
                                     dest_segment_num_rows);
                 if (st.ok()) {
-                    st = add_absent_source_nulls(dest_index_dirs, trans_vec, absent_sources);
+                    add_absent_source_nulls(dest_index_dirs, trans_vec, absent_sources);
                 }
             }
             if (!st.ok()) {

@@ -321,8 +321,6 @@ Status PeerFileCacheReader::fetch_blocks(const std::vector<FileBlockSPtr>& block
     peer_bytes_per_read << filled;
     peer_cache_reader_succ_counter << 1;
     result->bytes_read = filled;
-    result->host = realhost;
-    result->server_fill_requested = request_fill;
     return Status::OK();
 }
 

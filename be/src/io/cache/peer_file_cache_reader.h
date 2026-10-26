@@ -45,10 +45,6 @@ struct PeerFetchChunk {
 
 struct PeerFetchResult {
     std::vector<PeerFetchChunk> chunks;
-    // The peer address the chunks came from, and whether the peer was asked to fill missing
-    // blocks from remote storage before serving them.
-    std::string host;
-    bool server_fill_requested = false;
     size_t bytes_read = 0;
 
     void clear() {

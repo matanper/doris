@@ -581,7 +581,6 @@ Status trigger_peer_server_fill(io::FileBlockSPtr& fb, int64_t fill_tablet_id,
 
     auto final_state = fb->state();
     if (final_state == io::FileBlock::State::DOWNLOADED) {
-        fb->set_fill_source(io::FileBlock::FillSource::FILLED_FOR_PEER);
         g_peer_server_fill_success << 1;
         return Status::OK();
     }

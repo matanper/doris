@@ -351,12 +351,6 @@ public:
 
     std::map<size_t, FileBlockSPtr> get_blocks_by_key(const UInt128Wrapper& hash);
 
-    // The cached blocks of hash that overlap [left, right], each with its range, state and fill
-    // source, for diagnostics. Changes no block state. any_peer is set when a block came from a
-    // peer.
-    std::string describe_blocks(const UInt128Wrapper& hash, size_t left, size_t right,
-                                bool* any_peer);
-
     /// For debug and UT
     std::string dump_structure(const UInt128Wrapper& hash);
     std::string dump_single_cache_type(const UInt128Wrapper& hash, size_t offset);
