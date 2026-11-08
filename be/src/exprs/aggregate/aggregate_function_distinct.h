@@ -151,10 +151,24 @@ struct AggregateFunctionDistinctGenericData {
         DCHECK(!stable);
         if constexpr (!stable) {
             for (const auto& elem : rhs.data) {
-                StringRef key = elem;
-                key.data = arena.insert(key.data, key.size);
-                data.emplace(key);
+                insert_copy(elem, arena);
             }
+        }
+    }
+
+    // The container holds StringRefs into the arena, and arena memory lives until the state is
+    // destroyed, so a key is copied into the arena only when it is not in the container yet.
+    // `key` points at the caller's bytes and is used for the lookup alone.
+    void insert_copy(const StringRef& key, Arena& arena) {
+        if constexpr (stable) {
+            const auto index = static_cast<uint32_t>(data.size());
+            data.lazy_emplace(key, [&](const auto& ctor) {
+                ctor(StringRef(arena.insert(key.data, key.size), key.size), index);
+            });
+        } else {
+            data.lazy_emplace(key, [&](const auto& ctor) {
+                ctor(StringRef(arena.insert(key.data, key.size), key.size));
+            });
         }
     }
 
@@ -195,14 +209,7 @@ struct AggregateFunctionDistinctSingleGenericData
     using Base = AggregateFunctionDistinctGenericData<stable>;
     using Base::data;
     void add(const IColumn** columns, size_t /* columns_num */, size_t row_num, Arena& arena) {
-        auto key = columns[0]->get_data_at(row_num);
-        key.data = arena.insert(key.data, key.size);
-
-        if constexpr (stable) {
-            data.emplace(key, data.size());
-        } else {
-            data.insert(key);
-        }
+        Base::insert_copy(columns[0]->get_data_at(row_num), arena);
     }
 
     MutableColumns get_arguments(const DataTypes& argument_types) const {
@@ -240,10 +247,17 @@ struct AggregateFunctionDistinctMultipleGenericData
             key.size += cur_ref.size;
         }
 
+        bool inserted = false;
         if constexpr (stable) {
-            data.emplace(key, data.size());
+            inserted = data.emplace(key, data.size()).second;
         } else {
-            data.emplace(key);
+            inserted = data.emplace(key).second;
+        }
+        // The key is the last allocation in the arena: give it back when it is a duplicate, as
+        // arena memory is otherwise held until the state is destroyed.
+        if (!inserted) {
+            const auto* rolled_back = static_cast<const char*>(arena.rollback(key.size));
+            DCHECK_EQ(static_cast<const void*>(rolled_back), static_cast<const void*>(key.data));
         }
     }
 

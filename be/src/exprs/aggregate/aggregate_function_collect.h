@@ -133,9 +133,7 @@ struct AggregateFunctionCollectSetData<T, HasLimit> {
     size_t size() const { return data_set.size(); }
 
     void add(const IColumn& column, size_t row_num, Arena& arena) {
-        auto key = column.get_data_at(row_num);
-        key.data = arena.insert(key.data, key.size);
-        data_set.insert(key);
+        insert_copy(column.get_data_at(row_num), arena);
     }
 
     void merge(const SelfType& rhs, Arena& arena) {
@@ -149,10 +147,17 @@ struct AggregateFunctionCollectSetData<T, HasLimit> {
                     return;
                 }
             }
-            StringRef key = rhs_elem;
-            key.data = arena.insert(key.data, key.size);
-            data_set.insert(key);
+            insert_copy(rhs_elem, arena);
         }
+    }
+
+    // The set holds StringRefs into the arena, and arena memory lives until the state is
+    // destroyed, so a value is copied into the arena only when it is not in the set yet.
+    // `key` points at the caller's bytes and is used for the lookup alone.
+    void insert_copy(const StringRef& key, Arena& arena) {
+        data_set.lazy_emplace(key, [&](const auto& ctor) {
+            ctor(StringRef(arena.insert(key.data, key.size), key.size));
+        });
     }
 
     void write(BufferWritable& buf) const {

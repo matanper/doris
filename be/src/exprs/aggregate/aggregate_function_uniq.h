@@ -302,7 +302,7 @@ public:
         static_cast<void>(unused);
         if (!inserted) {
             const auto* rolled_back = static_cast<const char*>(arena.rollback(key.size));
-            DCHECK_EQ(rolled_back, key.data);
+            DCHECK_EQ(static_cast<const void*>(rolled_back), static_cast<const void*>(key.data));
         }
     }
 
